@@ -5,6 +5,30 @@ command into slices and hands them to persistent worker sessions (w1, w2, …). 
 its own [Orca](https://github.com/stablyai/orca) terminal and always returns a result JSON. Usage and rules:
 [`SKILL.md`](SKILL.md).
 
+## Concept
+
+```mermaid
+flowchart TB
+    U([User]) -->|"command"| M
+    M["Manager session (omp + SKILL.md)<br/>splits work into slices with non-overlapping files<br/>never implements itself"]
+    M -->|"team.py assign, one per slice (parallel)"| H["team.py helper"]
+    H -->|"writes brief"| ST[("team state<br/>~/.local/state/team-building/team-id/<br/>briefs/tNNN.md · results/tNNN.json")]
+    H -->|"sends one line via Orca CLI"| O
+    subgraph O["Orca: one terminal per worker"]
+        W1["w1 · interactive omp"]
+        W2["w2 · interactive omp"]
+        W3["w3 · interactive omp"]
+    end
+    O -->|"reads brief, does the work,<br/>writes result JSON"| ST
+    ST -->|"helper waits for the result file,<br/>prints status · summary · files · verification"| M
+    M -->|"reviewed result"| U
+```
+
+- Workers are persistent: each keeps its own omp session, so a follow-up to `wN` has the earlier context.
+- Every assignment returns `succeeded`, `failed` or `blocked`, including on timeout, a crash or a bad model. Workers
+  never ask the user; they report `blocked` with the exact need.
+- `team clear` collects a wrap-up from every worker, closes their terminals and writes one summary report.
+
 ## Requirements
 
 - `omp` on `PATH` (tested with omp 18.3.2), with `tools.approvalMode` set to `yolo` — nobody can answer approval
