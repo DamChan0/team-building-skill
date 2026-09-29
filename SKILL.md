@@ -1,86 +1,81 @@
 ---
 name: team-building
 description: >
-  OMP manager/worker team: this session becomes the main (manager-only) session and routes every
-  command to persistent omp worker sessions, each its own Orca terminal, that always return a result. Use for `team init`,
-  `team_building init`, `member <N>`, bare `member 2`/`member 4`, `team status`, `team clear`, and — whenever an
-  active team exists (`~/.local/state/team-building/*/team.json`) — bare `status`, `clear`, 작업자 N명, 워커 N명,
-  "w1에게 …", "wN한테 시켜/배정", 작업자에게 배정, assign to worker, 팀 빌딩, 팀 만들어, 작업자 세션, worker sessions.
-  Worker ids w1, w2… exist only through this skill's helper. Not the Claude-only `team-builder` agent picker.
+  Persistent AI-worker teams in Orca terminals. Use for `team init`, `team status`, `team clear`,
+  `team member N`, explicit worker assignments such as "w1에게 …", or Korean requests containing
+  팀, 작업자, 워커, or wN. Workers may use omp, Claude Code, or Codex.
 ---
 
 # team-building
 
 `$H` below = `~/.agents/skills/team-building/team.py` (Python stdlib; write the full path in each command). State: `~/.local/state/team-building/<team-id>/`
-(team.json, `logs/wN.log`, `briefs/tNNN.md`, `results/*.json`, `sessions/wN/`). Each worker wN is its own Orca terminal
-(interactive `omp`, the worker's model) in the team cwd: opened on its first assign, reused afterwards, closed by
-`clear`/shrink/timeout. Needs Orca running: without it `assign` exits 4 (no headless fallback) — tell the user to start
-Orca.
+(team.json, `logs/wN.log`, `briefs/tNNN.md`, `results/*.json`, `sessions/wN/` for omp; Claude Code and Codex use their native session roots). Each worker wN is an Orca terminal
+running its selected harness in the team cwd: opened on first assignment, reused afterwards, closed by `clear`/shrink/timeout.
+Needs Orca running: without it `assign` exits 4 (no headless fallback) — tell the user to start Orca.
 
 ## Commands (user says → main session runs)
 
 | User | Run (bash tool) |
 |---|---|
-| `init [--member N] [--model M]` | `python3 $H init [--member N] [--model M]` — sync. Active team exists → **adopts it** (no new team; `--member`/`--model` resize/switch it). None → new team, 3 workers or N. `--new` forces a new team only when the user asks for another team. "팀 만들어줘, 작업자 4명" = `init --member 4` (one call). |
-| `member <N> [--model M]` | `python3 $H member N [--model M]` — async (shrink waits for wrap-up summaries). N 1–8; >4 prints a warning: tell the user the default cap is 4 and continue only if they asked for N. `--model` applies to workers that start a new session (a resumed worker keeps its session's model). |
-| `status` | `python3 $H status` — workers, model (requested → resolved), state, current task, queue, log path. |
-| `clear` | `python3 $H clear` — async, `timeout: 0`. Wrap-up from every worker, closes their Orca terminals, writes `~/work-notes/team-building/<date>-<team-id>.md`, deletes state and sessions. Report the printed path. |
+| `init [--member N] [--model M] [--harness omp\|claude\|codex] [--isolate]` | `python3 $H init [--member N] [--model M] [--harness H] [--allow-bypass] [--isolate]` — sync. Active team exists → **adopts it**; `--new` forces another team only when asked. Claude Code/Codex require explicit `--allow-bypass`; omp requires `tools.approvalMode=yolo`. `--isolate` creates one Orca worktree per worker. |
+| `team member <N> [--model M] [--harness H]` | `python3 $H member N [--model M] [--harness H] [--allow-bypass]` — async; omitted `--harness` retains the team harness. |
+| `team status` | `python3 $H status` — workers, harness, model (requested → resolved), state, current task, queue, log path. |
+| `team clear` | `python3 $H clear` — async; wrap-up uses the same idle/absolute budget, closes terminals, writes a report, and removes only that team's sessions. |
 
-Model = `omp --model` fuzzy pattern (e.g. `sonnet`, `gpt-5.6-terra`, `openai-codex/gpt-6-luna`); omitted = omp default.
-`init` refuses when `tools.approvalMode` is not `yolo`: nobody answers approval prompts in a worker tab, so workers would need a broader approval than the user set.
-Relay that as a user decision; never add `--auto-approve`.
-Several teams active → `status` lists them all; pass `--team <id>` to every other command (and `init --team <id>` to adopt one).
+Model uses the selected harness's `--model`; omitted = its default. Several teams active → `team status` lists them all; pass `--team <id>` to every other command (and `init --team <id>` to adopt one).
+
+`--timeout` is idle time (default 1200 seconds); `--max` is the absolute cap (default 14400 seconds). Choose `--max` from the brief: default for edits, longer for full builds or long tests. On `idle`, first send a follow-up to the same worker.
+
+With `--isolate`, each worker owns its worktree: it must make a local commit and report `branch` and `commit`; never push. Review then run `git merge`/`git cherry-pick` in the manager cwd. Report conflicts. Uncommitted manager changes do not carry into worker worktrees.
 
 ## Session start / restart
 
-A new or restarted main session with any team command (or a bare `member N`, `status`, `clear`, `작업자 N명`)
-runs `python3 $H status` first. Active team → those bare phrases are team commands for it; adopt it with `init`
-(never `--new` unless asked). Worker sessions and context survive the main session dying.
+A new or restarted main session with an explicit team command runs `python3 $H status` first. Active team → adopt it with
+`init` (never `--new` unless asked). Worker sessions and context survive the main session dying.
 
 ## Announced = executed
 
 Every helper command you announce ("w4를 추가합니다", "clear 하겠습니다") must actually run and its output be
-checked before your final reply. Never end a turn on an announced but unrun command; verify counts with `status`.
-Never end your turn while an async `assign`/`member`/`clear` is still running: wait for its result (harness wait/job
-tool) and report it. In headless `omp -p` the process exits after the final reply and kills pending jobs (the task
-then shows as `failed`: "wrapper process … died").
+checked before your final reply. Never end a turn on an announced but unrun command; verify counts with `team status`.
+Never end your turn while an async `assign`/`member`/`clear` is still running: wait for its result with the harness's
+background wait/job tool and report it.
 
-## After `init`: every user command goes to workers
+## After `init`: dispatch work deliberately
 
-The main session is manager only: no implementation, no project edits, no running the assigned work itself.
+Split independent work into worker briefs. Exception: handle it directly in the main session when it is one already-read file,
+about 10 lines or less, and needs no build or long test; say so in one line. “직접 해” means main; “워커에게” means worker first.
 
 1. Read only what is needed to split the command. Split into independent slices with **non-overlapping file ownership**; indivisible → one slice.
 2. One slice → one **sync** bash call, `timeout: 0` (returns the result in the same turn). Several slices → one bash
    call each with `async: true`, `timeout: 0`, all in the same turn, then `wait` for them:
    ```
    python3 $H assign [--worker wN] <<'EOF'
-   Goal / files you own (only these) / constraints / acceptance check to run
+   Goal / files you own (only these) / constraints / acceptance check / May delete: path-or-none
    EOF
    ```
    No `--worker` = any idle worker; if none is idle the call queues inside the helper until one frees (no polling needed).
    Follow-up to earlier work → `--worker wN` (that worker keeps its session context).
 3. The helper sends the brief to the worker's terminal and waits for its `results/tNNN.json`; helper exit is the
    return signal and the harness injects stdout. Output = one human line + JSON:
-   `status` (succeeded|failed|blocked), `summary`, `files_changed`, `verification`, `blockers`, plus
-   `model`, `team`, `worker`, `task`, `duration_s`, `log`. Timeout (`--timeout S`, default 3600; closes the
-   worker terminal, next assign reopens its session), model error, terminal exit, invalid result file, signal → `failed` result. A bash result with no JSON counts as `failed`; check `status`.
-4. `blocked` → answer from context, or ask the user, then send the answer as a follow-up to the same worker.
-5. Review each result against its acceptance check, integrate, report to the user. While slices run, do other
-   useful work; once nothing is left, call the harness `wait` tool (omp: `wait`) for the pending jobs — never send the
-   final reply with an assign still running. No sleep/poll loops.
+   `status` (succeeded|failed|blocked), `summary`, `files_changed`, `files_deleted`, `verification`, `blockers`,
+   `approval_requests`, and isolated-worktree `branch`/`commit`, plus `model`, `team`, `worker`, `task`, `duration_s`, `log`.
+   Timeout, model error, terminal exit, invalid result file, signal → `failed`. For a generic `blocked` result, answer from context or ask the user, then follow up with the same worker. Approval requests are separate: obtain explicit user approval, run `approve`, then same-worker `assign --approval tNNN`.
+4. Review each result against its acceptance check, integrate, report to the user. While slices run, do other useful work; once nothing is left, call the harness's background wait tool for pending jobs — never send the final reply with an assignment still running. No sleep/poll loops.
 
-## Worker contract (injected by the helper via `--append-system-prompt` on the worker's omp)
+## Worker contract (injected by the helper)
 
-Workers implement directly, never ask the user (blocked → `blocked` result with the exact need), touch only their
-slice's files, never run team-building or spawn teams (the helper also refuses `init/member/assign/clear` when
-`TEAM_BUILDING_WORKER` is set), never git push / upload / publish, never delete files, and write the result JSON to the
-`results/tNNN.json` path named in the brief.
+Workers implement directly, never ask the user (blocked → `blocked` result with the exact need), touch only their slice's files,
+never run team-building or spawn teams (the helper also refuses `init/member/assign/clear` when `TEAM_BUILDING_WORKER` is set),
+and may delete only brief-listed `May delete:` paths or files they created for the assignment. Gated external work is not forbidden:
+return `blocked` with exact `approval_requests`; after the user approves, the manager records it with `approve` and sends a same-worker
+follow-up with `--approval tNNN`. They write `files_deleted` in the result JSON at the named `results/tNNN.json` path.
 
 ## Limits
 
-- Workers are visible live in their Orca tabs (omp retitles them `OMP - <dir>`; `status`/team.json hold the handle). Do not type into a busy worker tab.
+- Workers are visible live in their Orca tabs; `status`/team.json hold the handle. Do not type into a busy worker tab.
 - One assignment at a time per worker; a follow-up to a busy worker queues behind its current task.
-- Safety rules for workers are prompt-level; with `approvalMode: yolo` nothing blocks a disobedient tool call.
-- `clear` waits for busy workers to finish their current task before their wrap-up.
-- omp keeps prompt history in its own DBs (`~/.omp/agent/*.db`); `clear` removes only sessions and team state.
+- Permission bypass for Claude Code/Codex is opt-in; omp requires its existing yolo setting.
+- `clear` waits for busy workers to finish their current task before their wrap-up and removes only the recorded worker sessions.
+- Claude Code and omp expose session errors/models in their JSONL records. Codex's local session record is used for resume and cleanup; if it has no reliable error event, timeout remains the fallback.
+- Gated commands are `git push`, `ssh`, `scp`, `rsync`, `sftp`, `gh`, and `docker push` (plus `TEAM_BUILDING_GATED_EXTRA`). PATH shims deter mistakes, not malicious workers: absolute paths and harness-native remote tools (such as `ssh://` URIs) can bypass them; even read-only `ssh` needs approval.
 - A helper killed with SIGKILL is noticed (failed result) only on the next helper call; the worker terminal keeps running; PID reuse can hide it.
