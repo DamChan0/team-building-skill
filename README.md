@@ -8,20 +8,29 @@ its own [Orca](https://github.com/stablyai/orca) terminal and always returns a r
 ## Concept
 
 ```mermaid
-flowchart TB
-    U([User]) -->|"command"| M
-    M["Manager session (omp + SKILL.md)<br/>splits work into slices with non-overlapping files<br/>never implements itself"]
-    M -->|"team.py assign, one per slice (parallel)"| H["team.py helper"]
-    H -->|"writes brief"| ST[("team state<br/>~/.local/state/team-building/team-id/<br/>briefs/tNNN.md · results/tNNN.json")]
-    H -->|"sends one line via Orca CLI"| O
-    subgraph O["Orca: one terminal per worker"]
-        W1["w1 · interactive omp"]
-        W2["w2 · interactive omp"]
-        W3["w3 · interactive omp"]
+sequenceDiagram
+    actor U as User
+    participant M as Manager session<br/>(omp + SKILL.md)
+    participant H as team.py
+    participant W1 as w1<br/>(Orca tab, omp)
+    participant W2 as w2<br/>(Orca tab, omp)
+    U->>M: command
+    M->>M: split into slices<br/>(non-overlapping files, no implementing)
+    par slice A
+        M->>H: assign slice A
+        H->>W1: brief file + one line via Orca CLI
+        W1->>W1: does the work
+        W1-->>H: results/tNNN.json
+        H-->>M: status · summary · files · verification
+    and slice B
+        M->>H: assign slice B
+        H->>W2: brief file + one line via Orca CLI
+        W2->>W2: does the work
+        W2-->>H: results/tNNN.json
+        H-->>M: status · summary · files · verification
     end
-    O -->|"reads brief, does the work,<br/>writes result JSON"| ST
-    ST -->|"helper waits for the result file,<br/>prints status · summary · files · verification"| M
-    M -->|"reviewed result"| U
+    M->>M: review against acceptance checks
+    M-->>U: reviewed result
 ```
 
 - Workers are persistent: each keeps its own omp session, so a follow-up to `wN` has the earlier context.
