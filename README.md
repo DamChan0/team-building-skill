@@ -1,5 +1,7 @@
 # team-building
 
+![team-building concept: the manager splits a user command into briefs, each worker in its own Orca terminal returns a result, the manager reviews and reports back](concept.webp)
+
 An [omp](https://github.com/can1357/oh-my-pi) skill: the current session becomes a manager that splits each user
 command into slices and hands them to persistent worker sessions (w1, w2, …). Each worker is an interactive `omp` in
 its own [Orca](https://github.com/stablyai/orca) terminal and always returns a result JSON. Usage and rules:
