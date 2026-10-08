@@ -12,7 +12,7 @@ persistent worker sessions (w1, w2, …). Each worker runs omp, Claude Code, or 
 sequenceDiagram
     actor U as User
     participant M as Manager session<br/>(SKILL.md)
-    participant H as team.py
+    participant H as src/main.mjs
     participant W1 as w1<br/>(Orca tab, selected harness)
     participant W2 as w2<br/>(Orca tab, selected harness)
     U->>M: command
@@ -35,41 +35,51 @@ sequenceDiagram
 ```
 
 - Workers are persistent: each keeps its own harness session, so a follow-up to `wN` has earlier context.
+- A worker pins its native session ID/file and Orca PTY/pane identity. Stale handles reconnect to that worker. Confirmed exit or model change uses an exact noninteractive resume, never another Orca tab or a latest-session selector. Unknown process state or missing/ambiguous session identity fails closed; `status` reports the session and transport.
 - Every assignment returns `succeeded`, `failed` or `blocked`, including on timeout, a crash or a bad model.
   Workers never ask the user; they report `blocked` with the exact need.
 - `team clear` collects a wrap-up from every worker, closes their terminals and writes one summary report.
 
 - Shared cwd is the default. `team init --isolate` gives each worker an Orca worktree and requires a local commit for manager review/merge; each worktree has separate build caches (for example `target/` or `node_modules`), so cold builds and disk use increase.
+- OMP dispatch defaults to `assign --difficulty simple|moderate|complex`: the manager classifies every brief locally and routes to Luna (`--thinking max`), Terra, or Sol. Omit a tier only for a fixed `init --model` team or a deliberate per-task `assign --model`; no classifier API call is used. Mixed-harness teams must select a known OMP worker before routing.
 - Assignments use an idle timeout (default 1200 seconds) and absolute cap (default 14400 seconds). External commands are blocked pending an exact per-task approval.
 
 ## Requirements
 
-- Python 3 (stdlib only) and Orca running, its CLI on `PATH` as `orca-ide` (tested with 1.4.197). Different name →
+- Node.js 20+ with npm, and Orca running with its CLI on `PATH` as `orca-ide` (tested with 1.4.197). Different name →
   `export ORCA_CLI_COMMAND=<cli>`. Never point it at bare `orca` on Linux (GNOME screen reader).
-- Worker harnesses on `PATH`: omp 18.3.2 (requires `tools.approvalMode=yolo`), Claude Code 2.1.283, or Codex CLI
-  0.157.1. Claude Code and Codex require explicit `--allow-bypass`, enabling their documented permission-bypass flag.
+- OMP is the default worker harness. Claude Code and Codex are supported when explicitly selected with
+  `--harness claude` or `--harness codex`; both require `--allow-bypass`.
 
 ## Install
 
-Clone to `~/.agents/skills/team-building`; omp and Codex load this skills directory:
+Install with the [Skills CLI](https://github.com/vercel-labs/skills). The `cline` target is intentional: it bridges
+the canonical skill to `~/.agents/skills`, the shared location OMP reads. Codex and Claude Code targets are installed
+at the same time where supported. The second command installs the required Node dependencies:
 
 ```sh
-git clone https://github.com/DamChan0/team-building-skill ~/.agents/skills/team-building
-python3 ~/.agents/skills/team-building/team.py status   # fresh install: "no active team; run `team.py init` first"
+npx --yes skills add DamChan0/team-building-skill --skill team-building --yes -g -a cline -a codex -a claude-code && \
+  node ~/.agents/skills/team-building/install.mjs
 ```
 
-Claude Code loads user skills from `~/.claude/skills`; point it at the same checkout:
+If OMP is missing, setup still completes but prints the official Linux/macOS installation suggestion:
 
 ```sh
-mkdir -p ~/.claude/skills
-ln -s ~/.agents/skills/team-building ~/.claude/skills/team-building
+curl -fsSL https://omp.sh/install | sh
 ```
 
-Restart the manager harness, then say `team init` (or `팀 만들어줘, 작업자 4명`). Use
-`team init --harness claude --allow-bypass` or `--harness codex --allow-bypass` for those worker harnesses.
+See <https://omp.sh/docs/quickstart>. Restart the manager harness, then say `team init` (or
+`팀 만들어줘, 작업자 4명`). Use `team init --harness claude --allow-bypass` or
+`--harness codex --allow-bypass` only when selecting those worker harnesses.
 
-Update: `git -C ~/.agents/skills/team-building pull`
-Uninstall: run `team clear` first, then `rm -rf ~/.agents/skills/team-building`
+Update only this installed skill, then re-run dependency setup:
+
+```sh
+npx --yes skills update team-building --global --yes && \
+  node ~/.agents/skills/team-building/install.mjs
+```
+
+Uninstall: run `team clear` first, then `npx skills remove -g team-building`.
 
 ## Files written at runtime
 
