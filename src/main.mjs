@@ -47,16 +47,12 @@ import {
   sleep,
   writeShims,
 } from './harness.mjs';
+import { classifyRequest, configureRouter, DIFFICULTIES } from './router.mjs';
 
 const MAX_WORKERS = 8;
 const WARN_WORKERS = 4;
 const POLL_MS = 2_000;
 const ACTIVITY_CHECK_MS = 15_000;
-export const DIFFICULTY_MODELS = Object.freeze({
-  simple: Object.freeze({ model: 'openai-codex/gpt-5.6-luna', thinking: 'max' }),
-  moderate: Object.freeze({ model: 'openai-codex/gpt-5.6-terra', thinking: null }),
-  complex: Object.freeze({ model: 'openai-codex/gpt-5.6-sol', thinking: null }),
-});
 let interruption = null;
 
 export function requiresBypass(harness) {
@@ -508,6 +504,16 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
   try {
     await withLock(teamDir, async () => {
       const data = await load(teamDir);
+      if (assignment.router_family && (
+        data.model || data.router?.family !== assignment.router_family
+        || data.router?.models?.[assignment.difficulty]?.model !== assignment.model
+        || (data.router?.models?.[assignment.difficulty]?.thinking ?? null) !== (assignment.thinking ?? null)
+      )) throw new Error('router configuration changed during classification; assignment not started');
+      const finalWorker = kind === 'final' && data.workers[preferredWorker];
+      if (finalWorker) {
+        assignment.model ??= finalWorker.task_model || finalWorker.last_route?.model || finalWorker.resolved_model || finalWorker.model;
+        assignment.thinking ??= finalWorker.task_thinking ?? finalWorker.last_route?.thinking ?? null;
+      }
       await mkdir(join(teamDir, 'approvals'), { recursive: true });
       await writeShims(teamDir, data);
       task = `t${String(data.next_task++).padStart(3, '0')}`;
@@ -522,6 +528,7 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
         model: assignment.model || null,
         thinking: assignment.thinking ?? null,
         difficulty: assignment.difficulty || null,
+        intent: assignment.intent || null,
       });
       await save(teamDir, data);
     });
@@ -545,6 +552,7 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
             task_model: entry.model,
             task_thinking: entry.thinking,
             task_difficulty: entry.difficulty,
+            task_intent: entry.intent,
           });
           worker = { ...data.workers[workerId] };
           cwd = worker.cwd || data.cwd;
@@ -565,7 +573,7 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
     if (!result) {
       await appendFile(
         worker.log,
-        `\n=== ${task} ${kind} start ${now()} model=${launchConfig(worker).model || 'omp default'} difficulty=${worker.task_difficulty || 'manual'} ===\n${prompt}\n--- output ---\n`,
+        `\n=== ${task} ${kind} start ${now()} model=${launchConfig(worker).model || 'omp default'} difficulty=${worker.task_difficulty || 'manual'} intent=${JSON.stringify(worker.task_intent || null)} router=${assignment.router_model || 'manual'} ===\n${prompt}\n--- output ---\n`,
       );
       const [workerResult, model] = await runTerminal(teamDir, worker, cwd, task, prompt, timeout, maximum, worker.log);
       result = workerResult;
@@ -595,9 +603,18 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
           task_model: null,
           task_thinking: null,
           task_difficulty: null,
+          task_intent: null,
         });
         assignedWorker.assignments++;
         assignedWorker.resolved_model = result.model || assignedWorker.resolved_model;
+        if (kind === 'task') assignedWorker.last_route = {
+          intent: assignment.intent || null,
+          difficulty: assignment.difficulty || null,
+          model: assignment.model || assignedWorker.model || result.model,
+          thinking: assignment.thinking ?? null,
+          router_model: assignment.router_model || null,
+          duration_ms: assignment.router_duration_ms ?? null,
+        };
       }
       await save(teamDir, data);
     });
@@ -609,6 +626,9 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
     task,
     kind,
     difficulty: result.difficulty || worker?.task_difficulty || null,
+    intent: assignment.intent || null,
+    router_model: assignment.router_model || null,
+    router_duration_ms: assignment.router_duration_ms ?? null,
     duration_s: Math.round((Date.now() - started) / 100) / 10,
     finished: now(),
   });
@@ -627,7 +647,7 @@ function newWorker(teamDir, data, harness, cwd) {
   const selectedHarness = harness || data.harness || 'omp';
   data.workers[id] = {
     id,
-    model: data.model,
+    model: data.model || data.router?.worker_model || null,
     resolved_model: null,
     state: 'idle',
     task: null,
@@ -657,7 +677,10 @@ export async function show(teamDir) {
     await save(teamDir, data);
   });
 
-  console.log(`team ${data.id}  cwd=${data.cwd}  model=${data.model || 'omp default'}  state=${teamDir}`);
+  console.log(`team ${data.id}  cwd=${data.cwd}  model=${data.model || 'routed/default'}  router=${data.router?.enabled ? data.router.family : 'off'}  state=${teamDir}`);
+  if (data.router?.enabled) {
+    console.log(`  classifier=${data.router.classifier} checked=${data.router.checked_at} simple=${data.router.models.simple.model} moderate=${data.router.models.moderate.model} complex=${data.router.models.complex.model} extreme=${data.router.models.extreme?.model || 'init required'}${data.router.models.extreme?.thinking ? ` thinking=${data.router.models.extreme.thinking}` : ''}`);
+  }
   for (const worker of Object.values(data.workers).sort((left, right) => workerIndex(left.id) - workerIndex(right.id))) {
     let model = worker.model || 'omp default';
     if (worker.resolved_model) model += ` -> ${worker.resolved_model}`;
@@ -791,7 +814,15 @@ async function retire(teamDir, ids, timeout, maximum) {
 
 async function init(args) {
   forbidWorkerManager();
+  if (args.member !== undefined && (!Number.isInteger(args.member) || args.member < 1 || args.member > MAX_WORKERS)) {
+    die(`member must be 1..${MAX_WORKERS} (task.maxConcurrency)`);
+  }
+  const selectedFamily = args.family || (['gpt', 'claude'].includes(args.model) ? args.model : null);
+  if (args.family && args.model && args.family !== args.model) die(`conflicting family ${args.family} and --model ${args.model}`);
+  const familySelected = !!selectedFamily;
+  const fixedModel = familySelected ? null : args.model || null;
   const harness = args.harness || 'omp';
+  if (familySelected && harness !== 'omp') die('gpt/claude family routing requires --harness omp; the family selects models, not the harness');
   if (harness === 'omp') await requireOmp(die);
   if (requiresBypass(harness) && !args.allowBypass) {
     die(`--harness ${harness} requires explicit --allow-bypass (it enables ${configFor({ harness }).bypass})`, 3);
@@ -814,15 +845,36 @@ async function init(args) {
     }
     const teamDir = await resolveTeam(args.team, die);
     console.log(`adopted existing team ${basename(teamDir)} (no new team; \`init --new\` creates one)`);
-    if (args.member || args.model) {
-      return member({ ...args, n: args.member || Object.keys((await load(teamDir)).workers).length, team: basename(teamDir) });
+    const current = await load(teamDir);
+    const ompOnly = Object.values(current.workers).filter(worker => !worker.retiring).every(worker => workerHarness(worker, current) === 'omp');
+    if (familySelected && !ompOnly) die('family routing requires OMP workers; cannot change the harness of existing sessions');
+    if (!fixedModel && ompOnly && (familySelected || !current.model)) {
+      const family = familySelected ? selectedFamily : current.router?.family || 'gpt';
+      const changesFamily = data => data.model || (data.router?.family || null) !== family;
+      const rejectBusyChange = data => {
+        if (changesFamily(data) && (data.queue.length || Object.values(data.workers).some(worker => worker.state === 'busy'))) {
+          die('cannot change router family while assignments are busy or queued; wait for this team to become idle');
+        }
+      };
+      rejectBusyChange(current);
+      const router = await configureRouter(family);
+      await withLock(teamDir, async () => {
+        const data = await load(teamDir);
+        rejectBusyChange(data);
+        if (data.closing) die('team is being cleared');
+        if (Object.values(data.workers).some(worker => workerHarness(worker, data) !== 'omp')) die('family routing requires OMP workers');
+        data.router = router;
+        data.model = null;
+        for (const worker of Object.values(data.workers)) worker.model = router.worker_model;
+        await save(teamDir, data);
+      });
+    }
+    if (args.member || fixedModel) {
+      return member({ ...args, model: fixedModel, n: args.member || Object.keys(current.workers).length, team: basename(teamDir) });
     }
     return show(teamDir);
   }
 
-  if (args.member !== undefined && (!Number.isInteger(args.member) || args.member < 1 || args.member > MAX_WORKERS)) {
-    die(`member must be 1..${MAX_WORKERS} (task.maxConcurrency)`);
-  }
   const worktree = await registeredCwd();
   if (!args.isolate && !insideWorktree(worktree, process.cwd())) {
     die(`manager cwd ${process.cwd()} is outside active Orca worktree ${worktree}; return to that worktree or initialize a new team there`, 4);
@@ -833,6 +885,9 @@ async function init(args) {
   if (args.isolate && (await gitOutput(['status', '--porcelain'], process.cwd()))[1]) {
     console.error('team-building: warning: uncommitted manager changes are not copied into isolated worker worktrees');
   }
+  const router = harness === 'omp' && !fixedModel
+    ? await configureRouter(selectedFamily || 'gpt')
+    : null;
 
   const stamp = new Date();
   const id = `tb-${String(stamp.getMonth() + 1).padStart(2, '0')}${String(stamp.getDate()).padStart(2, '0')}-${String(stamp.getHours()).padStart(2, '0')}${String(stamp.getMinutes()).padStart(2, '0')}${String(stamp.getSeconds()).padStart(2, '0')}`;
@@ -846,7 +901,8 @@ async function init(args) {
     created: now(),
     cwd: process.cwd(),
     worktree,
-    model: args.model || null,
+    model: fixedModel,
+    router,
     harness,
     approval_mode: approvalMode,
     next_task: 1,
@@ -871,12 +927,13 @@ async function init(args) {
   }
 
   await save(teamDir, data);
-  console.log(`team ${id} ready: ${args.member || 3} workers, harness=${harness}, model=${args.model || 'default'}, cwd=${data.cwd}`);
+  console.log(`team ${id} ready: ${args.member || 3} workers, harness=${harness}, model=${fixedModel || 'automatic'}, router=${router?.family || 'off'}, cwd=${data.cwd}`);
   await show(teamDir);
 }
 
 async function member(args) {
   forbidWorkerManager();
+  if (['gpt', 'claude'].includes(args.model)) die('select a model family with init --model gpt|claude, not member --model');
   if (!Number.isInteger(args.n) || args.n < 1 || args.n > MAX_WORKERS) die(`member must be 1..${MAX_WORKERS} (task.maxConcurrency)`);
 
   const teamDir = await resolveTeam(args.team, die);
@@ -895,7 +952,10 @@ async function member(args) {
     if (requiresBypass(effectiveHarness) && !args.allowBypass && (args.harness || growing)) {
       die(`--harness ${effectiveHarness} requires explicit --allow-bypass (it enables ${configFor({ harness: effectiveHarness }).bypass})`, 3);
     }
-    if (args.model) data.model = args.model;
+    if (args.model) {
+      data.model = args.model;
+      data.router = null;
+    }
     if (growing) {
       for (let index = liveWorkers.length; index < args.n; index++) {
         const workerId = `w${data.next_worker}`;
@@ -955,7 +1015,9 @@ export function routedAssignment(data, args) {
   if (!args.difficulty || args.model) return args.model ? { model: args.model } : {};
   const error = routingError(data, args.worker);
   if (error) die(error);
-  return { ...DIFFICULTY_MODELS[args.difficulty], difficulty: args.difficulty };
+  const selected = data.router?.models?.[args.difficulty];
+  if (!selected) die('router model catalog is missing; run init --model gpt|claude');
+  return { ...selected, difficulty: args.difficulty };
 }
 
 async function assign(args) {
@@ -977,11 +1039,35 @@ async function assign(args) {
     });
   }
 
-  let assignment;
-  await withLock(teamDir, async () => {
-    assignment = routedAssignment(await load(teamDir), args);
-  });
   await requireOrca(die);
+  let data = await load(teamDir);
+  const automatic = data.router?.enabled && !data.model && !args.model && !args.difficulty;
+  if (automatic || (args.difficulty && !args.model)) {
+    const error = routingError(data, args.worker);
+    if (error) die(error);
+  }
+  if (args.difficulty && !args.model && !data.model && !data.router) {
+    const router = await configureRouter('gpt', { refresh: false });
+    router.enabled = false;
+    await withLock(teamDir, async () => {
+      data = await load(teamDir);
+      if (!data.model && !data.router) {
+        data.router = router;
+        await save(teamDir, data);
+      }
+    });
+  }
+  let assignment;
+  if (automatic) {
+    const started = Date.now();
+    assignment = await classifyRequest(data.router, prompt, { cwd: data.cwd });
+    assignment.router_duration_ms = Date.now() - started;
+    console.log(`route ${data.router.family}: ${assignment.difficulty} model=${assignment.model} intent=${JSON.stringify(assignment.intent)} (${assignment.router_duration_ms}ms)`);
+  } else {
+    assignment = routedAssignment(data, args);
+  }
+  if (assignment.difficulty && data.router?.family) assignment.router_family = data.router.family;
+  if (interrupted()) throw interrupted();
   printResult(await runAssignment(teamDir, args.worker, prompt, args.timeout, args.max, 'task', args.approval, assignment));
 }
 
@@ -1105,10 +1191,10 @@ function usage() {
 team-building helper: persistent harness-neutral workers driven by one manager session.
 
 Commands:
-  init [--model MODEL] [--member N] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--new]
+  init [gpt|claude] [--model gpt|claude|MODEL] [--member N] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--new]
   member N [--model MODEL] [--harness omp|claude|codex] [--allow-bypass]
   status
-  assign [--worker wN] [--approval tNNN] [--model MODEL] [--difficulty simple|moderate|complex] [PROMPT]
+  assign [--worker wN] [--approval tNNN] [--model MODEL] [--difficulty simple|moderate|complex|extreme] [PROMPT]
   approve --worker wN --task tNNN -- COMMAND...
   clear
 
@@ -1164,7 +1250,7 @@ export function parseArgs(argv) {
     } else if (option === '--difficulty') {
       args.difficulty = take(index, '--difficulty');
       index++;
-      if (!Object.hasOwn(DIFFICULTY_MODELS, args.difficulty)) die(`invalid difficulty: ${args.difficulty} (choose simple, moderate, or complex)`);
+      if (!DIFFICULTIES.includes(args.difficulty)) die(`invalid difficulty: ${args.difficulty} (choose ${DIFFICULTIES.join(', ')})`);
     } else if (option === '--harness') {
       args.harness = take(index, '--harness');
       index++;
@@ -1198,6 +1284,8 @@ export function parseArgs(argv) {
       break;
     } else if (args.cmd === 'assign' && args.prompt === undefined) {
       args.prompt = option;
+    } else if (args.cmd === 'init' && !args.family && ['gpt', 'claude'].includes(option)) {
+      args.family = option;
     } else {
       die(`unexpected argument ${option}`);
     }

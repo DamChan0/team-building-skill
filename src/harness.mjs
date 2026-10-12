@@ -316,7 +316,13 @@ export async function agentCommand(team, worker, { headless = false, prompt } = 
       args.push('-p');
     }
   }
-  const { model, thinking } = launchConfig(worker);
+  let { model, thinking } = launchConfig(worker);
+  if (headless && !thinking && (!worker.harness || worker.harness === 'omp')) {
+    const configured = await command('omp', ['config', 'get', 'defaultThinkingLevel'], { cwd: worker.cwd });
+    if (configured.code !== 0 || !configured.out.trim()) throw new OrcaError('cannot resolve default thinking for the pinned session');
+    // OMP resumes saved effort unless an override is explicit.
+    thinking = configured.out.trim();
+  }
   if (model) args.push('--model', model);
   if (thinking && (!worker.harness || worker.harness === 'omp')) args.push('--thinking', thinking);
   if (headless) args.push(prompt);

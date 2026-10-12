@@ -1,9 +1,11 @@
 ---
 name: team-building
 description: >
-  Persistent AI-worker teams in Orca terminals. Use for `team init`, `team status`, `team clear`,
-  `team member N`, explicit worker assignments such as "w1에게 …", or Korean requests containing
-  팀, 작업자, 워커, or wN. Workers may use omp, Claude Code, or Codex.
+  Persistent AI-worker teams in Orca terminals. Examples: `init claude --member 3`, `init gpt`,
+  `member 4`, `status`, `clear`, or `assign --worker w1 <task>`. Use for `team init`, `team status`,
+  `team clear`, `team member N`, explicit worker assignments such as "w1에게 …", or Korean requests
+  containing 팀, 작업자, 워커, or wN. Workers may use omp, Claude Code, or Codex.
+argument-hint: init claude --member 3 | init gpt | member 4 | status | clear | assign --worker w1 <task>
 ---
 
 # team-building
@@ -19,14 +21,18 @@ New shared-team `init` binds workers to the Orca worktree resolved from manager 
 
 | User | Run (bash tool) |
 |---|---|
-| `init [--member N] [--model M] [--harness omp\|claude\|codex] [--isolate]` | `node ~/.agents/skills/team-building/src/main.mjs init [--member N] [--model M] [--harness H] [--allow-bypass] [--isolate]` — sync. Active team exists → **adopts it**; `--new` forces another team only when asked. Claude Code/Codex require explicit `--allow-bypass`; omp requires `tools.approvalMode=yolo`. `--isolate` creates one Orca worktree per worker. |
+| `init [gpt\|claude] [--member N] [--model M] [--harness omp\|claude\|codex] [--isolate]` | `node ~/.agents/skills/team-building/src/main.mjs init [gpt\|claude] [--member N] [--model M] [--harness H] [--allow-bypass] [--isolate]` — sync. For OMP, plain init selects the GPT family and positional `claude` selects the Claude family; an exact `--model M` is fixed. Active team exists → **adopts it** and refreshes its selected routing family; `--new` forces another team only when asked. Claude Code/Codex require explicit `--allow-bypass`; omp requires `tools.approvalMode=yolo`. `--isolate` creates one Orca worktree per worker. |
 | `team member <N> [--model M] [--harness H]` | `node ~/.agents/skills/team-building/src/main.mjs member N [--model M] [--harness H] [--allow-bypass]` — async; omitted `--harness` retains the team harness. |
-| `team status` | `node ~/.agents/skills/team-building/src/main.mjs status` — workers, harness, model (requested → resolved), state, current task, queue, log path. |
+| `team status` | `node ~/.agents/skills/team-building/src/main.mjs status` — workers, harness, model (requested → resolved), router family/fixed/off, state, current task, queue, log path. |
 | `team clear` | `node ~/.agents/skills/team-building/src/main.mjs clear` — async; wrap-up uses the same idle/absolute budget, closes terminals, writes a report, and removes only that team's sessions. |
 
-`assign --difficulty simple|moderate|complex` routes OMP work only: simple → Luna with `--thinking max`, moderate → Terra, complex → Sol. The manager classifies the brief; do not make a separate model/API classifier call. `assign --model M` is a per-task manual override and wins over `--difficulty`. `init --model M` is a fixed team-wide override, so `--difficulty` fails for that team; use `assign --model` or omit it. Routing without `--worker` requires every eligible worker to be OMP; for mixed teams, select a known OMP worker explicitly. A changed route confirms the existing idle terminal was stopped, then resumes its pinned session with the selected model without opening another tab.
+OMP routing is automatic for OMP teams with an enabled router: plain `init` chooses the GPT family and positional `init claude` chooses the Claude family. Init refreshes OMP's model catalog and pins the selected map until the next `init` adoption; it does not create a persistent router session or Orca tab. For Claude, Haiku is only the bounded no-tools classifier, Sonnet is the default for ordinary simple/moderate work, and a genuinely complex assignment upgrades the selected worker's pinned native session to Opus; its next ordinary assignment resumes that same session on Sonnet. `assign --difficulty` uses the saved tier directly; `assign --model M` is a per-task manual override and wins. An exact `init --model M` is fixed, so `--difficulty` fails for that team; use `assign --model` or omit it. Native Claude Code/Codex teams do not auto-route. Routing without `--worker` requires every eligible worker to be OMP; mixed teams select a worker explicitly.
 
-Difficulty rubric: **simple** for bounded edits, known-file fixes, and straightforward tests; **moderate** for multi-file integration or familiar feature work; **complex** only for security, concurrency, architecture, root-cause investigations, or genuinely difficult reasoning.
+GPT tiers are simple Luna Max / moderate Terra / complex Sol / extreme Astra. Claude uses Haiku only for classification, Sonnet for simple/moderate worker tasks, Opus for complex work, and the same latest Opus with explicit `thinking=xhigh` for extreme work. Astra has no explicit thinking override. Opus lacking xhigh support stops initialization instead of downgrading. Family selection changes worker models, not the current manager process. Invalid JSON, classifier errors, or a family/map change while classifying stop dispatch rather than guess a route. Existing legacy teams stay manual until `init` adoption; existing three-tier maps need another `init` to acquire extreme.
+
+On headless OMP resume without task-specific thinking, reapply the configured `defaultThinkingLevel` explicitly: OMP otherwise retains saved effort, so leaving out `--thinking` does not clear a previous extreme task's `xhigh`.
+
+Difficulty rubric: **simple** for bounded edits, known-file fixes, and straightforward tests; **moderate** for multi-file integration or familiar feature work; **complex** for difficult security, concurrency, architecture, root-cause investigations, or deep reasoning; **extreme** for the highest difficulty only: exceptionally difficult unresolved multi-system failures, architecture with conflicting correctness constraints, or formal algorithm/security reasoning.
 
 Model uses the selected harness's `--model`; omitted = its default. Several teams active → `team status` lists them all; pass `--team <id>` to every other command (and `init --team <id>` to adopt one).
 
@@ -48,24 +54,24 @@ background wait/job tool and report it.
 
 ## After `init`: dispatch work deliberately
 
-Split independent work into worker briefs. Exception: handle it directly in the main session when it is one already-read file,
-about 10 lines or less, and needs no build or long test; say so in one line. “직접 해” means main; “워커에게” means worker first.
+Split independent work into worker briefs. With an enabled router, dispatch ordinary requests, including trivial edits, rather than implementing them in the manager. Only an explicit “직접 해” bypasses worker dispatch.
+For fixed-model or native-harness teams without automatic routing, a one-file change of about 10 lines or less may still be handled directly when it needs no build or long test; say so in one line. “워커에게” means worker first.
 
 1. Read only what is needed to split the command. Split into independent slices with **non-overlapping file ownership**; indivisible → one slice.
-2. For every OMP slice, classify the brief with the rubric and include `--difficulty <simple|moderate|complex>` in `assign`. Omit it only for an explicit fixed team `init --model`, or when deliberately supplying a per-task `assign --model`; no external classifier call.
+2. Delegate each OMP slice immediately with its original brief. Do **not** do separate classification or research before routing: omit route options for automatic routing. Use `--difficulty <simple|moderate|complex|extreme>` only when the tier is already known, or `--model` for a deliberate manual override.
 3. One slice → one **sync** bash call, `timeout: 0` (returns the result in the same turn). Several slices → one bash
    call each with `async: true`, `timeout: 0`, all in the same turn, then `wait` for them:
    ```
-   node ~/.agents/skills/team-building/src/main.mjs assign [--worker wN] --difficulty <tier> <<'EOF'
+   node ~/.agents/skills/team-building/src/main.mjs assign [--worker wN] <<'EOF'
    Goal / files you own (only these) / constraints / acceptance check / May delete: path-or-none
    EOF
    ```
    No `--worker` = any idle worker; if none is idle the call queues inside the helper until one frees (no polling needed).
    Follow-up to earlier work → `--worker wN` (that worker keeps its session context).
 4. The helper sends the brief to the worker's terminal and waits for its `results/tNNN.json`; helper exit is the
-   return signal and the harness injects stdout. Output = one human line + JSON:
+   return signal and the harness injects stdout. Automatic routing first prints its family, tier, model, intent, and classifier latency; result output then is one human line + JSON:
    `status` (succeeded|failed|blocked), `summary`, `files_changed`, `files_deleted`, `verification`, `blockers`,
-   `approval_requests`, and isolated-worktree `branch`/`commit`, plus `model`, `team`, `worker`, `task`, `duration_s`, `log`.
+   `approval_requests`, and isolated-worktree `branch`/`commit`, plus `model`, `intent`, `difficulty`, `router_model`, `router_duration_ms`, `team`, `worker`, `task`, `duration_s`, `log`.
    Timeout, model error, terminal exit, invalid result file, signal → `failed`. For a generic `blocked` result, answer from context or ask the user, then follow up with the same worker. Approval requests are separate: obtain explicit user approval, run `approve`, then same-worker `assign --approval tNNN`.
 5. Review each result against its acceptance check, integrate, report to the user. While slices run, do other useful work; once nothing is left, call the harness's background wait tool for pending jobs — never send the final reply with an assignment still running. No sleep/poll loops.
 

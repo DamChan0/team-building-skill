@@ -25,8 +25,8 @@ async function fixture(fn) {
       assignments: 1, session_dir: join(dir, 'sessions/w1'), log: join(dir, 'logs/w1.log'), cwd: dir,
       terminal: 'old-handle', terminal_pty_id: 'worker-pty', terminal_tab_id: 'worker-tab', terminal_leaf_id: 'worker-leaf',
       terminal_started: true, terminal_incarnation_id: 'worker-life', session_id: sessionId, session_file: session, terminal_model: null, terminal_thinking: null };
-    const saveWorker = async changes => writeFile(join(dir, 'team.json'), JSON.stringify({ id: team, cwd: dir, worktree: dir,
-      harness: 'omp', model: null, next_task: 1, next_worker: 2, workers: { w1: { ...worker, ...changes } }, queue: [] }));
+    const saveWorker = async ({ router = null, ...changes }) => writeFile(join(dir, 'team.json'), JSON.stringify({ id: team, cwd: dir, worktree: dir,
+      harness: 'omp', model: null, router, next_task: 1, next_worker: 2, workers: { w1: { ...worker, ...changes } }, queue: [] }));
     await saveWorker({});
     await writeFile(join(bin, 'orca-ide'), `#!/usr/bin/env node
 import { appendFile, readFile, writeFile } from 'node:fs/promises';
@@ -58,9 +58,17 @@ if (a[0] === 'terminal' && ['create', 'close', 'send'].includes(a[1])) {
 console.log(JSON.stringify({ ok: true, result }));
 `);
     await writeFile(join(bin, 'omp'), `#!/usr/bin/env node
-import { appendFile, writeFile } from 'node:fs/promises';
+import { appendFile, readFile, writeFile } from 'node:fs/promises';
 const a = process.argv.slice(2);
-await appendFile(process.env.EVENT_LOG, JSON.stringify({ type: 'resume', args: a }) + '\\n');
+if (a[0] === 'config') { console.log('auto'); process.exit(0); }
+if (a[0] === 'models') {
+  console.log(JSON.stringify({ models: ['luna', 'terra', 'sol', 'astra'].map(role => ({ id: 'gpt-5.6-' + role, provider: 'openai-codex', selector: 'openai-codex/gpt-5.6-' + role, thinking: ['low', 'max'] })) }));
+  process.exit(0);
+}
+const history = (await readFile(process.env.SESSION_FILE, 'utf8')).trim().split('\\n').map(JSON.parse);
+const thinking = a.includes('--thinking') ? a[a.indexOf('--thinking') + 1] : history.filter(row => row.type === 'thinking_level_change').at(-1)?.thinkingLevel || 'auto';
+await appendFile(process.env.SESSION_FILE, JSON.stringify({ type: 'thinking_level_change', thinkingLevel: thinking }) + '\\n');
+await appendFile(process.env.EVENT_LOG, JSON.stringify({ type: 'resume', args: a, effective_thinking: thinking }) + '\\n');
 if (!a.includes('-p') || a[a.indexOf('--resume') + 1] !== process.env.SESSION_FILE) process.exit(7);
 if (process.env.SCENARIO === 'resume-timeout') { setInterval(() => {}, 1000); await new Promise(() => {}); }
 const brief = a.at(-1).match(/read (.+?) and do it/)[1];
@@ -111,12 +119,51 @@ test('a lost pinned session never falls back to a fresh session', async () => fi
   assert.deepEqual(await events(), []);
 }));
 
-test('model routing resumes pinned conversation instead of reopening a tab', async () => fixture(async ({ run, events }) => {
+test('model routing resumes pinned conversation instead of reopening a tab', async () => fixture(async ({ run, events, dir }) => {
   const result = run('live', ['--difficulty', 'simple']);
-  assert.match(result.stdout, /same session resumed/);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(await readFile(join(dir, 'results/t001.json'), 'utf8')).status, 'succeeded');
+  const followup = run('live');
+  assert.equal(followup.status, 0, followup.stderr);
+  assert.equal(JSON.parse(await readFile(join(dir, 'results/t002.json'), 'utf8')).status, 'succeeded');
   const calls = await events();
-  assert.deepEqual(calls.map(call => call.type), ['close', 'resume']);
+  assert.deepEqual(calls.map(call => call.type), ['close', 'resume', 'resume']);
   assert.ok(calls[1].args.includes('openai-codex/gpt-5.6-luna'));
+}));
+
+test('Claude complex and extreme work preserve the pinned session and reset xhigh on return to Sonnet', async () => fixture(async ({ run, events, saveWorker, dir }) => {
+  const sonnet = 'anthropic/claude-sonnet-5-5';
+  const opus = 'anthropic/claude-opus-5-5';
+  await saveWorker({
+    model: sonnet,
+    terminal_model: sonnet,
+    router: {
+      enabled: true,
+      family: 'claude',
+      classifier: 'anthropic/claude-haiku-4-5',
+      models: {
+        simple: { model: sonnet, thinking: null },
+        moderate: { model: sonnet, thinking: null },
+        complex: { model: opus, thinking: null },
+        extreme: { model: opus, thinking: 'xhigh' },
+      },
+    },
+  });
+  assert.equal(run('live', ['--difficulty', 'extreme']).status, 0);
+  assert.equal(run('live', ['--difficulty', 'complex']).status, 0);
+  assert.equal(run('live', ['--difficulty', 'simple']).status, 0);
+  const calls = await events();
+  assert.deepEqual(calls.map(call => call.type), ['close', 'resume', 'resume', 'resume']);
+  const resumes = calls.filter(call => call.type === 'resume');
+  assert.equal(resumes[0].args[resumes[0].args.indexOf('--model') + 1], opus);
+  assert.equal(resumes[0].effective_thinking, 'xhigh');
+  assert.equal(resumes[1].args[resumes[1].args.indexOf('--model') + 1], opus);
+  assert.equal(resumes[1].effective_thinking, 'auto');
+  assert.equal(resumes[2].args[resumes[2].args.indexOf('--model') + 1], sonnet);
+  assert.equal(resumes[2].effective_thinking, 'auto');
+  const stored = JSON.parse(await readFile(join(dir, 'team.json'), 'utf8')).workers.w1;
+  assert.equal(stored.session_id, sessionId);
+  assert.equal(stored.session_file.endsWith(`${sessionId}.jsonl`), true);
 }));
 
 test('first launch records its session and PTY before later assignments reuse them', async () => fixture(async ({ run, events, session, saveWorker, dir }) => {
@@ -146,8 +193,9 @@ test('missing or replaced PTY cannot adopt a different session', async () => {
   });
 });
 
-test('failed stop cannot launch a concurrent resume', async () => fixture(async ({ run, events }) => {
-  assert.match(run('close-failed', ['--difficulty', 'simple']).stdout, /failed to close worker terminal/);
+test('failed stop cannot launch a concurrent resume', async () => fixture(async ({ run, events, dir }) => {
+  run('close-failed', ['--difficulty', 'simple']);
+  assert.equal(JSON.parse(await readFile(join(dir, 'results/t001.json'), 'utf8')).status, 'failed');
   assert.deepEqual((await events()).map(call => call.type), ['close']);
 }));
 

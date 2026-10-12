@@ -4,7 +4,18 @@ import assert from 'node:assert/strict';
 import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { chooseWorker, DIFFICULTY_MODELS, parseArgs, requiresBypass, resultFrom, routedAssignment, runAssignment, show } from '../src/main.mjs';
+import { chooseWorker, parseArgs, requiresBypass, resultFrom, routedAssignment, runAssignment, show } from '../src/main.mjs';
+
+const router = {
+  enabled: true,
+  family: 'gpt',
+  models: {
+    simple: { model: 'openai-codex/gpt-5.6-luna', thinking: 'max' },
+    moderate: { model: 'openai-codex/gpt-5.6-terra', thinking: null },
+    complex: { model: 'openai-codex/gpt-5.6-sol', thinking: null },
+    extreme: { model: 'openai-codex/gpt-6-astra', thinking: null },
+  },
+};
 
 test('parses common options before the command and approval command after --', () => {
   const parsed = parseArgs([
@@ -33,33 +44,24 @@ test('preserves a dash assignment prompt so assign reads stdin', () => {
   assert.equal(parsed.prompt, '-');
 });
 
-test('maps each difficulty to its OMP selector and parses only supported values', () => {
-  assert.deepEqual(DIFFICULTY_MODELS, {
-    simple: { model: 'openai-codex/gpt-5.6-luna', thinking: 'max' },
-    moderate: { model: 'openai-codex/gpt-5.6-terra', thinking: null },
-    complex: { model: 'openai-codex/gpt-5.6-sol', thinking: null },
-  });
-  assert.equal(parseArgs(['assign', '--difficulty', 'complex', 'work']).difficulty, 'complex');
-  assert.throws(() => parseArgs(['assign', '--difficulty', 'hard', 'work']), /__team_die__/);
-  process.exitCode = undefined;
-});
-
-
-test('uses manual models over routing and restricts routed assignments to OMP workers', () => {
+test('parses supported routing tiers and routes saved maps with manual precedence', () => {
   const omp = { id: 'w1', harness: 'omp', state: 'idle', retiring: false };
   const mixed = {
     model: null,
     harness: 'omp',
+    router,
     workers: {
       w1: omp,
       w2: { id: 'w2', harness: 'claude', state: 'idle', retiring: false },
     },
   };
 
+  assert.equal(parseArgs(['assign', '--difficulty', 'complex', 'work']).difficulty, 'complex');
+  assert.throws(() => parseArgs(['assign', '--difficulty', 'hard', 'work']), /__team_die__/);
   assert.deepEqual(routedAssignment({ ...mixed, model: 'fixed' }, { difficulty: 'simple', model: 'manual' }), { model: 'manual' });
   assert.deepEqual(
     routedAssignment(mixed, { worker: 'w1', difficulty: 'simple' }),
-    { ...DIFFICULTY_MODELS.simple, difficulty: 'simple' },
+    { ...router.models.simple, difficulty: 'simple' },
   );
   assert.throws(
     () => routedAssignment({ ...mixed, model: 'fixed' }, { difficulty: 'simple' }),
@@ -94,7 +96,7 @@ test('guards shared and isolated worktree targets before terminal lifecycle chan
   });
   const events = async () => (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
   const state = ({ cwd, worktree, isolate = false, workerWorktree = null, terminal = null }) => ({
-    id: team, cwd, ...(worktree ? { worktree } : {}), isolate, model: null, harness: 'omp',
+    id: team, cwd, ...(worktree ? { worktree } : {}), isolate, model: null, harness: 'omp', router,
     next_task: 1, next_worker: 2, workers: {
       w1: {
         id: 'w1', model: null, resolved_model: null, state: 'idle', task: null, retiring: false,
@@ -270,6 +272,7 @@ test('status output includes queued assignments', async () => {
       id: 'tb-1001-120000',
       cwd: teamDir,
       model: null,
+      router,
       workers: {
         w1: {
           id: 'w1', state: 'idle', retiring: false, model: null, assignments: 0, log: 'w1.log',
@@ -284,6 +287,7 @@ test('status output includes queued assignments', async () => {
     await show(teamDir);
 
     assert.ok(output.some(line => line.includes('difficulty=simple model=openai-codex/gpt-5.6-luna thinking=max')));
+    assert.ok(output.some(line => line.includes('router=gpt')));
     assert.ok(output.some(line => line.includes('queued t003 worker=w2 kind=task')));
   } finally {
     console.log = originalLog;
