@@ -16,8 +16,9 @@ async function fixture(check) {
   await Promise.all([
     writeFile(join(bin, "npm"), "#!/usr/bin/env node\n"),
     writeFile(join(bin, "omp"), "#!/usr/bin/env node\nconsole.log('omp')\n"),
+    writeFile(join(bin, "cargo"), "#!/usr/bin/env node\n"),
   ]);
-  await Promise.all(["npm", "omp"].map(name => chmod(join(bin, name), 0o755)));
+  await Promise.all(["npm", "omp", "cargo"].map(name => chmod(join(bin, name), 0o755)));
   const run = () => spawnSync(process.execPath, [installer], {
     encoding: "utf8",
     env: {

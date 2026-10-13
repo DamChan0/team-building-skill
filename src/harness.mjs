@@ -1,4 +1,4 @@
-import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
@@ -85,84 +85,26 @@ async function claudeFiles(worker) {
 }
 async function codexFiles(worker) { return worker.session_file && await exists(worker.session_file) ? [worker.session_file] : []; }
 
-async function codexSessions(since) {
-  const files = [];
-  const root = join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'sessions');
 
-  async function walk(dir) {
-    let entries;
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    await Promise.all(entries.map(async entry => {
-      const path = join(dir, entry.name);
-      if (entry.isDirectory()) return walk(path);
-      if (!entry.isFile() || !/^rollout-.*\.jsonl$/.test(entry.name)) return;
-      try {
-        files.push({ path, mtime: (await stat(path)).mtimeMs });
-      } catch {}
-    }));
-  }
-
-  await walk(root);
-  return files.sort((left, right) => right.mtime - left.mtime);
-}
-
-export async function recordSession(teamDir, worker, cwd, since = 0) {
-  if (worker.session_file) {
-    if (!(await exists(worker.session_file))) throw new OrcaError(`pinned session file is missing for ${worker.id}; refusing a fresh session`);
-    if (worker.harness !== 'claude') {
-      const header = await sessionHeader(worker.session_file);
-      if (!header || header.id !== worker.session_id || header.cwd !== cwd) {
-        throw new OrcaError(`pinned session identity does not match ${worker.id}; refusing a fresh session`);
-      }
+export async function recordSession(teamDir, worker, cwd) {
+  if (!worker.session_file) return;
+  if (!(await exists(worker.session_file))) throw new OrcaError(`pinned session file is missing for ${worker.id}; refusing a fresh session`);
+  if (!worker.session_id) throw new OrcaError(`pinned session has no native identity for ${worker.id}; refusing a fresh session`);
+  if (worker.harness === 'claude') {
+    if (!(await claudeFiles(worker)).includes(worker.session_file)) {
+      throw new OrcaError(`pinned session identity does not match ${worker.id}; refusing a fresh session`);
     }
     return;
   }
-  const candidates = worker.harness === 'codex'
-    ? (await codexSessions(since)).filter(file => file.mtime >= since).map(file => file.path)
-    : await configFor(worker).files(worker);
-  const matches = [];
-  for (const file of candidates) {
-    const header = worker.harness === 'claude' ? { id: worker.session_id, cwd } : await sessionHeader(file);
-    if (header?.id && header.cwd === cwd && (!worker.session_id || header.id === worker.session_id)) {
-      matches.push({ id: header.id, file });
-    }
+  const header = await sessionHeader(worker.session_file);
+  if (!header || header.id !== worker.session_id || header.cwd !== cwd) {
+    throw new OrcaError(`pinned session identity does not match ${worker.id}; refusing a fresh session`);
   }
-  if (matches.length > 1) throw new OrcaError(`ambiguous session identity for ${worker.id}; refusing to choose the latest session`);
-  if (!matches.length) return;
-  const identity = { session_id: matches[0].id, session_file: matches[0].file };
-  await withLock(teamDir, async () => {
-    const team = await load(teamDir);
-    const savedWorker = team.workers[worker.id];
-    if (!savedWorker) throw new OrcaError(`worker ${worker.id} was removed while recording its session`);
-    if (savedWorker.session_file && savedWorker.session_file !== identity.session_file) {
-      throw new OrcaError(`session identity changed for ${worker.id}`);
-    }
-    Object.assign(savedWorker, identity);
-    await save(teamDir, team);
-  });
-  Object.assign(worker, identity);
 }
 
 const HARNESSES = {
   omp: {
-    session: () => null,
     files: ompFiles,
-    async argv(worker, contract) {
-      await mkdir(worker.session_dir, { recursive: true });
-      return [
-        'omp',
-        '--no-title',
-        '--session-dir',
-        worker.session_dir,
-        '--append-system-prompt',
-        contract,
-        ...(worker.session_file ? ['--resume', worker.session_file] : []),
-      ];
-    },
     async cleanup(worker) {
       await dropPointers(worker.session_dir);
       await rm(worker.session_dir, { recursive: true, force: true });
@@ -170,31 +112,14 @@ const HARNESSES = {
   },
   claude: {
     bypass: '--dangerously-skip-permissions',
-    session: randomUUID,
     files: claudeFiles,
-    async argv(worker, contract) {
-      return [
-        'claude',
-        '--append-system-prompt',
-        contract,
-        this.bypass,
-        ...((await claudeFiles(worker)).length ? ['--resume', worker.session_id] : ['--session-id', worker.session_id]),
-      ];
-    },
     async cleanup(worker) {
       await Promise.all((await claudeFiles(worker)).map(file => rm(file, { force: true })));
     },
   },
   codex: {
     bypass: '--dangerously-bypass-approvals-and-sandbox',
-    session: () => null,
     files: codexFiles,
-    async argv(worker, contract) {
-      const config = `developer_instructions=${JSON.stringify(contract)}`;
-      return worker.session_id
-        ? ['codex', 'resume', '-c', config, this.bypass, worker.session_id]
-        : ['codex', '-c', config, this.bypass];
-    },
     async cleanup(worker) {
       if (worker.session_file) await rm(worker.session_file, { force: true });
     },
@@ -243,6 +168,7 @@ const [team, wid] = (process.env.TEAM_BUILDING_WORKER || '/').split('/');
 const root = join(process.env.HOME, '.local/state/team-building', team);
 const name = process.env.TEAM_BUILDING_COMMAND || basename(process.argv[1]);
 const argv = [name, ...process.argv.slice(2)];
+const approvalTask = process.env.TEAM_BUILDING_APPROVAL_TASK;
 const first = (args, options = []) => {
   for (let index = 0; index < args.length; index++) {
     if (options.includes(args[index]) && index + 1 < args.length) {
@@ -261,10 +187,9 @@ const docker = dockerCommand === 'push' || (dockerCommand === 'image' && first(d
 
 let approved = [];
 try {
-  const worker = JSON.parse(readFileSync(join(root, 'team.json'))).workers[wid];
-  const task = worker.approval_task || worker.task;
-  const approval = JSON.parse(readFileSync(join(root, 'approvals', task + '.json')));
-  if (approval.worker === wid) approved = approval.commands || [];
+  if (!approvalTask) throw new Error('no approval source task');
+  const approval = JSON.parse(readFileSync(join(root, 'approvals', approvalTask + '.json')));
+  if (approval.worker === wid && approval.task === approvalTask) approved = approval.commands || [];
 } catch {}
 if ((name !== 'git' || git) && (name !== 'docker' || docker) && !approved.some(command => JSON.stringify(command) === JSON.stringify(argv))) {
   console.error('BLOCKED: needs approval — return blocked with approval_requests');
@@ -288,50 +213,54 @@ await import('./run.mjs');
   }
 }
 
-export const contract = (team, wid) => `You are team-building worker ${wid} of team ${team}. A manager assigns work by sending one line that points to a brief file; write the result file named in that brief. Your context persists across assignments in this team.
+export const contract = (team, wid) => `You are team-building worker ${wid} of team ${team}. Work only on the assigned task. Your task is the prompt sent by your manager.
+
 Rules:
-- Do the assigned work directly. Never run team-building init/member/assign/approve/clear or create another team or worker session.
-- You cannot ask the user. When blocked, write status "blocked", including approval_requests with exact command argv string, target, and why.
-- Touch only assigned files. You MAY delete only paths explicitly listed after \`May delete:\` in the brief, or files you created for this assignment. Never remove a directory wholesale or change git history.
-- Remote/external commands require manager approval. For an unapproved gated command, do not retry it: return blocked with approval_requests. Local work needs no approval.
-- In an isolated worktree, make a local commit and report its branch and commit.
-- Write exactly one JSON object to the result path (via .tmp then rename):
-{"status":"succeeded|failed|blocked","summary":"...","files_changed":["path"],"files_deleted":["path"],"verification":"...","blockers":[],"approval_requests":[],"branch":"","commit":""}`;
+- Implement the assigned slice directly; never run team-building commands, manage teams, or create workers.
+- Do not ask the user. If blocked, return status "blocked" and state the exact need.
+- Touch only assigned files. Delete only paths explicitly allowed by the brief or files you created; never delete a directory wholesale or rewrite git history.
+- External/gated commands need manager approval. If not approved, do not retry; return a blocked result with approval_requests containing the exact command argv, target, and reason. Local commands need no approval.
+- In an isolated worktree, make a local commit and report its branch and commit. Never push.
+- Return exactly one JSON object, without prose or Markdown, containing status ("succeeded", "failed", or "blocked"), summary, files_changed, files_deleted, verification, blockers, approval_requests, branch, and commit. Do not write a result file; the supervisor receives the structured native result.`;
 export function launchConfig(worker) {
-  return {
-    model: worker.task_model ?? worker.model ?? null,
-    thinking: worker.task_thinking ?? null,
-  };
+  return { model: worker.task_model ?? worker.model ?? null, thinking: worker.task_thinking ?? null };
 }
 
-export async function agentCommand(team, worker, { headless = false, prompt } = {}) {
-  if (headless && (!worker.session_id || !worker.session_file || !(await exists(worker.session_file)))) {
-    throw new OrcaError(`no pinned session to resume for ${worker.id}; refusing a fresh session`);
+async function defaultOmpThinking() {
+  const result = await command('omp', ['config', 'get', 'defaultThinkingLevel'], { timeout: 5_000 });
+  const thinking = result.code === 0 ? result.out.trim() : '';
+  if (!/^[a-z][a-z0-9_-]{0,31}$/i.test(thinking)) {
+    throw new OrcaError('could not read a valid OMP defaultThinkingLevel; refusing to inherit native thinking');
   }
-  let args = await configFor(worker).argv(worker, contract(team, worker.id));
-  if (headless) {
-    if (worker.harness === 'codex') {
-      args = ['codex', 'exec', 'resume', '-c', `developer_instructions=${JSON.stringify(contract(team, worker.id))}`, HARNESSES.codex.bypass, worker.session_id];
-    } else {
-      args.push('-p');
-    }
+  return thinking;
+}
+
+export async function nativeTask(team, worker, { prompt, teamDir, cwd }) {
+  const instruction = contract(team, worker.id);
+  const { model, thinking: configuredThinking } = launchConfig(worker);
+  const harness = worker.harness || 'omp';
+  if (worker.session_file) await recordSession(teamDir, worker, cwd);
+  if (harness === 'omp') {
+    const thinking = configuredThinking ?? await defaultOmpThinking();
+    const argv = ['omp', '--mode', 'rpc', '--no-ui', '--no-title', '--session-dir', worker.session_dir, '--append-system-prompt', instruction];
+    if (worker.session_file) argv.push('--resume', worker.session_file);
+    if (model) argv.push('--model', model);
+    argv.push('--thinking', thinking);
+    return { argv, env: {}, thinking };
   }
-  let { model, thinking } = launchConfig(worker);
-  if (headless && !thinking && (!worker.harness || worker.harness === 'omp')) {
-    const configured = await command('omp', ['config', 'get', 'defaultThinkingLevel'], { cwd: worker.cwd });
-    if (configured.code !== 0 || !configured.out.trim()) throw new OrcaError('cannot resolve default thinking for the pinned session');
-    // OMP resumes saved effort unless an override is explicit.
-    thinking = configured.out.trim();
+  if (harness === 'claude') {
+    const schema = JSON.stringify({ type: 'object', additionalProperties: false, required: ['status', 'summary', 'files_changed', 'files_deleted', 'verification', 'blockers', 'approval_requests', 'branch', 'commit'], properties: { status: { enum: ['succeeded', 'failed', 'blocked'] }, summary: { type: 'string' }, files_changed: { type: 'array', items: { type: 'string' } }, files_deleted: { type: 'array', items: { type: 'string' } }, verification: { type: 'string' }, blockers: { type: 'array', items: { type: 'string' } }, approval_requests: { type: 'array' }, branch: { type: 'string' }, commit: { type: 'string' } } });
+    const argv = ['claude', '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--replay-user-messages', '--json-schema', schema, '--append-system-prompt', instruction];
+    if (worker.allow_bypass) argv.push(HARNESSES.claude.bypass);
+    argv.push(...(worker.session_id ? ['--resume', worker.session_id] : ['--session-id', randomUUID()]));
+    if (model) argv.push('--model', model);
+    if (configuredThinking) argv.push('--effort', configuredThinking);
+    return { argv, env: {}, thinking: configuredThinking };
   }
-  if (model) args.push('--model', model);
-  if (thinking && (!worker.harness || worker.harness === 'omp')) args.push('--thinking', thinking);
-  if (headless) args.push(prompt);
-  return [
-    'env',
-    `${WORKER_ENV}=${team}/${worker.id}`,
-    `PATH=${join(STATE_ROOT, team, 'shim')}:${process.env.PATH || ''}`,
-    ...args,
-  ];
+  const argv = ['codex'];
+  if (worker.allow_bypass) argv.push('-c', 'approval_policy="never"', '-c', 'sandbox_mode="danger-full-access"');
+  argv.push('-c', `developer_instructions=${JSON.stringify(instruction)}`, 'app-server');
+  return { argv, env: {}, thinking: configuredThinking };
 }
 export async function closeTerminal(handle) {
   if (!handle) return true;

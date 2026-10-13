@@ -1,115 +1,97 @@
 # team-building
 
-Release: [v0.1.0](https://github.com/DamChan0/team-building-skill/releases/tag/v0.1.0).
+Release: [v0.2.0](https://github.com/DamChan0/team-building-skill/releases/tag/v0.2.0).
 
-![team-building concept: the manager splits a user command into briefs, each worker in its own Orca terminal returns a result, the manager reviews and reports back](concept.webp)
+![team-building concept: the manager splits a user command into briefs, native worker sessions execute them, Orca observer terminals show typed UI messages, and the manager reviews results](concept.webp)
 
-Persistent AI-worker teams: the current session becomes a manager that splits work into slices and hands them to
-persistent worker sessions (w1, w2, …). Each worker runs omp, Claude Code, or Codex in its own
-[Orca](https://github.com/stablyai/orca) terminal and returns a result JSON. Usage and rules: [`SKILL.md`](SKILL.md).
+Persistent AI-worker teams turn the current session into a manager that assigns slices to persistent OMP, Claude Code, or Codex sessions. Node manages team metadata and routing; a singleton Rust supervisor owns native processes, scheduling, sessions, and durable task state. Usage rules are in [`SKILL.md`](SKILL.md).
 
-## Concept
+## Execution model
 
 ```mermaid
 sequenceDiagram
-    actor U as User
-    participant M as Manager session<br/>(SKILL.md)
-    participant H as src/main.mjs
-    participant W1 as w1<br/>(Orca tab, selected harness)
-    participant W2 as w2<br/>(Orca tab, selected harness)
-    U->>M: command
-    M->>M: delegate independent slices<br/>(non-overlapping ownership when delegated)
-    par slice A
-        M->>H: assign slice A
-        H->>W1: brief file + one line via Orca CLI
-        W1->>W1: does the work
-        W1-->>H: results/tNNN.json
-        H-->>M: status · summary · files · verification
-    and slice B
-        M->>H: assign slice B
-        H->>W2: brief file + one line via Orca CLI
-        W2->>W2: does the work
-        W2-->>H: results/tNNN.json
-        H-->>M: status · summary · files · verification
-    end
-    M->>M: review against acceptance checks
-    M-->>U: reviewed result
+    participant M as Node manager
+    participant S as Rust supervisor
+    participant W as Native worker
+    participant O as Orca observer
+    M->>S: versioned object IPC
+    S->>W: private native structured protocol
+    W-->>S: validated result + exact session identity
+    S-->>M: durable task state/events
+    O->>S: view typed UI log
 ```
 
-- Workers are persistent: each keeps its own harness session, so a follow-up to `wN` has earlier context.
-- A worker pins its native session ID/file and Orca PTY/pane identity. Stale handles reconnect to that worker. Confirmed exit or model change uses an exact noninteractive resume, never another Orca tab or a latest-session selector. Unknown process state or missing/ambiguous session identity fails closed; `status` reports the session and transport.
-- Every assignment returns `succeeded`, `failed` or `blocked`, including on timeout, a crash or a bad model.
-  Workers never ask the user; they report `blocked` with the exact need.
-- `team clear` collects a wrap-up from every worker, closes their terminals and writes one summary report.
+- Local IPC uses `{ "version": 1, "id": "<uuid>", "type": "<command>", "payload": { ... } }`. Every envelope and payload is an object; scalar requests are rejected. Responses and events are correlated objects.
+- OMP RPC, Claude stream-json, and Codex app-server JSON-RPC remain private to the Rust worker. Orca terminals are read-only observers of typed UI messages; they never receive native protocol traffic or TaskResult JSON.
+- A manager EOF never cancels work. Identical retries with the same `--request-id` replay the durable assignment; a changed assignment conflicts. FIFO queues are per worker.
+- A restarted running task becomes `unknown`, never a synthetic success/failure. It stays fenced until the broker proves its recorded process group stopped. Recovery blocks queued successors and preserves the exact native session.
+- Resume only the persisted identity. OMP requires its native session file; Claude and Codex resume their exact broker-recorded IDs. Never use `latest`, `continue`, or a fresh session as recovery.
+- Resource bounds: current-thread Tokio runtime; at most 32 IPC clients and 4 active workers; 1 MiB protocol frames, 1024 queued tasks, bounded/rotated worker logs, SQLite cache 512 KiB with mmap disabled. The observer is the Rust binary, not a resident Node process.
 
-- Shared cwd is the default. `team init --isolate` gives each worker an Orca worktree and requires a local commit for manager review/merge; each worktree has separate build caches (for example `target/` or `node_modules`), so cold builds and disk use increase.
-- OMP teams route automatically after `init`: plain `init` or `init gpt` selects GPT; `init claude` (also `init --model claude`) selects the Claude model family, not the native Claude Code harness. Claude workers start with a Sonnet baseline for simple/moderate work; complex assignments upgrade only the selected worker's same session to Opus. The next ordinary assignment returns that session to Sonnet. Haiku is only the lightweight classifier. Init refreshes and saves OMP's catalog; `assign --difficulty` selects a saved tier without classification, and `assign --model` overrides one task. Fixed exact-model and native Claude Code/Codex teams do not auto-route.
-- Assignments use an idle timeout (default 1200 seconds) and absolute cap (default 14400 seconds). External commands are blocked pending an exact per-task approval.
+## Requirements and install
 
-## Requirements
-
-- Node.js 20+ with npm, and Orca running with its CLI on `PATH` as `orca-ide` (tested with 1.4.197). Different name →
-  `export ORCA_CLI_COMMAND=<cli>`. Never point it at bare `orca` on Linux (GNOME screen reader).
-- OMP is the default worker harness. Claude Code and Codex are supported when explicitly selected with
-  `--harness claude` or `--harness codex`; both require `--allow-bypass`.
-
-## Install
-
-Install with the [Skills CLI](https://github.com/vercel-labs/skills). The `cline` target is intentional: it bridges
-the canonical skill to `~/.agents/skills`, the shared location OMP reads. Codex and Claude Code targets are installed
-at the same time where supported. The second command installs the required Node dependencies:
+Node.js 20+, npm, Rust/Cargo, OMP, and a running Orca CLI (`orca-ide`) are required. On Linux, do not use bare `orca`; it is the GNOME screen reader. Set `ORCA_CLI_COMMAND` if the CLI binary has another name. OMP is the default harness and requires `tools.approvalMode=yolo`. Native Claude Code and Codex require explicit `--allow-bypass`.
 
 ```sh
 npx --yes skills add DamChan0/team-building-skill --skill team-building --yes -g -a cline -a codex -a claude-code && \
   node ~/.agents/skills/team-building/install.mjs
 ```
 
-Setup also adds OMP's `/team-building` command with inline parameter examples. Type `/team-building ` to see the hint, for example `init claude --member 3`. Claude Code uses the skill's `argument-hint`; OMP's `/skill:team-building` picker shows examples in its description instead.
-
-If OMP is missing, setup still completes but prints the official Linux/macOS installation suggestion:
+The setup script installs Node dependencies and builds `supervisor/` with `cargo build --release --locked`. The first supervisor use performs the same locked build if the binary is absent; there is no Node transport fallback. If OMP is missing, setup still installs the command and prints the official Linux/macOS suggestion:
 
 ```sh
 curl -fsSL https://omp.sh/install | sh
 ```
 
-See <https://omp.sh/docs/quickstart>. Restart the manager harness, then say `team init` (or
-`팀 만들어줘, 작업자 4명`). Use `team init --harness claude --allow-bypass` or
-`--harness codex --allow-bypass` only when selecting those worker harnesses.
+See <https://omp.sh/docs/quickstart>. Restart the manager harness after installing the skill.
 
-## Routing an OMP team
+## Routing
 
 ```sh
-# Refresh and pin the current GPT catalog, then let assignment route the original brief.
+# Refresh and pin the GPT-family map, then let the classifier route the brief.
 node ~/.agents/skills/team-building/src/main.mjs init --member 3
-node ~/.agents/skills/team-building/src/main.mjs assign "Fix the failing parser test."
+node ~/.agents/skills/team-building/src/main.mjs assign "Fix the failing parser test"
 
-# Or pin the current Claude-family catalog for this OMP team.
+# Or select the Claude model family for an OMP team.
 node ~/.agents/skills/team-building/src/main.mjs init claude --member 3
-node ~/.agents/skills/team-building/src/main.mjs assign "Review this concurrent cache change."
+node ~/.agents/skills/team-building/src/main.mjs assign "Review this concurrent cache change"
 ```
 
-GPT tiers: **simple** Luna Max, **moderate** Terra, **complex** Sol, **extreme** Astra. Claude tiers: **simple/moderate** Sonnet, **complex** Opus, **extreme** the same latest Opus with explicit `thinking=xhigh`; Haiku classifies only. Astra has no explicit thinking override. Opus must support xhigh or initialization fails rather than downgrades. Existing three-tier teams must rerun `init` to acquire extreme.
+Plain `init` / `init gpt` selects the GPT family. `init claude` selects the Claude family for OMP; it does not select native Claude Code. Use `--harness claude --allow-bypass` for native Claude Code. An exact `init --model <selector>` creates a fixed-model team and disables automatic routing.
 
-When an OMP session resumes without a task-specific effort override, the helper explicitly reapplies `defaultThinkingLevel`; an earlier extreme task's saved `xhigh` cannot leak into ordinary work.
+GPT tiers are simple Luna Max, moderate Terra, complex Sol, extreme Astra. Claude tiers are simple/moderate Sonnet, complex Opus, and extreme Opus with `thinking=xhigh`; Haiku is only the lightweight classifier. Initialization fails rather than downgrading if the required model/effort is unavailable. The saved map remains stable until the next `init` adoption. `assign --difficulty simple|moderate|complex|extreme` uses a saved tier without classification; `assign --model <selector>` is a per-task override. Invalid classifier output, routing errors, or a changed map fail closed.
 
-The saved map is deliberately stable for a team: run `init` again to refresh it. Use
-`assign --difficulty simple|moderate|complex|extreme` when you already know the tier, or
-`assign --model <selector>` for an exact one-task override. `init --model <exact selector>`
-creates a fixed-model team instead; it does not auto-route.
+OMP resumes without task-specific thinking by explicitly applying its configured `defaultThinkingLevel`; an earlier extreme task's `xhigh` cannot leak into ordinary work.
 
-The Claude family keeps the native session ID/file across model changes; it never creates another Orca tab to upgrade a task. `--harness claude --allow-bypass` explicitly selects the native Claude Code CLI instead of OMP family routing.
-
-Update only this installed skill, then re-run dependency setup:
+## Commands and recovery
 
 ```sh
-npx --yes skills update team-building --global --yes && \
-  node ~/.agents/skills/team-building/install.mjs
+node ~/.agents/skills/team-building/src/main.mjs init [gpt|claude] [--member N] [--model M] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--new]
+node ~/.agents/skills/team-building/src/main.mjs member N [--model M] [--harness H] [--allow-bypass]
+node ~/.agents/skills/team-building/src/main.mjs status [--team ID]
+node ~/.agents/skills/team-building/src/main.mjs assign [--worker wN] [--approval tNNN] [--request-id UUID] [--model M] [--difficulty TIER] PROMPT
+node ~/.agents/skills/team-building/src/main.mjs approve --worker wN --task tNNN -- COMMAND...
+node ~/.agents/skills/team-building/src/main.mjs stop --worker wN [--team ID]
+node ~/.agents/skills/team-building/src/main.mjs clear [--team ID]
 ```
 
-Uninstall: run `team clear` first, then `npx skills remove -g team-building`. If setup installed the generated OMP alias, remove `team-building.md` from the commands directory reported by setup as well; leave user-owned conflicting aliases unchanged.
+An active team is adopted by `init`; `--new` forces a separate team. If multiple teams are active, pass `--team <id>`. `--timeout` is the idle timeout (default 1200 seconds); `--max` is the absolute cap (default 14400 seconds). A 60-second supervisor wait checkpoint is not a worker failure.
 
-## Files written at runtime
+A request interrupted after submission can be retried with the same `--request-id` and identical assignment. A changed prompt, team, worker, model, thinking, difficulty, or approval conflicts rather than rerouting. `assign --approval tNNN` keeps the approved source task and worker bound in the PATH shim.
 
-- `~/.local/state/team-building/<team-id>/` — team state, briefs, results, worker sessions (deleted by `clear`)
-- `~/work-notes/team-building/<date>-<team-id>.md` — wrap-up report written by `clear`
-- `~/.omp/agent/commands/team-building.md` — generated parameter-hint command installed by setup; `PI_CONFIG_DIR` and `OMP_PROFILE`/`PI_PROFILE` select its config/profile directory
+Recover a broker-owned `unknown` worker with `stop --team <id> --worker wN`. The command verifies native process ownership, blocks queued tasks rather than replaying them, and preserves the last exact session; resubmit follow-up work afterward. A legacy live terminal has no broker-owned process identity and remains blocked. Closing an Orca tab is not stop proof.
+
+## Worktrees and permissions
+
+Shared teams are bound to the active Orca worktree. Every assignment checks that the team worktree still matches and that the selected worker's cwd stays inside it. `--isolate` creates a separate Orca worktree per worker; uncommitted manager changes are not copied there. Review isolated commits in the manager worktree and merge/cherry-pick locally; workers never push. `clear` removes only clean merged isolated worktrees and leaves dirty/unmerged worktrees in place.
+
+Gated external commands include `git push`, `ssh`, `scp`, `rsync`, `sftp`, `gh`, and `docker push` (plus `TEAM_BUILDING_GATED_EXTRA`). Approval is exact, per worker and source task; even read-only `ssh` needs approval. PATH shims deter mistakes, not malicious workers: absolute paths and harness-native remote tools can bypass them.
+
+## Runtime files
+
+- `~/.local/state/team-building/<team-id>/` — team metadata, approvals, results, worker logs, and session references; removed by `clear` only after verified recovery/retirement.
+- `~/.local/state/team-building/supervisor/` — singleton supervisor SQLite database and lock.
+- `~/work-notes/team-building/<date>-<team-id>.md` — summary written by `clear`.
+- `~/.omp/agent/commands/team-building.md` — generated OMP command alias; `PI_CONFIG_DIR` and `OMP_PROFILE`/`PI_PROFILE` select its config/profile directory. Setup leaves conflicting user-owned aliases unchanged.
+
+Uninstall: run `team clear` first, then `npx skills remove -g team-building`. Remove the generated OMP alias from the commands directory reported by setup; leave user-owned aliases untouched.

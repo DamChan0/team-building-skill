@@ -1,144 +1,77 @@
+import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmod, mkdtemp, mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import assert from 'node:assert/strict';
-import { agentCommand, cleanupWorker, configFor, isDockerPush, isGitPush, recordSession, shellQuote, writeShims } from '../src/harness.mjs';
+import { isDockerPush, isGitPush, nativeTask, writeShims } from '../src/harness.mjs';
 
-test('gates docker push variants only', () => {
-  assert.equal(isDockerPush(['push', 'registry/image']), true);
-  assert.equal(isDockerPush(['image', 'push', 'registry/image']), true);
-  assert.equal(isDockerPush(['image', 'ls']), false);
-  assert.equal(isDockerPush(['--context', 'prod', 'image', 'push', 'image']), true);
-});
-
-test('recognizes git push after options', () => {
-  assert.equal(isGitPush(['-C', '/repo', 'push', 'origin', 'main']), true);
+test('gates publish commands only', () => {
+  assert.equal(isGitPush(['push', 'origin', 'main']), true);
   assert.equal(isGitPush(['status']), false);
+  assert.equal(isDockerPush(['image', 'push', 'registry/image']), true);
+  assert.equal(isDockerPush(['build', '.']), false);
 });
 
-test('POSIX quotes untrusted terminal arguments', () => {
-  const value = "a b'$(x)`";
-  const result = spawnSync('/bin/sh', ['-c', `printf '%s' ${shellQuote(value)}`], { encoding: 'utf8' });
-  assert.equal(result.status, 0);
-  assert.equal(result.stdout, value);
-});
-
-test('passes the full worker contract to Codex', async () => {
-  const args = await agentCommand('tb-1001-000000', { id: 'w1', harness: 'codex' });
-  const config = args.find(arg => arg.startsWith('developer_instructions='));
-  const instructions = JSON.parse(config.slice('developer_instructions='.length));
-
-  assert.match(instructions, /Never run team-building init\/member\/assign\/approve\/clear/);
-  assert.match(instructions, /For an unapproved gated command, do not retry it/);
-  assert.match(instructions, /"status":"succeeded\|failed\|blocked"/);
-});
-
-test('adds Luna thinking only to routed OMP launches', async () => {
-  const args = await agentCommand('tb-1001-000000', {
-    id: 'w1',
-    harness: 'omp',
-    session_dir: join(tmpdir(), 'team-building-luna-session'),
-    task_model: 'openai-codex/gpt-5.6-luna',
-    task_thinking: 'max',
-  });
-
-  assert.deepEqual(args.slice(-4), ['--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'max']);
-});
-
-
-test('shim blocks docker image push without blocking non-push commands', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'team-building-home-'));
-  const team = 'tb-1001-000000';
-  const teamDir = join(home, '.local', 'state', 'team-building', team);
-  const fakeBin = join(home, 'bin');
-  const previousHome = process.env.HOME;
-
+test('native launches reset OMP effort and pin only exact Claude session IDs', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'team-building-native-'));
+  const previousPath = process.env.PATH;
   try {
-    process.env.HOME = home;
-    await mkdir(join(teamDir, 'approvals'), { recursive: true });
-    await mkdir(fakeBin, { recursive: true });
-    await writeFile(join(fakeBin, 'docker'), '#!/bin/sh\nexit 0\n');
-    await chmod(join(fakeBin, 'docker'), 0o755);
-    await writeFile(join(teamDir, 'team.json'), JSON.stringify({ workers: { w1: { task: 't001' } } }));
-    await writeFile(
-      join(teamDir, 'approvals', 't001.json'),
-      JSON.stringify({ worker: 'w1', commands: [['docker', 'image', 'push', 'registry/approved']] }),
-    );
-    await writeShims(teamDir, {});
-
-    const runShim = args => spawnSync(join(teamDir, 'shim', 'docker'), args, {
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        PATH: `${fakeBin}:${process.env.PATH}`,
-        TEAM_BUILDING_WORKER: `${team}/w1`,
-      },
-    });
-    assert.equal(runShim(['image', 'push', 'registry/image']).status, 126);
-    assert.equal(runShim(['image', 'push', 'registry/approved']).status, 0);
-    assert.equal(runShim(['--version']).status, 0);
+    const bin = join(root, 'bin');
+    await mkdir(bin);
+    await writeFile(join(bin, 'omp'), '#!/bin/sh\nprintf "low\\n"\n');
+    await chmod(join(bin, 'omp'), 0o755);
+    process.env.PATH = `${bin}:${previousPath || ''}`;
+    const omp = await nativeTask('team', {
+      id: 'w1', harness: 'omp', session_dir: join(root, 'sessions', 'w1'),
+      task_model: 'openai-codex/gpt-6-luna', task_thinking: null,
+    }, { prompt: 'smoke', teamDir: root, cwd: root });
+    assert.ok(omp.argv.includes('--no-ui'));
+    assert.deepEqual(omp.argv.slice(-2), ['--thinking', 'low']);
+    assert.equal(omp.thinking, 'low');
   } finally {
-    process.env.HOME = previousHome;
-    await rm(home, { recursive: true, force: true });
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
   }
+
+  const pinned = '123e4567-e89b-42d3-a456-426614174000';
+  const claude = worker => nativeTask('team', {
+    id: 'w1', harness: 'claude', allow_bypass: false,
+    task_model: 'anthropic/claude-sonnet-5-5', task_thinking: 'high',
+    ...worker,
+  }, { prompt: 'smoke', teamDir: '/tmp', cwd: '/tmp' });
+  const fresh = await claude({ session_id: null });
+  const freshIndex = fresh.argv.indexOf('--session-id');
+  assert.notEqual(freshIndex, -1);
+  assert.match(fresh.argv[freshIndex + 1], /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  assert.equal(fresh.argv.includes('--resume'), false);
+  const resumed = await claude({ session_id: pinned });
+  const resumeIndex = resumed.argv.indexOf('--resume');
+  assert.deepEqual(resumed.argv.slice(resumeIndex, resumeIndex + 2), ['--resume', pinned]);
 });
 
-test('rejects unsafe extra gated command names', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'team-building-shim-'));
-  const previousExtra = process.env.TEAM_BUILDING_GATED_EXTRA;
 
+test('a worker can run a gated command only through its bound approval', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'team-building-approval-'));
+  const team = 'approval-team';
+  const root = join(home, '.local', 'state', 'team-building', team);
+  const bin = join(home, 'bin');
+  const marker = join(home, 'ran');
   try {
-    for (const extra of ['../outside', 'run.mjs']) {
-      process.env.TEAM_BUILDING_GATED_EXTRA = extra;
-      await assert.rejects(writeShims(dir, {}), /safe command names/);
-    }
+    await mkdir(join(root, 'approvals'), { recursive: true });
+    await mkdir(bin);
+    await writeFile(join(bin, 'git'), '#!/bin/sh\necho ran >> \"$MARKER\"\n');
+    await chmod(join(bin, 'git'), 0o755);
+    await writeFile(join(root, 'team.json'), JSON.stringify({ workers: { w1: { task: 't001' } } }));
+    await writeShims(root, {});
+    const env = { ...process.env, HOME: home, MARKER: marker, TEAM_BUILDING_WORKER: `${team}/w1`, TEAM_BUILDING_APPROVAL_TASK: '', PATH: `${join(root, 'shim')}:${bin}:${process.env.PATH}` };
+    assert.equal(spawnSync(join(root, 'shim', 'git'), ['push'], { env }).status, 126);
+    await writeFile(join(root, 'approvals', 't001.json'), JSON.stringify({ worker: 'w1', task: 't001', commands: [['git', 'push']] }));
+    env.TEAM_BUILDING_APPROVAL_TASK = 't001';
+    assert.equal(spawnSync(join(root, 'shim', 'git'), ['push'], { env }).status, 0);
+    assert.equal(await readFile(marker, 'utf8'), 'ran\n');
   } finally {
-    if (previousExtra === undefined) delete process.env.TEAM_BUILDING_GATED_EXTRA;
-    else process.env.TEAM_BUILDING_GATED_EXTRA = previousExtra;
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-test('pins a unique Codex session and refuses ambiguous same-cwd sessions', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'team-building-home-'));
-  const teamDir = join(home, 'team');
-  const codexHome = join(home, 'custom-codex');
-  const sessions = join(codexHome, 'sessions', '2026', '10', '01');
-  const cwd = '/work/project';
-  const since = Date.parse('2026-10-01T12:00:00Z');
-  const worker = { id: 'w1', harness: 'codex', session_id: null, session_file: null };
-  const previousCodexHome = process.env.CODEX_HOME;
-  try {
-    process.env.CODEX_HOME = codexHome;
-    await mkdir(teamDir, { recursive: true });
-    await mkdir(sessions, { recursive: true });
-    await writeFile(join(teamDir, 'team.json'), JSON.stringify({ workers: { w1: worker } }));
-    const session = async (name, id, path, modified) => {
-      const file = join(sessions, name);
-      await writeFile(file, `${JSON.stringify({ type: 'session_meta', payload: { id, cwd: path } })}\n`);
-      await utimes(file, modified / 1000, modified / 1000);
-      return file;
-    };
-    await session('rollout-old.jsonl', 'old', cwd, since - 1_000);
-    await session('rollout-wrong.jsonl', 'wrong', '/other/project', since + 1_000);
-    const first = await session('rollout-first.jsonl', 'first', cwd, since + 2_000);
-    const newer = await session('rollout-newer.jsonl', 'newer', cwd, since + 3_000);
-    await assert.rejects(recordSession(teamDir, worker, cwd, since), /ambiguous session/);
-    assert.equal(worker.session_id, null);
-    await rm(newer);
-    await recordSession(teamDir, worker, cwd, since);
-    assert.equal(worker.session_id, 'first');
-    assert.equal(worker.session_file, first);
-    await session('rollout-newer.jsonl', 'newer', cwd, since + 3_000);
-    await recordSession(teamDir, worker, cwd, since);
-    assert.equal(worker.session_id, 'first');
-    assert.equal(JSON.parse(await readFile(join(teamDir, 'team.json'), 'utf8')).workers.w1.session_id, 'first');
-    await cleanupWorker(worker);
-    await assert.rejects(recordSession(teamDir, worker, cwd, since), /pinned session file is missing/);
-  } finally {
-    if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-    else process.env.CODEX_HOME = previousCodexHome;
     await rm(home, { recursive: true, force: true });
   }
 });

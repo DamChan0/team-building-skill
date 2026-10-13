@@ -1,0 +1,326 @@
+import assert from 'node:assert/strict';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import net from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import test from 'node:test';
+import { Supervisor, supervisorBinary, supervisorPaths } from '../src/supervisor.mjs';
+
+const result = JSON.stringify({ status: 'succeeded', summary: 'fixture completed', verification: 'fixture' });
+const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+const uuid = index => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+const cli = fileURLToPath(new URL('../src/main.mjs', import.meta.url));
+
+const fixture = `
+import { appendFileSync, writeFileSync } from 'node:fs';
+import net from 'node:net';
+import readline from 'node:readline';
+const mode = process.env.FIXTURE_MODE;
+const session = process.env.FIXTURE_SESSION;
+const sessionFile = process.env.FIXTURE_SESSION_FILE;
+const control = process.env.FIXTURE_CONTROL;
+const effect = process.env.FIXTURE_EFFECT;
+let request;
+let thread;
+let turn;
+let complete;
+writeFileSync(sessionFile, session);
+const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
+const finish = () => {
+  if (!complete) return;
+  appendFileSync(effect, session + '\\n');
+  if (mode === 'codex') {
+    send({ jsonrpc: '2.0', method: 'item/completed', params: { threadId: thread, turnId: turn, item: { type: 'agentMessage', text: ${JSON.stringify(result)} } } });
+    send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: thread, turnId: turn, turn: { status: 'completed' } } });
+  } else {
+    send({ type: 'prompt_result', id: request, status: 'completed', sessionSettled: true });
+  }
+};
+const server = net.createServer(socket => {
+  let input = '';
+  socket.on('data', chunk => {
+    input += chunk;
+    const end = input.indexOf('\\n');
+    if (end < 0) return;
+    const message = JSON.parse(input.slice(0, end));
+    if (message && typeof message === 'object' && message.type === 'complete') {
+      complete = true;
+      finish();
+      socket.end(JSON.stringify({ type: 'ack' }) + '\\n');
+    }
+  });
+});
+server.listen(control, () => {
+  if (mode !== 'codex') send({ type: 'ready', protocolVersion: 1, supportedProtocolVersions: [1] });
+});
+readline.createInterface({ input: process.stdin }).on('line', line => {
+  const message = JSON.parse(line);
+  if (mode === 'codex') {
+    if (message.id === 1) {
+      send({ jsonrpc: '2.0', id: 1, result: {} });
+    } else if (message.id === 2) {
+      thread = 'thread-' + session;
+      send({ jsonrpc: '2.0', id: 2, result: { thread: { id: thread } } });
+    } else if (message.id === 3) {
+      turn = 'turn-' + session;
+      send({ jsonrpc: '2.0', id: 3, result: { turn: { id: turn } } });
+      send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: thread, turnId: 'wrong-turn', turn: { status: 'completed' } } });
+    }
+    return;
+  }
+  if (message.type === 'get_state') {
+    send({ type: 'response', id: message.id, success: true, data: { sessionId: session, sessionFile, isSettled: message.id === 'settled' } });
+  } else if (message.type === 'prompt') {
+    request = message.id;
+    send({ type: 'response', id: request, success: true });
+    writeFileSync(process.env.FIXTURE_READY, 'ready');
+    send({ type: 'session_settled' });
+  } else if (message.type === 'get_last_assistant_text') {
+    send({ type: 'response', id: message.id, success: true, data: { text: ${JSON.stringify(result)} } });
+  }
+});
+`;
+
+async function connectControl(path) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      await new Promise((resolve, reject) => {
+        const socket = net.createConnection(path);
+        socket.once('error', reject);
+        socket.once('connect', () => socket.write(`${JSON.stringify({ type: 'complete' })}\n`));
+        socket.once('data', chunk => {
+          try {
+            const ack = JSON.parse(chunk.toString('utf8').trim());
+            if (ack?.type !== 'ack') throw new Error('fixture returned an invalid control acknowledgement');
+            socket.end();
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        });
+      });
+      return;
+    } catch {
+      await delay(20);
+    }
+  }
+  throw new Error('fixture control socket did not become ready');
+}
+
+async function waitForFile(path, diagnostic) {
+  for (let attempt = 0; attempt < 100 && !existsSync(path); attempt++) await delay(10);
+  assert.ok(existsSync(path), `fixture did not create ${path}: ${JSON.stringify(await diagnostic())}`);
+}
+
+async function start(root, name = 'supervisor', paths = null) {
+  const stateDir = paths?.stateDir || join(root, name, 'state');
+  const socket = paths?.socket || join(root, name, 'socket');
+  await mkdir(stateDir, { recursive: true });
+  const process = spawn(supervisorBinary, ['serve', '--state-dir', stateDir, '--socket', socket], { stdio: ['ignore', 'pipe', 'pipe'] });
+  await new Promise((resolve, reject) => {
+    let output = '';
+    const timer = setTimeout(() => reject(new Error('supervisor did not become ready')), 5_000);
+    process.once('error', reject);
+    process.stdout.on('data', chunk => {
+      output += chunk;
+      if (!output.includes('"ready":true')) return;
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+  return { process, client: new Supervisor({ stateDir, socket }) };
+}
+
+async function stop(daemon, signal = false) {
+  if (daemon.process.exitCode !== null) return;
+  if (signal) daemon.process.kill('SIGKILL');
+  else await daemon.client.request('shutdown').catch(() => {});
+  await new Promise(resolve => daemon.process.once('exit', resolve));
+}
+
+function task(root, request, control, effect, { team = 'team', harness = 'omp', session = null, sessionFile = null, worker = 'w1', task: name = 't001' } = {}) {
+  const nativeSessionFile = sessionFile || join(root, `${request}.session`);
+  return {
+    team_dir: root,
+    team, worker, task: name, kind: 'task', cwd: root, harness,
+    argv: [process.execPath, join(root, 'fixture.mjs')],
+    env: { FIXTURE_MODE: harness, FIXTURE_SESSION: session || `session-${request}`, FIXTURE_SESSION_FILE: nativeSessionFile, FIXTURE_CONTROL: control, FIXTURE_EFFECT: effect, FIXTURE_READY: `${control}.ready` },
+    prompt: 'Complete this fixture task and report a structured result.',
+    log: join(root, `${request}.log`), idle_timeout_ms: 10_000, max_timeout_ms: 30_000,
+  };
+}
+
+async function running(client, request) {
+  let after = 0;
+  for (;;) {
+    const reply = await client.wait(request, after, 1_000);
+    for (const event of reply.events) {
+      after = Math.max(after, event.seq);
+      await client.ack(request, event.seq);
+    }
+    if (reply.task.state === 'running') return reply.task;
+    if (['failed', 'blocked', 'unknown'].includes(reply.task.state)) throw new Error(`worker failed before running: ${JSON.stringify(reply.task)}`);
+  }
+}
+
+async function owned(client, request) {
+  let after = 0;
+  for (;;) {
+    const reply = await client.wait(request, after, 1_000);
+    for (const event of reply.events) {
+      after = Math.max(after, event.seq);
+      if (event.state === 'owned') return;
+    }
+    if (['failed', 'blocked', 'unknown'].includes(reply.task.state)) throw new Error(`worker failed before ownership: ${JSON.stringify(reply.task)}`);
+  }
+}
+
+async function terminal(client, request) {
+  let after = 0;
+  for (;;) {
+    const reply = await client.wait(request, after, 1_000);
+    for (const event of reply.events) after = Math.max(after, event.seq);
+    if (['succeeded', 'failed', 'blocked', 'unknown'].includes(reply.task.state)) return reply.task;
+  }
+}
+
+const available = existsSync(supervisorBinary);
+test('broker keeps native work pending through acceptance and reuses its exact session', { skip: !available, concurrency: false }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'team-supervisor-'));
+  const effect = join(root, 'effect');
+  let daemon;
+  try {
+    await writeFile(join(root, 'fixture.mjs'), fixture);
+    daemon = await start(root);
+    const first = uuid(1);
+    const firstControl = join(root, 'first.sock');
+    await daemon.client.submit(task(root, first, firstControl, effect), first);
+    await running(daemon.client, first);
+    await waitForFile(`${firstControl}.ready`, async () => (await daemon.client.get(first)).task);
+    const previous = await daemon.client.wait(first, 0, 0);
+    const after = previous.events.at(-1)?.seq || 0;
+    const waiting = daemon.client.wait(first, after, 30_000);
+    await connectControl(firstControl);
+    const completedReply = await Promise.race([waiting, delay(1_000).then(() => null)]);
+    assert.ok(completedReply, 'terminal event must wake an active waiter before its checkpoint');
+    const completed = completedReply.task;
+    assert.equal(completed.state, 'succeeded');
+    assert.equal(completed.session_id, `session-${first}`);
+
+    const second = uuid(2);
+    const secondControl = join(root, 'second.sock');
+    await daemon.client.submit(task(root, second, secondControl, effect, { session: completed.session_id, sessionFile: completed.session_file, task: 't002' }), second);
+    await running(daemon.client, second);
+    await connectControl(secondControl);
+    assert.equal((await terminal(daemon.client, second)).session_id, completed.session_id);
+    assert.equal((await daemon.client.status('team')).workers[0].assignments, 2);
+    assert.deepEqual(readFileSync(effect, 'utf8').trim().split('\n'), [completed.session_id, completed.session_id]);
+  } finally {
+    if (daemon) await stop(daemon);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('broker survives manager EOF and makes identical request retries single-execution', { skip: !available, concurrency: false }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'team-supervisor-'));
+  const effect = join(root, 'effect');
+  let daemon;
+  try {
+    await writeFile(join(root, 'fixture.mjs'), fixture);
+    daemon = await start(root);
+    const request = uuid(3);
+    const control = join(root, 'eof.sock');
+    const spec = task(root, request, control, effect);
+    await new Promise((resolve, reject) => {
+      const socket = net.createConnection(daemon.client.paths.socket);
+      socket.once('error', reject);
+      socket.once('connect', () => { socket.end(`${JSON.stringify({ version: 1, id: request, type: 'submit', payload: spec })}\n`); resolve(); });
+    });
+    await running(daemon.client, request);
+    await daemon.client.submit(spec, request);
+    await assert.rejects(daemon.client.submit({ ...spec, prompt: 'different' }, request), error => error.code === 'conflict');
+    await connectControl(control);
+    assert.equal((await terminal(daemon.client, request)).state, 'succeeded');
+    assert.equal(readFileSync(effect, 'utf8').trim().split('\n').length, 1);
+  } finally {
+    if (daemon) await stop(daemon);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Codex ignores a wrong-turn completion until its matching result arrives', { skip: !available, concurrency: false }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'team-supervisor-'));
+  let daemon;
+  try {
+    await writeFile(join(root, 'fixture.mjs'), fixture);
+    daemon = await start(root);
+    const request = uuid(4);
+    const control = join(root, 'codex.sock');
+    await daemon.client.submit(task(root, request, control, join(root, 'effect'), { harness: 'codex' }), request);
+    await running(daemon.client, request);
+    await connectControl(control);
+    assert.equal((await terminal(daemon.client, request)).state, 'succeeded');
+  } finally {
+    if (daemon) await stop(daemon);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('restart marks running work unknown and fences its queued successor until verified CLI stop', { skip: !available, concurrency: false }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'team-supervisor-'));
+  const effect = join(root, 'effect');
+  const stateRoot = join(root, '.local', 'state', 'team-building');
+  const runtime = join(root, 'runtime');
+  const team = 'tb-0101-000001';
+  const teamDir = join(stateRoot, team);
+  const previousRuntime = process.env.XDG_RUNTIME_DIR;
+  let daemon;
+  try {
+    process.env.XDG_RUNTIME_DIR = runtime;
+    const paths = supervisorPaths(stateRoot);
+    await mkdir(runtime, { recursive: true, mode: 0o700 });
+    await mkdir(teamDir, { recursive: true });
+    await writeFile(join(teamDir, 'team.json'), JSON.stringify({
+      id: team,
+      queue: [],
+      workers: { w1: { id: 'w1', state: 'idle', harness: 'omp', log: join(teamDir, 'w1.log'), assignments: 0 } },
+    }));
+    await writeFile(join(root, 'fixture.mjs'), fixture);
+    daemon = await start(root, 'supervisor', paths);
+    const first = uuid(5);
+    const firstControl = join(root, 'restart-first.sock');
+    await daemon.client.submit(task(root, first, firstControl, effect, { team }), first);
+    await running(daemon.client, first);
+    await owned(daemon.client, first);
+    await waitForFile(`${firstControl}.ready`, async () => (await daemon.client.get(first)).task);
+    await stop(daemon, true);
+    daemon = await start(root, 'supervisor', paths);
+
+    const second = uuid(6);
+    const control = join(root, 'restart-second.sock');
+    await daemon.client.submit(task(root, second, control, effect, { team, task: 't002' }), second);
+    const before = await daemon.client.status(team);
+    assert.deepEqual([before.workers[0].state, before.queued], ['unknown', 1]);
+
+    const result = spawnSync(process.execPath, [cli, 'stop', '--team', team, '--worker', 'w1'], {
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: { ...process.env, HOME: root, XDG_RUNTIME_DIR: runtime },
+    });
+    assert.equal(result.status, 0, `${result.error?.message || ''}${result.stderr}`);
+    assert.match(result.stdout, /broker-proven idle/);
+    const saved = JSON.parse(readFileSync(join(teamDir, 'team.json'), 'utf8'));
+    assert.equal(saved.workers.w1.state, 'idle');
+    assert.equal(saved.workers.w1.session_id, `session-${first}`);
+    assert.equal((await daemon.client.get(second)).task.state, 'blocked');
+    assert.equal((await daemon.client.status(team)).queued, 0);
+  } finally {
+    if (previousRuntime === undefined) delete process.env.XDG_RUNTIME_DIR;
+    else process.env.XDG_RUNTIME_DIR = previousRuntime;
+    if (daemon) await stop(daemon);
+    await rm(root, { recursive: true, force: true });
+  }
+});

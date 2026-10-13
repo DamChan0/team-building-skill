@@ -1,19 +1,16 @@
 #!/usr/bin/env node
 import {
-  appendFile,
   mkdir,
   readFile,
   readdir,
   rename,
   rm,
-  stat,
   writeFile,
 } from 'node:fs/promises';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
-import { createWriteStream, realpathSync } from 'node:fs';
-import { finished } from 'node:stream/promises';
+import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import {
   activeTeams,
   DEFAULT_MAX,
@@ -32,27 +29,22 @@ import {
   writeResult,
 } from './state.mjs';
 import {
-  agentCommand,
-  launchConfig,
   cleanupWorker,
   closeTerminal,
   command,
   configFor,
   OrcaError,
   orca,
-  recordSession,
   requireOmp,
   requireOrca,
-  shellQuote,
-  sleep,
   writeShims,
+  nativeTask,
 } from './harness.mjs';
+import { connectSupervisor, supervisorBinary } from './supervisor.mjs';
 import { classifyRequest, configureRouter, DIFFICULTIES } from './router.mjs';
 
 const MAX_WORKERS = 8;
 const WARN_WORKERS = 4;
-const POLL_MS = 2_000;
-const ACTIVITY_CHECK_MS = 15_000;
 let interruption = null;
 
 export function requiresBypass(harness) {
@@ -79,566 +71,237 @@ function interrupted() {
   return interruption ? new Error(interruption) : null;
 }
 
-function processAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function reapDeadAssignments(teamDir, data) {
-  data.queue = data.queue.filter(entry => processAlive(entry.pid));
-
-  for (const worker of Object.values(data.workers)) {
-    if (worker.state !== 'busy' || processAlive(worker.pid) || (worker.child && processAlive(worker.child))) continue;
-
-    await writeResult(teamDir, {
-      ...failed(`wrapper process ${worker.pid} died before returning a result`),
-      team: data.id,
-      worker: worker.id,
-      task: worker.task,
-      kind: 'task',
-      finished: now(),
-    });
-    Object.assign(worker, {
-      state: 'idle',
-      task: null,
-      task_prompt: null,
-      pid: null,
-      child: null,
-      approval_task: null,
-    });
-  }
-}
 
 function routingError(data, workerId) {
   if (data.model) return '--difficulty cannot be used when the team has a fixed --model; omit it or use assign --model';
-  const workers = workerId
-    ? [data.workers[workerId]]
-    : Object.values(data.workers).filter(worker => !worker.retiring);
-  if (!workers.length || workers.some(worker => !worker || workerHarness(worker, data) !== 'omp')) {
-    return '--difficulty requires an explicitly selected OMP worker or a team whose eligible workers are all OMP';
+  if (workerId) {
+    const worker = data.workers[workerId];
+    return !worker || workerHarness(worker, data) !== 'omp'
+      ? '--difficulty requires an OMP worker'
+      : null;
   }
-  return null;
+  return Object.values(data.workers).some(worker => !worker.retiring && workerHarness(worker, data) === 'omp')
+    ? null
+    : '--difficulty requires an available OMP worker';
 }
 
 export function chooseWorker(data, task, kind) {
-  const taken = new Set();
-  const queue = [...data.queue].sort(
-    (left, right) => Number(left.worker === null) - Number(right.worker === null),
-  );
-
-  for (const entry of queue) {
-    let candidate = null;
-    let reason = entry.difficulty ? routingError(data, entry.worker) : null;
-    if (reason) {
-      if (entry.task === task) return ['fail', reason];
-      continue;
-    }
-
-    if (entry.worker) {
-      const worker = data.workers[entry.worker];
-      if (!worker) {
-        reason = `worker ${entry.worker} does not exist (retired or never spawned)`;
-      } else if (worker.retiring && entry.kind !== 'final') {
-        reason = `worker ${entry.worker} is being retired`;
-      } else if (worker.state === 'idle' && !taken.has(worker.id)) {
-        candidate = worker.id;
-      }
-    } else {
-      const liveWorkers = Object.values(data.workers).filter(worker => !worker.retiring);
-      if (!liveWorkers.length) {
-        reason = 'no active workers left (team is closing or shrunk to zero)';
-      } else {
-        candidate = liveWorkers
-          .filter(worker => worker.state === 'idle' && !taken.has(worker.id))
-          .sort((left, right) => (
-            left.assignments - right.assignments || workerIndex(left.id) - workerIndex(right.id)
-          ))[0]?.id ?? null;
-      }
-    }
-
-    if (entry.task === task) {
-      if (reason) return ['fail', reason];
-      if (candidate) return ['take', candidate];
-      return ['wait', null];
-    }
-    if (candidate) taken.add(candidate);
+  const entry = data.queue.find(item => item.task === task);
+  if (!entry) return ['fail', 'task vanished from queue'];
+  if (entry.difficulty) {
+    const reason = routingError(data, entry.worker);
+    if (reason) return ['fail', reason];
   }
-
-  return ['fail', 'task vanished from queue'];
-}
-
-async function newestSessionMtime(worker) {
-  const files = await configFor(worker).files(worker);
-  const dated = await Promise.all(files.map(async file => ({
-    file,
-    mtime: (await stat(file)).mtimeMs,
-  })));
-  return dated.sort((left, right) => right.mtime - left.mtime)[0] || null;
-}
-
-async function lastAssistant(worker) {
-  const newest = await newestSessionMtime(worker);
-  if (!newest) return null;
-
-  const lines = (await readFile(newest.file, 'utf8')).split('\n').reverse();
-  for (const line of lines) {
-    try {
-      const record = JSON.parse(line);
-      const message = record.message || record.payload || {};
-      if (message.role !== 'assistant' && !['agent_message', 'error'].includes(message.type)) continue;
-
-      if (worker.harness === 'omp') {
-        return {
-          timestamp: (message.timestamp || 0) / 1_000,
-          model: message.model || message.model_id,
-          stopReason: message.stopReason,
-          errorMessage: message.errorMessage || '',
-        };
-      }
-      if (worker.harness === 'claude') {
-        return {
-          timestamp: Date.parse(record.timestamp || message.timestamp || '') / 1_000,
-          model: message.model,
-          stopReason: message.stop_reason,
-          errorMessage: message.error || '',
-        };
-      }
-      return { timestamp: 0 };
-    } catch {
-      // Ignore incomplete JSONL records while a harness is writing them.
-    }
+  if (entry.worker) {
+    const worker = data.workers[entry.worker];
+    if (!worker) return ['fail', `worker ${entry.worker} does not exist (retired or never spawned)`];
+    if (worker.retiring && kind !== 'final') return ['fail', `worker ${worker.id} is being retired`];
+    return ['take', worker.id];
   }
-  return null;
+  const worker = Object.values(data.workers)
+    .filter(item => (!item.retiring || kind === 'final') && (!entry.difficulty || workerHarness(item, data) === 'omp'))
+    .sort((left, right) => left.assignments - right.assignments || workerIndex(left.id) - workerIndex(right.id))[0];
+  return worker ? ['take', worker.id] : ['fail', 'no compatible active workers left (team is closing or shrunk to zero)'];
 }
 
-async function terminalCursor(handle, cursor) {
-  const args = ['terminal', 'read', '--terminal', handle];
-  if (cursor) args.push('--cursor', cursor);
-  const response = await orca(...args);
-  return response.nextCursor ?? response.next_cursor ?? response.cursor ?? null;
+
+function taskOutput(snapshot, fallback = {}) {
+  const spec = snapshot.spec || {};
+  const result = snapshot.result;
+  const status = snapshot.state === 'unknown' ? 'unknown' : result?.status || (snapshot.state === 'failed' || snapshot.error ? 'failed' : 'blocked');
+  return {
+    status,
+    summary: result?.summary || snapshot.error || `task ${snapshot.state || 'unknown'} without a native result`,
+    files_changed: result?.files_changed || [],
+    files_deleted: result?.files_deleted || [],
+    verification: result?.verification || '',
+    blockers: result?.blockers || (snapshot.error ? [snapshot.error] : []),
+    approval_requests: result?.approval_requests || [],
+    branch: result?.branch || '',
+    commit: result?.commit || '',
+    team: spec.team || fallback.team,
+    worker: spec.worker || fallback.worker,
+    task: spec.task || fallback.task,
+    kind: spec.kind || fallback.kind,
+    request_id: snapshot.request_id,
+    state: snapshot.state,
+    model: snapshot.model ?? spec.model ?? null,
+    thinking: spec.thinking ?? null,
+    difficulty: spec.env?.TEAM_BUILDING_DIFFICULTY || null,
+    intent: spec.env?.TEAM_BUILDING_INTENT || null,
+    router_model: spec.env?.TEAM_BUILDING_ROUTER_MODEL || null,
+    session_id: snapshot.session_id ?? null,
+    session_file: snapshot.session_file ?? null,
+    error: snapshot.error ?? null,
+    created_ms: snapshot.created_ms,
+    updated_ms: snapshot.updated_ms,
+    log: spec.log || fallback.log,
+  };
 }
 
-export function needsTerminalRestart(worker) {
-  const configured = Object.hasOwn(worker, 'terminal_model') || Object.hasOwn(worker, 'terminal_thinking');
-  const desired = launchConfig(worker);
-  if (!configured) return !!(worker.task_model || worker.task_thinking);
-  return (
-    worker.terminal_model !== desired.model
-    || worker.terminal_thinking !== desired.thinking
-  );
-}
-
-async function updateWorker(teamDir, worker, fields) {
+async function syncStatus(teamDir, client, team) {
+  const workers = [];
+  let queued = 0;
+  for (let after = 0;;) {
+    const page = await client.status(team, after);
+    workers.push(...page.workers);
+    queued = page.queued;
+    if (!page.has_more) break;
+    if (!Number.isInteger(page.next_after) || page.next_after <= after) throw new Error('supervisor returned an invalid status page');
+    after = page.next_after;
+  }
   await withLock(teamDir, async () => {
     const data = await load(teamDir);
-    if (!data.workers[worker.id]) throw new OrcaError(`worker ${worker.id} no longer exists`);
-    Object.assign(data.workers[worker.id], fields);
+    for (const item of workers) {
+      const worker = data.workers[item.worker];
+      if (!worker) continue;
+      const snapshot = (await client.get(item.request_id)).task;
+      if (!snapshot) continue;
+      const spec = snapshot.spec || {};
+      const active = ['queued', 'running'].includes(item.state);
+      const fenced = item.state === 'unknown' && !item.fence_released;
+      worker.state = active ? 'busy' : fenced ? 'unknown' : 'idle';
+      worker.session_id = snapshot.session_id ?? item.session_id ?? worker.session_id ?? null;
+      worker.session_file = snapshot.session_file ?? item.session_file ?? worker.session_file ?? null;
+      worker.resolved_model = snapshot.model ?? spec.model ?? worker.resolved_model ?? null;
+      worker.last_route = { model: spec.model ?? null, thinking: spec.thinking ?? null };
+      if (!Number.isSafeInteger(item.assignments) || item.assignments < 0) throw new Error('supervisor returned an invalid worker assignment count');
+      worker.assignments = item.assignments;
+      if (active || fenced) {
+        worker.task = spec.task || item.task;
+        worker.task_prompt = spec.prompt || worker.task_prompt || null;
+      } else {
+        worker.task = null;
+        worker.task_prompt = null;
+      }
+    }
     await save(teamDir, data);
   });
-  Object.assign(worker, fields);
+  return { workers, queued };
 }
 
-async function reconnectTerminal(teamDir, worker, worktree) {
-  let terminal;
-  if (worker.terminal) {
-    try {
-      const shown = (await orca('terminal', 'show', '--terminal', worker.terminal)).terminal;
-      if (shown) terminal = { ...shown, handle: shown.handle || worker.terminal };
-    } catch {
-      // Handles expire across runtime restarts; recover only the saved PTY/pane.
-    }
-  }
-  const sameTerminal = candidate => (
-    !!candidate.handle && (!candidate.worktreePath || resolve(candidate.worktreePath) === resolve(worktree))
-    && (!worker.terminal_incarnation_id || candidate.incarnationId === worker.terminal_incarnation_id)
-    && (worker.terminal_pty_id
-      ? candidate.ptyId === worker.terminal_pty_id
-      : worker.terminal_tab_id && worker.terminal_leaf_id
-        ? candidate.tabId === worker.terminal_tab_id && candidate.leafId === worker.terminal_leaf_id
-        : candidate.handle === worker.terminal)
-  );
-  if (!terminal || !sameTerminal(terminal) || (terminal.connected === false && !terminal.exited && terminal.exitCode == null)) {
-    const inventory = await orca('terminal', 'list', '--worktree', `path:${worktree}`);
-    const matches = (inventory.terminals || []).filter(sameTerminal);
-    if (matches.length !== 1 || inventory.truncated) {
-      throw new OrcaError(`cannot confirm existing terminal for ${worker.id}; refusing a duplicate tab or concurrent session`);
-    }
-    terminal = matches[0];
-  }
-  if (terminal.exited || terminal.exitCode != null) {
-    await updateWorker(teamDir, worker, { terminal_stopped: true });
-    return null;
-  }
-  if (terminal.connected === false || terminal.writable === false || terminal.orphaned) {
-    throw new OrcaError(`worker ${worker.id} terminal is disconnected, not confirmed stopped; refusing a duplicate session`);
-  }
-  const handle = terminal.handle || worker.terminal;
-  await updateWorker(teamDir, worker, {
-    terminal: handle,
-    terminal_pty_id: terminal.ptyId || worker.terminal_pty_id || null,
-    terminal_incarnation_id: terminal.incarnationId || worker.terminal_incarnation_id || null,
-    terminal_tab_id: terminal.tabId || worker.terminal_tab_id || null,
-    terminal_leaf_id: terminal.leafId || worker.terminal_leaf_id || null,
-  });
-  return handle;
-}
-
-async function stopWorkerTerminal(teamDir, worker, handle, cwd) {
-  if (!(await closeTerminal(handle))) throw new OrcaError(`failed to close worker terminal ${handle}; refusing a concurrent resume`);
-  await updateWorker(teamDir, worker, { terminal_stopped: true });
-  await recordSession(teamDir, worker, cwd, worker.session_started_at || 0);
-}
-
-async function ensureTerminal(teamDir, team, worker, cwd, worktree) {
-  if (worker.terminal || worker.terminal_started || worker.session_id || worker.session_file) {
-    await recordSession(teamDir, worker, cwd, worker.session_started_at || 0);
-  }
-  if (worker.headless_pending || (worker.child && processAlive(worker.child))) {
-    throw new OrcaError(`worker ${worker.id} resume owner is still active or uncertain; refusing a concurrent session`);
-  }
-  if (worker.terminal_stopped) return null;
-  if (worker.terminal_started || worker.terminal) {
-    const handle = await reconnectTerminal(teamDir, worker, worktree);
-    if (!handle || !needsTerminalRestart(worker)) return handle;
-    // Capture a real session before stopping its TUI; never replace it with a new conversation.
-    await agentCommand(team, worker, { headless: true, prompt: '' });
-    await stopWorkerTerminal(teamDir, worker, handle, cwd);
-    return null;
-  }
-  if (worker.session_file) {
-    throw new OrcaError(`worker ${worker.id} has a saved session but no confirmed terminal owner; refusing a duplicate session`);
-  }
-  const since = Date.now();
-  const argv = await agentCommand(team, worker);
-  // Persist before create: a lost create response must not trigger another create.
-  await updateWorker(teamDir, worker, { terminal_started: true, session_started_at: since });
-  const response = await orca(
-    'terminal', 'create', '--worktree', `path:${worktree}`, '--title', `${team} ${worker.id}`,
-    '--command', `cd ${shellQuote(cwd)} && exec ${argv.map(shellQuote).join(' ')}`,
-  );
+const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
+async function ensureObserver(teamDir, data, worker) {
+  if (worker.observer) return;
+  const worktree = data.isolate ? worker.worktree : data.worktree;
+  if (!worktree) throw new OrcaError(`worker ${worker.id} has no Orca worktree for its observer`);
+  const response = await orca('terminal', 'create', '--worktree', `path:${worktree}`, '--title', `${data.id} ${worker.id} observer`, '--command', `exec ${shellQuote(supervisorBinary)} view --log ${shellQuote(worker.log)}`);
   const terminal = response.terminal || response;
-  if (!terminal.handle) throw new OrcaError('terminal create returned no handle; refusing another create');
-  const desired = launchConfig(worker);
-  await updateWorker(teamDir, worker, {
-    terminal: terminal.handle,
-    terminal_pty_id: terminal.ptyId || null,
-    terminal_incarnation_id: terminal.incarnationId || null,
-    terminal_tab_id: terminal.tabId || null,
-    terminal_leaf_id: terminal.leafId || null,
-    terminal_model: desired.model,
-    terminal_thinking: desired.thinking,
-  });
-  await orca('terminal', 'wait', '--terminal', terminal.handle, '--for', 'tui-idle', '--timeout-ms', '90000');
-  await recordSession(teamDir, worker, cwd, since);
-  return terminal.handle;
-}
-
-async function runResumed(teamDir, worker, cwd, task, briefPath, timeout, maximum, log) {
-  await recordSession(teamDir, worker, cwd);
-  const argv = await agentCommand(basename(teamDir), worker, {
-    headless: true, prompt: `Assignment ${task}: read ${briefPath} and do it. Continue any unfinished work; do not create or fork a session.`,
-  });
-  await updateWorker(teamDir, worker, { headless_pending: true });
-  const output = createWriteStream(log, { flags: 'a' });
-  let outputError;
-  output.on('error', error => { outputError = error; });
-  let activity = Date.now();
-  let outcome;
-  const child = spawn(argv[0], argv.slice(1), { cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  const exit = new Promise(resolveExit => {
-    child.once('error', error => { outcome = { error }; resolveExit(); });
-    child.once('close', (code, signal) => { outcome ||= { code, signal }; resolveExit(); });
-  });
-  for (const stream of [child.stdout, child.stderr]) {
-    stream.on('data', () => { activity = Date.now(); });
-    stream.pipe(output, { end: false });
-  }
-  let failure;
-  try {
-    await updateWorker(teamDir, worker, { child: child.pid || null, headless_pending: false });
-    const deadline = Date.now() + maximum * 1_000;
-    while (!outcome) {
-      if (outputError || interrupted() || Date.now() >= deadline || Date.now() - activity >= timeout * 1_000) {
-        failure = outputError?.message || interrupted()?.message || (Date.now() >= deadline ? `max timeout after ${maximum}s` : `idle timeout after ${timeout}s`);
-        break;
-      }
-      await Promise.race([exit, sleep(POLL_MS)]);
-    }
-  } finally {
-    if (!outcome && child.pid) {
-      try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-    }
-    await exit;
-    output.end();
-    try { await finished(output); } finally {
-      await updateWorker(teamDir, worker, { child: null, headless_pending: false });
-    }
-  }
-  if (failure) return [failed(`${failure}; resumed worker stopped`), null];
-  if (outcome.error || outcome.code !== 0) return [failed(`session resume failed: ${outcome.error?.message || outcome.signal || outcome.code}`), null];
-  const resultPath = join(teamDir, 'results', `${task}.json`);
-  const result = await exists(resultPath) ? resultFrom(await readFile(resultPath, 'utf8')) : null;
-  return [result || failed('resumed worker exited without a valid result'), (await lastAssistant(worker))?.model];
-}
-
-async function terminalWorktree(teamDir, worker, cwd) {
-  const data = await load(teamDir);
-  if (data.isolate) {
-    if (!worker.worktree) throw new OrcaError(`isolated worker ${worker.id} has no recorded worktree`);
-    return worker.worktree;
-  }
-
-  const current = await registeredCwd();
-  if (!insideWorktree(current, cwd)) {
-    throw new OrcaError(`worker cwd ${cwd} is outside current Orca worktree ${current}; return to the team's initialized worktree or initialize a new team there`);
-  }
-  if (data.worktree) {
-    if (resolve(data.worktree) !== resolve(current)) {
-      throw new OrcaError(`current Orca worktree ${current} does not match team worktree ${data.worktree}; return to the team's initialized worktree or initialize a new team there`);
-    }
-    return data.worktree;
-  }
-
+  if (!terminal.handle) throw new OrcaError(`observer create returned no handle for ${worker.id}`);
   await withLock(teamDir, async () => {
     const latest = await load(teamDir);
-    if (!latest.worktree) {
-      latest.worktree = current;
+    if (latest.workers[worker.id]) {
+      latest.workers[worker.id].observer = terminal.handle;
       await save(teamDir, latest);
-    } else if (resolve(latest.worktree) !== resolve(current)) {
-      throw new OrcaError(`current Orca worktree ${current} does not match team worktree ${latest.worktree}; return to the team's initialized worktree or initialize a new team there`);
     }
   });
-  return current;
-}
-
-async function runTerminal(teamDir, worker, cwd, task, prompt, timeout, maximum, log) {
-  const resultPath = join(teamDir, 'results', `${task}.json`);
-  const briefPath = join(teamDir, 'briefs', `${task}.md`);
-  await mkdir(join(teamDir, 'briefs'), { recursive: true });
-
-  const approval = worker.approval_task
-    ? `\nApproved source task: \`${worker.approval_task}\`; exact approved argv are in \`${join(teamDir, 'approvals', `${worker.approval_task}.json`)}\`.\n`
-    : '';
-  await writeFile(
-    briefPath,
-    `# [team ${basename(teamDir)} / ${worker.id} / ${task}]\n\n${prompt}${approval}\n---\nWhen finished, write the result JSON object (worker contract) to \`${resultPath}\` (write \`${resultPath}.tmp\`, then rename). That file is the assignment-result channel.\n`,
-  );
-
-  const worktree = await terminalWorktree(teamDir, worker, cwd);
-  let handle = await ensureTerminal(teamDir, basename(teamDir), worker, cwd, worktree);
-  if (!handle) return runResumed(teamDir, worker, cwd, task, briefPath, timeout, maximum, log);
-  const cursorBeforeSend = await terminalCursor(handle);
-  let cursor = cursorBeforeSend;
-  let sessionMtime = (await newestSessionMtime(worker))?.mtime ?? 0;
-  await appendFile(log, `[terminal ${handle}] brief ${briefPath}\n`);
-  await orca('terminal', 'send', '--terminal', handle, '--text', `Assignment ${task}: read ${briefPath} and do it.`, '--enter');
-
-  const sent = Date.now();
-  const deadline = sent + maximum * 1_000;
-  let activity = sent;
-  let nextActivityCheck = sent + ACTIVITY_CHECK_MS;
-  while (true) {
-    if (interrupted()) {
-      await stopWorkerTerminal(teamDir, worker, handle, cwd);
-      return [failed(`interrupted by ${interruption}; worker terminal closed`), null];
-    }
-    if (await exists(resultPath)) {
-      const text = await readFile(resultPath, 'utf8');
-      const result = resultFrom(text);
-      if (result) {
-        await recordSession(teamDir, worker, cwd, worker.session_started_at || 0);
-        return [result, (await lastAssistant(worker))?.model];
-      }
-      if (Date.now() - (await stat(resultPath)).mtimeMs > 5_000) {
-        return [
-          failed('worker wrote an invalid result file', [`result file tail: ${text.slice(-800)}`]),
-          (await lastAssistant(worker))?.model,
-        ];
-      }
-    }
-
-    const current = Date.now();
-    if (current >= deadline) {
-      await stopWorkerTerminal(teamDir, worker, handle, cwd);
-      return [failed(`max timeout after ${maximum}s; worker terminal closed`), (await lastAssistant(worker))?.model];
-    }
-    if (current >= nextActivityCheck) {
-      nextActivityCheck = current + ACTIVITY_CHECK_MS;
-      await recordSession(teamDir, worker, cwd, worker.session_started_at || 0);
-      const previousHandle = handle;
-      handle = await reconnectTerminal(teamDir, worker, worktree);
-      if (!handle) return runResumed(teamDir, worker, cwd, task, briefPath, timeout, Math.max(1, Math.ceil((deadline - current) / 1_000)), log);
-      if (handle !== previousHandle) cursor = null;
-      const nextCursor = await terminalCursor(handle, cursor);
-      const nextSessionMtime = (await newestSessionMtime(worker))?.mtime ?? 0;
-      if (nextCursor !== cursor || nextSessionMtime > sessionMtime) activity = current;
-      cursor = nextCursor;
-      sessionMtime = Math.max(sessionMtime, nextSessionMtime);
-
-      const message = await lastAssistant(worker);
-      if (message?.timestamp >= sent / 1_000 && ['error', 'aborted'].includes(message.stopReason)) {
-        return [failed(`model run ${message.stopReason}: ${message.errorMessage || ''}`.slice(0, 500)), message.model];
-      }
-    }
-    if (current - activity >= timeout * 1_000) {
-      await stopWorkerTerminal(teamDir, worker, handle, cwd);
-      return [failed(`idle timeout after ${timeout}s; worker terminal closed`), (await lastAssistant(worker))?.model];
-    }
-    await sleep(POLL_MS);
-  }
 }
 
 export async function runAssignment(teamDir, preferredWorker, prompt, timeout, maximum, kind = 'task', approval = null, assignment = {}) {
-  const started = Date.now();
   const team = basename(teamDir);
-  let task;
-  let workerId;
-  let result;
-  let worker;
-  let cwd;
-
-  try {
-    await withLock(teamDir, async () => {
-      const data = await load(teamDir);
-      if (assignment.router_family && (
-        data.model || data.router?.family !== assignment.router_family
-        || data.router?.models?.[assignment.difficulty]?.model !== assignment.model
-        || (data.router?.models?.[assignment.difficulty]?.thinking ?? null) !== (assignment.thinking ?? null)
-      )) throw new Error('router configuration changed during classification; assignment not started');
-      const finalWorker = kind === 'final' && data.workers[preferredWorker];
-      if (finalWorker) {
-        assignment.model ??= finalWorker.task_model || finalWorker.last_route?.model || finalWorker.resolved_model || finalWorker.model;
-        assignment.thinking ??= finalWorker.task_thinking ?? finalWorker.last_route?.thinking ?? null;
-      }
-      await mkdir(join(teamDir, 'approvals'), { recursive: true });
-      await writeShims(teamDir, data);
-      task = `t${String(data.next_task++).padStart(3, '0')}`;
-      data.queue.push({
-        task,
-        worker: preferredWorker || null,
-        kind,
-        prompt: prompt.slice(0, 120),
-        queued: now(),
-        pid: process.pid,
-        approval,
-        model: assignment.model || null,
-        thinking: assignment.thinking ?? null,
-        difficulty: assignment.difficulty || null,
-        intent: assignment.intent || null,
-      });
-      await save(teamDir, data);
-    });
-
-    while (!result) {
-      if (interrupted()) throw interrupted();
-      const [action, detail] = await withLock(teamDir, async () => {
-        const data = await load(teamDir);
-        await reapDeadAssignments(teamDir, data);
-        const decision = chooseWorker(data, task, kind);
-        const entry = data.queue.find(item => item.task === task);
-        if (decision[0] !== 'wait') data.queue = data.queue.filter(item => item.task !== task);
-        if (decision[0] === 'take') {
-          workerId = decision[1];
-          Object.assign(data.workers[workerId], {
-            state: 'busy',
-            task,
-            task_prompt: prompt.slice(0, 120),
-            pid: process.pid,
-            approval_task: approval,
-            task_model: entry.model,
-            task_thinking: entry.thinking,
-            task_difficulty: entry.difficulty,
-            task_intent: entry.intent,
-          });
-          worker = { ...data.workers[workerId] };
-          cwd = worker.cwd || data.cwd;
-        }
-        await save(teamDir, data);
-        return decision;
-      });
-
-      if (action === 'fail') {
-        result = failed(`not started: ${detail}`);
-      } else if (action === 'take') {
-        break;
-      } else {
-        await sleep(1_000);
-      }
+  const requestId = assignment.request_id || randomUUID();
+  const client = await connectSupervisor(STATE_ROOT);
+  const prior = await client.get(requestId);
+  if (prior.task) {
+    const spec = prior.task.spec;
+    if (spec.team !== team || spec.prompt !== prompt || (preferredWorker && spec.worker !== preferredWorker)
+      || (spec.env?.TEAM_BUILDING_APPROVAL_TASK || '') !== (approval || '')
+      || (assignment.difficulty !== undefined && (spec.env?.TEAM_BUILDING_DIFFICULTY || '') !== (assignment.difficulty || ''))
+      || (assignment.model !== undefined && spec.model !== assignment.model)
+      || (assignment.thinking !== undefined && spec.thinking !== assignment.thinking)) {
+      throw new Error(`request ${requestId} conflicts with its durable assignment`);
     }
-
-    if (!result) {
-      await appendFile(
-        worker.log,
-        `\n=== ${task} ${kind} start ${now()} model=${launchConfig(worker).model || 'omp default'} difficulty=${worker.task_difficulty || 'manual'} intent=${JSON.stringify(worker.task_intent || null)} router=${assignment.router_model || 'manual'} ===\n${prompt}\n--- output ---\n`,
-      );
-      const [workerResult, model] = await runTerminal(teamDir, worker, cwd, task, prompt, timeout, maximum, worker.log);
-      result = workerResult;
-      result.model = model || worker.task_model || worker.model;
-      result.difficulty = worker.task_difficulty || null;
-    }
-  } catch (error) {
-    const message = error instanceof OrcaError
-      ? `orca: ${error.message.split('\n')[0]}`
-      : `helper crashed or was interrupted: ${error.message || error}`;
-    result = failed(message);
+    const snapshot = await waitForTask(client, requestId, timeout);
+    await syncStatus(teamDir, client, team);
+    return taskOutput(snapshot);
   }
 
-  if (task) {
-    await withLock(teamDir, async () => {
-      const data = await load(teamDir);
-      data.queue = data.queue.filter(entry => entry.task !== task);
-      const assignedWorker = workerId && data.workers[workerId];
-      if (assignedWorker && assignedWorker.task === task) {
-        Object.assign(assignedWorker, {
-          state: 'idle',
-          task: null,
-          task_prompt: null,
-          pid: null,
-          child: null,
-          approval_task: null,
-          task_model: null,
-          task_thinking: null,
-          task_difficulty: null,
-          task_intent: null,
-        });
-        assignedWorker.assignments++;
-        assignedWorker.resolved_model = result.model || assignedWorker.resolved_model;
-        if (kind === 'task') assignedWorker.last_route = {
-          intent: assignment.intent || null,
-          difficulty: assignment.difficulty || null,
-          model: assignment.model || assignedWorker.model || result.model,
-          thinking: assignment.thinking ?? null,
-          router_model: assignment.router_model || null,
-          duration_ms: assignment.router_duration_ms ?? null,
-        };
+  let data; let worker; let task;
+  await withLock(teamDir, async () => {
+    data = await load(teamDir);
+    if (assignment.difficulty) {
+      const selected = data.router?.models?.[assignment.difficulty];
+      if (assignment.router_family && data.router?.family !== assignment.router_family) {
+        throw new Error('router family changed while the assignment was being classified; retry the assignment');
       }
-      await save(teamDir, data);
-    });
-  }
-
-  Object.assign(result, {
-    team,
-    worker: workerId,
-    task,
-    kind,
-    difficulty: result.difficulty || worker?.task_difficulty || null,
-    intent: assignment.intent || null,
-    router_model: assignment.router_model || null,
-    router_duration_ms: assignment.router_duration_ms ?? null,
-    duration_s: Math.round((Date.now() - started) / 100) / 10,
-    finished: now(),
+      if (!selected || selected.model !== assignment.model || selected.thinking !== assignment.thinking) {
+        throw new Error('router tier changed while the assignment was being classified; retry the assignment');
+      }
+    }
+    const pendingTask = '__pending_assignment__';
+    const [action, selectedWorker] = chooseWorker(
+      { ...data, queue: [...data.queue, { task: pendingTask, worker: preferredWorker, difficulty: assignment.difficulty }] },
+      pendingTask,
+      kind,
+    );
+    if (action !== 'take') throw new Error(selectedWorker);
+    worker = data.workers[selectedWorker];
+    const worktreeError = assignmentWorktreeError(data, worker, assignment.current_worktree);
+    if (worktreeError) throw new Error(worktreeError);
+    if (!data.isolate && !data.worktree) data.worktree = assignment.current_worktree;
+    const legacy = worker.terminal || worker.terminal_started || worker.terminal_stopped;
+    if (legacy && (!worker.terminal_stopped || !worker.session_id)) {
+      throw new Error(`legacy terminal for ${worker.id} has no broker-proven stop and exact native session identity; leave the production terminal open and recover its native session before migration`);
+    }
+    if (approval) {
+      const approved = JSON.parse(await readFile(join(teamDir, 'approvals', `${approval}.json`), 'utf8'));
+      if (approved.task !== approval || approved.worker !== worker.id) throw new Error(`approval ${approval} is not bound to ${worker.id}`);
+    }
+    const route = kind === 'final' ? worker.last_route || {} : assignment;
+    worker = {
+      ...worker,
+      task_model: route.model ?? worker.model ?? null,
+      task_thinking: route.thinking ?? null,
+      approval_task: approval,
+      allow_bypass: !!data.allow_bypass,
+    };
+    task = `t${String(data.next_task++).padStart(3, '0')}`;
+    await writeShims(teamDir, data);
+    await save(teamDir, data);
   });
-  if (workerId) result.log = join(teamDir, 'logs', `${workerId}.log`);
-  await writeResult(teamDir, result).catch(() => {});
-  return result;
+  await ensureObserver(teamDir, data, worker);
+  const cwd = worker.cwd || data.cwd;
+  const native = await nativeTask(team, worker, { prompt, teamDir, cwd });
+  const spec = {
+    team_dir: teamDir, team, worker: worker.id, task, kind, cwd,
+    harness: worker.harness || data.harness || 'omp', argv: native.argv,
+    env: {
+      ...native.env,
+      TEAM_BUILDING_WORKER: `${team}/${worker.id}`,
+      TEAM_BUILDING_APPROVAL_TASK: approval || '',
+      TEAM_BUILDING_DIFFICULTY: assignment.difficulty || '',
+      TEAM_BUILDING_INTENT: assignment.intent || '',
+      TEAM_BUILDING_ROUTER_MODEL: assignment.router_model || '',
+      PATH: `${join(teamDir, 'shim')}:${process.env.PATH || ''}`,
+    },
+    prompt, model: worker.task_model, thinking: native.thinking,
+    session_id: worker.session_id ?? null, session_file: worker.session_file ?? null,
+    log: worker.log, idle_timeout_ms: Math.max(1_000, timeout * 1000), max_timeout_ms: Math.max(1_000, maximum * 1000),
+  };
+  const accepted = await client.submit(spec, requestId);
+  await syncStatus(teamDir, client, team);
+  const snapshot = await waitForTask(client, accepted.request_id, timeout);
+  await syncStatus(teamDir, client, team);
+  const output = { ...taskOutput(snapshot, { team, worker: worker.id, task, kind, log: worker.log }), finished: now() };
+  if (output.status !== 'unknown') await writeResult(teamDir, output);
+  return output;
+}
+
+async function waitForTask(client, requestId, timeout) {
+  let after = 0;
+  for (;;) {
+    const reply = await client.wait(requestId, after, Math.min(60_000, Math.max(1_000, timeout * 1000)));
+    for (const event of reply.events) {
+      after = Math.max(after, event.seq);
+      await client.ack(requestId, event.seq);
+    }
+    if (['succeeded', 'failed', 'blocked', 'unknown'].includes(reply.task?.state)) return reply.task;
+  }
 }
 
 function printResult(result) {
-  console.log(`[${result.team}] ${result.worker || '-'} ${result.task} ${result.status} (${result.model || 'model n/a'}, ${result.duration_s}s): ${result.summary.slice(0, 200)}`);
+  const duration = result.created_ms && result.updated_ms ? `${Math.max(0, (result.updated_ms - result.created_ms) / 1000)}s` : 'duration n/a';
+  console.log(`[${result.team}] ${result.worker || '-'} ${result.task} ${result.status || result.state} (${result.model || 'model n/a'}, ${duration}) request_id=${result.request_id || 'n/a'}: ${(result.summary || result.error || 'no result').slice(0, 200)}`);
   console.log(JSON.stringify(result, null, 2));
 }
 
@@ -658,7 +321,8 @@ function newWorker(teamDir, data, harness, cwd) {
     session_dir: join(teamDir, 'sessions', id),
     log: join(teamDir, 'logs', `${id}.log`),
     harness: selectedHarness,
-    session_id: configFor({ harness: selectedHarness }).session(),
+    allow_bypass: !!data.allow_bypass,
+    session_id: null,
     session_file: null,
     cwd: cwd || data.cwd,
     worktree: null,
@@ -670,28 +334,19 @@ function newWorker(teamDir, data, harness, cwd) {
 }
 
 export async function show(teamDir) {
-  let data;
-  await withLock(teamDir, async () => {
-    data = await load(teamDir);
-    await reapDeadAssignments(teamDir, data);
-    await save(teamDir, data);
-  });
-
+  const team = basename(teamDir);
+  const client = await connectSupervisor(STATE_ROOT);
+  const status = await syncStatus(teamDir, client, team);
+  const data = await load(teamDir);
   console.log(`team ${data.id}  cwd=${data.cwd}  model=${data.model || 'routed/default'}  router=${data.router?.enabled ? data.router.family : 'off'}  state=${teamDir}`);
   if (data.router?.enabled) {
-    console.log(`  classifier=${data.router.classifier} checked=${data.router.checked_at} simple=${data.router.models.simple.model} moderate=${data.router.models.moderate.model} complex=${data.router.models.complex.model} extreme=${data.router.models.extreme?.model || 'init required'}${data.router.models.extreme?.thinking ? ` thinking=${data.router.models.extreme.thinking}` : ''}`);
+    console.log(`  classifier=${data.router.classifier} checked=${data.router.checked_at} simple=${data.router.models.simple.model} moderate=${data.router.models.moderate.model} complex=${data.router.models.complex.model} extreme=${data.router.models.extreme?.model || 'init required'}`);
   }
   for (const worker of Object.values(data.workers).sort((left, right) => workerIndex(left.id) - workerIndex(right.id))) {
-    let model = worker.model || 'omp default';
-    if (worker.resolved_model) model += ` -> ${worker.resolved_model}`;
-    const state = worker.state + (worker.retiring ? ' retiring' : '');
-    const task = worker.task ? `${worker.task}: ${JSON.stringify(worker.task_prompt)}${worker.task_difficulty ? ` difficulty=${worker.task_difficulty}` : ''}${worker.task_model ? ` model=${worker.task_model}${worker.task_thinking ? ` thinking=${worker.task_thinking}` : ''}` : ''}` : '-';
-    console.log(`  ${worker.id.padEnd(4)} ${state.padEnd(14)} harness=${worker.harness || 'omp'} model=${model}  session=${worker.session_id || 'pending'} transport=${worker.terminal_stopped ? 'headless-resume' : 'orca'} terminal=${worker.terminal || '-'}  assignments=${worker.assignments}  task=${task}  log=${worker.log}`);
+    const model = worker.resolved_model || worker.model || 'default';
+    console.log(`  ${worker.id.padEnd(4)} ${String(worker.state || 'idle').padEnd(14)} harness=${worker.harness || data.harness} model=${model} session=${worker.session_id || 'pending'} assignments=${worker.assignments} task=${worker.task || '-'} log=${worker.log}`);
   }
-  for (const entry of data.queue) {
-    const route = entry.difficulty ? ` difficulty=${entry.difficulty} model=${entry.model}` : entry.model ? ` model=${entry.model}` : '';
-    console.log(`  queued ${entry.task} worker=${entry.worker || 'any'} kind=${entry.kind}${route} prompt=${JSON.stringify(entry.prompt)}`);
-  }
+  if (status.queued) console.log(`  queued=${status.queued}`);
 }
 
 async function registeredCwd() {
@@ -721,6 +376,16 @@ async function registeredCwd() {
 function insideWorktree(worktree, cwd) {
   const path = relative(resolve(worktree), resolve(cwd));
   return path === '' || (path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path));
+}
+function assignmentWorktreeError(data, worker, currentWorktree) {
+  const worktree = data.isolate ? worker.worktree : data.worktree || currentWorktree;
+  const cwd = worker.cwd || data.cwd;
+  if (!worktree || !cwd || !insideWorktree(worktree, cwd)) {
+    return data.isolate
+      ? `isolated worker ${worker.id} cwd ${cwd || '(unknown)'} is outside its recorded worktree`
+      : `worker cwd ${cwd || '(unknown)'} is outside current Orca worktree ${worktree || '(unknown)'}`;
+  }
+  return null;
 }
 
 async function gitOutput(args, cwd) {
@@ -781,6 +446,9 @@ async function rollbackIsolated(data) {
 }
 
 async function retire(teamDir, ids, timeout, maximum) {
+  const team = basename(teamDir);
+  const broker = await connectSupervisor(STATE_ROOT);
+  await syncStatus(teamDir, broker, team);
   let workers;
   await withLock(teamDir, async () => {
     const data = await load(teamDir);
@@ -788,23 +456,29 @@ async function retire(teamDir, ids, timeout, maximum) {
     await save(teamDir, data);
     workers = Object.fromEntries(ids.map(id => [id, { ...data.workers[id] }]));
   });
-
+  for (const worker of Object.values(workers)) {
+    if (worker.state === 'unknown') await broker.stop(team, worker.id);
+  }
+  await syncStatus(teamDir, broker, team);
+  const latestData = await load(teamDir);
+  workers = Object.fromEntries(ids.map(id => [id, { ...latestData.workers[id] }]));
   const finals = {};
   await Promise.all(ids.map(async id => {
     const worker = workers[id];
-    finals[id] = worker.state === 'busy' || (await configFor(worker).files(worker)).length
-      ? await runAssignment(teamDir, id, 'Wrap-up: this worker is being shut down. Do not start new work. Return a final summary of ALL work you did across every assignment in this team (what was done, files changed, verification, open issues) in the required JSON block. Use status succeeded unless something you were given is unfinished (then blocked or failed).', timeout, maximum, 'final')
-      : {
-        status: 'succeeded', summary: 'no assignments; nothing to summarise', files_changed: [], files_deleted: [], verification: '', blockers: [], team: basename(teamDir), worker: id, kind: 'final',
-      };
+    finals[id] = worker.state !== 'idle' || worker.session_id || worker.session_file
+      ? await runAssignment(teamDir, id, 'Wrap-up: this worker is being shut down. Do not start new work. Return a final summary of all work and open issues in the required JSON object.', timeout, maximum, 'final')
+      : { status: 'succeeded', summary: 'no assignments; nothing to summarise', files_changed: [], files_deleted: [], verification: '', blockers: [], team, worker: id, kind: 'final' };
     await writeFile(join(teamDir, 'results', `${id}-final.json`), JSON.stringify(finals[id], null, 2));
   }));
-
+  for (const id of ids) await broker.stop(team, id);
+  await syncStatus(teamDir, broker, team);
   await withLock(teamDir, async () => {
     const data = await load(teamDir);
     for (const id of ids) {
-      await cleanupWorker(workers[id]);
-      await closeTerminal(data.workers[id]?.terminal);
+      const worker = data.workers[id];
+      if (worker?.state !== 'idle') throw new Error(`broker has not proven ${id} stopped; refusing cleanup`);
+      if (worker.observer && !(await closeTerminal(worker.observer))) throw new Error(`observer for ${id} is not proven closed`);
+      await cleanupWorker(worker);
       delete data.workers[id];
     }
     await save(teamDir, data);
@@ -904,6 +578,7 @@ async function init(args) {
     model: fixedModel,
     router,
     harness,
+    allow_bypass: !!args.allowBypass,
     approval_mode: approvalMode,
     next_task: 1,
     next_worker: 1,
@@ -1026,6 +701,21 @@ async function assign(args) {
   const prompt = await readPrompt(args.prompt);
   if (!prompt.trim()) die('empty prompt');
   if (args.approval && !/^t\d{3}$/.test(args.approval)) die('--approval must name a source task such as t001');
+  if (args.request_id) {
+    const client = await connectSupervisor(STATE_ROOT);
+    const prior = (await client.get(args.request_id)).task;
+    if (prior) {
+      const retry = { request_id: args.request_id };
+      if (args.difficulty !== undefined) Object.assign(retry, {
+        difficulty: args.difficulty,
+        model: prior.spec.model,
+        thinking: prior.spec.thinking,
+      });
+      if (args.model !== undefined) retry.model = args.model;
+      printResult(await runAssignment(teamDir, args.worker, prompt, args.timeout, args.max, 'task', args.approval, retry));
+      return;
+    }
+  }
 
   if (args.approval) {
     await withLock(teamDir, async () => {
@@ -1041,6 +731,10 @@ async function assign(args) {
 
   await requireOrca(die);
   let data = await load(teamDir);
+  const currentWorktree = await registeredCwd();
+  if (data.worktree && resolve(data.worktree) !== resolve(currentWorktree)) {
+    die(`team initialized worktree ${data.worktree} does not match active Orca worktree ${currentWorktree}; initialize a new team there`, 4);
+  }
   const automatic = data.router?.enabled && !data.model && !args.model && !args.difficulty;
   if (automatic || (args.difficulty && !args.model)) {
     const error = routingError(data, args.worker);
@@ -1056,6 +750,7 @@ async function assign(args) {
         await save(teamDir, data);
       }
     });
+    data = await load(teamDir);
   }
   let assignment;
   if (automatic) {
@@ -1066,7 +761,19 @@ async function assign(args) {
   } else {
     assignment = routedAssignment(data, args);
   }
+  const pendingTask = '__worktree_preflight__';
+  const [action, selectedWorker] = chooseWorker(
+    { ...data, queue: [...(data.queue || []), { task: pendingTask, worker: args.worker, difficulty: assignment.difficulty }] },
+    pendingTask,
+    'task',
+  );
+  if (action === 'take') {
+    const error = assignmentWorktreeError(data, data.workers[selectedWorker], currentWorktree);
+    if (error) die(error, 4);
+  }
   if (assignment.difficulty && data.router?.family) assignment.router_family = data.router.family;
+  assignment.current_worktree = currentWorktree;
+  assignment.request_id = args.request_id;
   if (interrupted()) throw interrupted();
   printResult(await runAssignment(teamDir, args.worker, prompt, args.timeout, args.max, 'task', args.approval, assignment));
 }
@@ -1101,6 +808,25 @@ async function approve(args) {
     await save(teamDir, data);
   });
   console.log(`approved ${args.command.join(' ')} for ${args.worker} source task ${args.task}: ${join(teamDir, 'approvals', `${args.task}.json`)}`);
+}
+
+async function stop(args) {
+  forbidWorkerManager();
+  if (!/^w\d+$/.test(args.worker || '')) die('stop requires --worker wN');
+  const teamDir = await resolveTeam(args.team, die);
+  const team = basename(teamDir);
+  const data = await load(teamDir);
+  const worker = data.workers[args.worker];
+  if (!worker) die(`worker ${args.worker} does not exist`);
+  if (worker.terminal || worker.terminal_started || worker.terminal_stopped) {
+    throw new Error(`legacy terminal for ${args.worker} has no broker-owned process identity; leave it open and recover its native session before migration`);
+  }
+  const client = await connectSupervisor(STATE_ROOT);
+  await client.stop(team, args.worker);
+  await syncStatus(teamDir, client, team);
+  const latest = await load(teamDir).then(data => data.workers[args.worker]);
+  if (latest.state !== 'idle') throw new Error(`broker did not prove ${args.worker} idle; state=${latest.state}`);
+  console.log(`${team}/${args.worker}: broker-proven idle; ${latest.session_id ? 'native session retained' : 'no native session'}; queued tasks, if any, are blocked and must be resubmitted`);
 }
 
 function tableCell(value) {
@@ -1186,7 +912,7 @@ async function clear(args) {
 }
 
 function usage() {
-  console.log(`usage: node src/main.mjs {init,member,status,assign,approve,clear} [options]
+  console.log(`usage: node src/main.mjs {init,member,status,assign,approve,stop,clear} [options]
 
 team-building helper: persistent harness-neutral workers driven by one manager session.
 
@@ -1196,6 +922,7 @@ Commands:
   status
   assign [--worker wN] [--approval tNNN] [--model MODEL] [--difficulty simple|moderate|complex|extreme] [PROMPT]
   approve --worker wN --task tNNN -- COMMAND...
+  stop --worker wN
   clear
 
 Common options: --team ID --timeout SECONDS --max SECONDS`);
@@ -1261,6 +988,10 @@ export function parseArgs(argv) {
       args.isolate = true;
     } else if (option === '--new') {
       args.new = true;
+    } else if (option === '--request-id') {
+      args.request_id = take(index, '--request-id');
+      index++;
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(args.request_id)) die('--request-id must be a UUID');
     } else if (option === '--worker') {
       args.worker = take(index, '--worker');
       index++;
@@ -1314,7 +1045,7 @@ async function main() {
   }
 
   await mkdir(STATE_ROOT, { recursive: true });
-  const action = { init, member, status, assign, approve, clear }[args.cmd];
+  const action = { init, member, status, assign, approve, stop, clear }[args.cmd];
   if (!action) {
     usage();
     die(`invalid command ${args.cmd}`);
@@ -1326,56 +1057,7 @@ const modulePath = realpathSync(fileURLToPath(import.meta.url));
 const invokedPath = process.argv[1] && realpathSync(process.argv[1]);
 if (invokedPath && modulePath === invokedPath) {
   main().catch(error => {
-    if (error.message !== '__team_die__') console.error(`team-building: ${error.message}`);
+    if (error.message !== '__team_die__') console.error(`team-building: ${error.code ? `${error.code}: ` : ''}${error.message}`);
     if (!process.exitCode) process.exitCode = 2;
   });
-}
-
-function balancedJsonObjects(text) {
-  const objects = [];
-  const starts = [];
-  let quoted = false;
-  let escaped = false;
-
-  for (let index = 0; index < text.length; index++) {
-    const character = text[index];
-    if (quoted) {
-      if (escaped) escaped = false;
-      else if (character === '\\') escaped = true;
-      else if (character === '"') quoted = false;
-      continue;
-    }
-    if (character === '"') {
-      quoted = true;
-    } else if (character === '{') {
-      starts.push(index);
-    } else if (character === '}' && starts.length) {
-      objects.push(text.slice(starts.pop(), index + 1));
-    }
-  }
-  return objects.reverse();
-}
-
-export function resultFrom(text) {
-  for (const candidate of balancedJsonObjects(text)) {
-    try {
-      const value = JSON.parse(candidate);
-      if (!['succeeded', 'failed', 'blocked'].includes(value.status)) continue;
-      const list = item => item == null || item === '' ? [] : Array.isArray(item) ? item.map(String) : [String(item)];
-      return {
-        status: value.status,
-        summary: String(value.summary || '').trim(),
-        files_changed: list(value.files_changed),
-        files_deleted: list(value.files_deleted),
-        verification: Array.isArray(value.verification) ? value.verification.join('; ') : String(value.verification || ''),
-        blockers: list(value.blockers),
-        approval_requests: Array.isArray(value.approval_requests) ? value.approval_requests : [],
-        branch: String(value.branch || ''),
-        commit: String(value.commit || ''),
-      };
-    } catch {
-      // Continue looking for the last valid worker result.
-    }
-  }
-  return null;
 }

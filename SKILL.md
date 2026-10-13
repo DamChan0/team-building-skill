@@ -1,94 +1,67 @@
 ---
 name: team-building
 description: >
-  Persistent AI-worker teams in Orca terminals. Examples: `init claude --member 3`, `init gpt`,
-  `member 4`, `status`, `clear`, or `assign --worker w1 <task>`. Use for `team init`, `team status`,
-  `team clear`, `team member N`, explicit worker assignments such as "w1에게 …", or Korean requests
-  containing 팀, 작업자, 워커, or wN. Workers may use omp, Claude Code, or Codex.
+  Persistent AI-worker teams supervised by a Rust broker. Examples: `init claude --member 3`,
+  `member 4`, `status`, `clear`, or `assign --worker w1 <task>`. Use for team init/status/clear/member,
+  explicit worker assignments such as “w1에게 …”, or Korean requests containing 팀, 작업자, 워커, or wN.
+  Workers may use OMP, Claude Code, or Codex.
 argument-hint: init claude --member 3 | init gpt | member 4 | status | clear | assign --worker w1 <task>
 ---
 
 # team-building
 
-All commands below use `node ~/.agents/skills/team-building/src/main.mjs`. State: `~/.local/state/team-building/<team-id>/`
-(team.json, `logs/wN.log`, `briefs/tNNN.md`, `results/*.json`, `sessions/wN/` for omp; Claude Code and Codex use their native session roots). Each worker opens an Orca terminal on its first assignment and pins its native session ID/file plus PTY/pane identity in `team.json`.
-Later assignments reuse that terminal. Stale handles are reacquired by the saved identity, never by title or “latest session”. Confirmed exit resumes the exact conversation in noninteractive mode without another tab. Disconnection or missing/ambiguous identity does not prove exit: fail closed instead of starting a concurrent session.
-Orca must be running for worktree validation and terminal discovery. Do not bypass a failed gate with `init --new`, `terminal create`, `--continue`, `--last`, or a fresh harness launch.
+Run `node ~/.agents/skills/team-building/src/main.mjs`. Node manages team metadata and routing; the singleton Rust supervisor owns native processes, scheduling, exact session identity, and durable task state. State lives under `~/.local/state/team-building/<team-id>/`.
 
-New shared-team `init` binds workers to the Orca worktree resolved from manager cwd and rejects a cwd outside it. Each launch rejects a change from the team's recorded worktree; legacy state without a recorded worktree is backfilled from the current Orca worktree only when its saved worker cwd is inside it. Isolated workers use only their recorded worktrees.
+## Commands (manager runs)
 
-## Commands (user says → main session runs)
-
-| User | Run (bash tool) |
+| Request | Command and behavior |
 |---|---|
-| `init [gpt\|claude] [--member N] [--model M] [--harness omp\|claude\|codex] [--isolate]` | `node ~/.agents/skills/team-building/src/main.mjs init [gpt\|claude] [--member N] [--model M] [--harness H] [--allow-bypass] [--isolate]` — sync. For OMP, plain init selects the GPT family and positional `claude` selects the Claude family; an exact `--model M` is fixed. Active team exists → **adopts it** and refreshes its selected routing family; `--new` forces another team only when asked. Claude Code/Codex require explicit `--allow-bypass`; omp requires `tools.approvalMode=yolo`. `--isolate` creates one Orca worktree per worker. |
-| `team member <N> [--model M] [--harness H]` | `node ~/.agents/skills/team-building/src/main.mjs member N [--model M] [--harness H] [--allow-bypass]` — async; omitted `--harness` retains the team harness. |
-| `team status` | `node ~/.agents/skills/team-building/src/main.mjs status` — workers, harness, model (requested → resolved), router family/fixed/off, state, current task, queue, log path. |
-| `team clear` | `node ~/.agents/skills/team-building/src/main.mjs clear` — async; wrap-up uses the same idle/absolute budget, closes terminals, writes a report, and removes only that team's sessions. |
+| `init [gpt\|claude] [--member N] [--model M] [--harness omp\|claude\|codex] [--isolate]` | `node ~/.agents/skills/team-building/src/main.mjs init ...`. An active team is adopted; routed OMP teams refresh the selected/current routing family. `--new` creates another team only when requested. OMP requires `tools.approvalMode=yolo`; native Claude Code/Codex require explicit `--allow-bypass`. `--isolate` creates one Orca worktree per worker. |
+| `member N [--model M] [--harness H]` | Resize the selected team. An omitted harness retains the existing team harness. |
+| `status [--team ID]` | Show workers, harness, requested/resolved model, router family, state, current task, queue, and log path. |
+| `assign [--worker wN] [--approval tNNN] [--request-id UUID] [--model M] [--difficulty TIER] PROMPT` | Submit work and wait for the durable native result. A busy selected worker is queued behind its current task. |
+| `approve --worker wN --task tNNN -- COMMAND...` | Record an exact external-command approval for one worker and source task. |
+| `stop --worker wN [--team ID]` | Broker-proven recovery of a broker-owned `unknown` worker. Queued tasks are blocked, not replayed. |
+| `clear [--team ID]` | Wrap up workers, clean only recoverable/owned sessions, report assignment history, and remove the selected team's state. |
 
-OMP routing is automatic for OMP teams with an enabled router: plain `init` chooses the GPT family and positional `init claude` chooses the Claude family. Init refreshes OMP's model catalog and pins the selected map until the next `init` adoption; it does not create a persistent router session or Orca tab. For Claude, Haiku is only the bounded no-tools classifier, Sonnet is the default for ordinary simple/moderate work, and a genuinely complex assignment upgrades the selected worker's pinned native session to Opus; its next ordinary assignment resumes that same session on Sonnet. `assign --difficulty` uses the saved tier directly; `assign --model M` is a per-task manual override and wins. An exact `init --model M` is fixed, so `--difficulty` fails for that team; use `assign --model` or omit it. Native Claude Code/Codex teams do not auto-route. Routing without `--worker` requires every eligible worker to be OMP; mixed teams select a worker explicitly.
+If several teams are active, pass `--team <id>`. `--model <exact selector>` pins a fixed model; `--difficulty` requires a routed OMP worker. On a new or restarted manager session, run `status` first and adopt the active team with `init`; never use `--new` unless asked.
 
-GPT tiers are simple Luna Max / moderate Terra / complex Sol / extreme Astra. Claude uses Haiku only for classification, Sonnet for simple/moderate worker tasks, Opus for complex work, and the same latest Opus with explicit `thinking=xhigh` for extreme work. Astra has no explicit thinking override. Opus lacking xhigh support stops initialization instead of downgrading. Family selection changes worker models, not the current manager process. Invalid JSON, classifier errors, or a family/map change while classifying stop dispatch rather than guess a route. Existing legacy teams stay manual until `init` adoption; existing three-tier maps need another `init` to acquire extreme.
+## Broker and message contract
 
-On headless OMP resume without task-specific thinking, reapply the configured `defaultThinkingLevel` explicitly: OMP otherwise retains saved effort, so leaving out `--thinking` does not clear a previous extreme task's `xhigh`.
+Every supervisor request is a versioned object envelope: `{"version":1,"id":"<uuid>","type":"submit|get|wait|ack|status|stop|shutdown","payload":{...}}`. The payload is always a JSON object; scalar strings and non-object envelopes are rejected. Responses and events are structured, bounded, and correlated by UUID. Do not add a scalar command channel or send control traffic through an Orca terminal.
 
-Difficulty rubric: **simple** for bounded edits, known-file fixes, and straightforward tests; **moderate** for multi-file integration or familiar feature work; **complex** for difficult security, concurrency, architecture, root-cause investigations, or deep reasoning; **extreme** for the highest difficulty only: exceptionally difficult unresolved multi-system failures, architecture with conflicting correctness constraints, or formal algorithm/security reasoning.
+OMP RPC, Claude stream-json, and Codex app-server JSON-RPC remain private to the Rust worker. Orca tabs are read-only observers running `team-supervisor view --log <path>`; they display typed UI messages only, never native protocol frames or TaskResult JSON. The manager may disconnect without cancelling an accepted worker. Retrying the same request UUID and identical spec replays the existing assignment; a changed prompt, team, worker, model, thinking, difficulty, or approval conflicts rather than duplicating or rerouting work.
 
-Model uses the selected harness's `--model`; omitted = its default. Several teams active → `team status` lists them all; pass `--team <id>` to every other command (and `init --team <id>` to adopt one).
+Work is durable FIFO per worker, one active assignment per worker. After supervisor restart, a running task becomes `unknown`; this is an ownership fence, not a synthetic failure or success. Do not submit follow-up work, wrap up, clean sessions, or remove a worktree until the broker proves the recorded process group stopped. `stop` preserves the exact native session and blocks queued successors; explicitly resubmit the work afterward.
 
-`--timeout` is idle time (default 1200 seconds); `--max` is the absolute cap (default 14400 seconds). Choose `--max` from the brief: default for edits, longer for full builds or long tests. On `idle`, first send a follow-up to the same worker.
+Workers resume only exact persisted identities. OMP needs its actual session file; Claude/Codex resume their broker-recorded native IDs even when no local session file is available. Never use `latest`, `continue`, `fork`, or a fresh session as recovery. A legacy live terminal has no broker-owned process identity; leave it open until the original owner proves it stopped and recovers the exact native identity. Closing an Orca tab is not stop proof.
 
-With `--isolate`, each worker owns its worktree: it must make a local commit and report `branch` and `commit`; never push. Review then run `git merge`/`git cherry-pick` in the manager cwd. Report conflicts. Uncommitted manager changes do not carry into worker worktrees.
+## Routing
 
-## Session start / restart
+OMP routing is automatic for a routed team. Plain `init` / `init gpt` selects the GPT family; `init claude` selects the Claude model family, not native Claude Code. The model catalog is refreshed and pinned until the next `init` adoption. An exact `init --model M` is fixed and does not auto-route.
 
-A new or restarted main session with an explicit team command runs `node ~/.agents/skills/team-building/src/main.mjs status` first. Active team → adopt it with
-`init` (never `--new` unless asked). Worker sessions and context survive the main session dying.
+- GPT tiers: simple Luna Max, moderate Terra, complex Sol, extreme Astra. Astra has no explicit thinking override.
+- Claude tiers: simple/moderate Sonnet, complex Opus, extreme the same latest Opus with `thinking=xhigh`; Haiku is only the lightweight classifier. Initialization fails closed if Opus lacks xhigh support.
+- `assign --difficulty simple|moderate|complex|extreme` uses the saved route directly; `assign --model M` is a per-task override. Classification errors, invalid JSON, or a family/map change before dispatch stop the assignment rather than guessing.
+- The model family selects worker routes; it does not switch the manager session. OMP headless resume without task-specific thinking reapplies `defaultThinkingLevel` so a prior extreme task's `xhigh` cannot leak into ordinary work.
 
-## Announced = executed
+Difficulty rubric: **simple** for bounded edits or known-file fixes; **moderate** for familiar multi-file integration; **complex** for difficult security, concurrency, architecture, or root-cause work; **extreme** only for exceptionally difficult multi-system failures or formal algorithm/security reasoning.
 
-Every helper command you announce ("w4를 추가합니다", "clear 하겠습니다") must actually run and its output be
-checked before your final reply. Never end a turn on an announced but unrun command; verify counts with `team status`.
-Never end your turn while an async `assign`/`member`/`clear` is still running: wait for its result with the harness's
-background wait/job tool and report it.
+## Worktree and worker safety
 
-## After `init`: dispatch work deliberately
+Shared teams bind to the active Orca worktree. Every assignment checks that the team still points to the active worktree and that the selected worker cwd remains inside it. Legacy teams without a recorded worktree are accepted only when their worker cwd is inside the current worktree; the path is then persisted. Isolated workers use their own recorded worktree and cwd. Manager changes are not copied into isolated worktrees; ask each worker for a local commit, review in the manager worktree, then merge/cherry-pick there. Workers never push.
 
-Split independent work into worker briefs. With an enabled router, dispatch ordinary requests, including trivial edits, rather than implementing them in the manager. Only an explicit “직접 해” bypasses worker dispatch.
-For fixed-model or native-harness teams without automatic routing, a one-file change of about 10 lines or less may still be handled directly when it needs no build or long test; say so in one line. “워커에게” means worker first.
+Workers implement only their assigned slice, never manage teams or create nested workers, and touch only assigned files. Delete only brief-listed `May delete:` paths or files created for the assignment. Workers do not ask the user; if blocked, they return `blocked` with the exact need. They return one structured result object with `status`, `summary`, `files_changed`, `files_deleted`, `verification`, `blockers`, and `approval_requests` (plus isolated-worktree `branch`/`commit`). The manager reviews each result against its acceptance check before reporting completion.
 
-1. Read only what is needed to split the command. Split into independent slices with **non-overlapping file ownership**; indivisible → one slice.
-2. Delegate each OMP slice immediately with its original brief. Do **not** do separate classification or research before routing: omit route options for automatic routing. Use `--difficulty <simple|moderate|complex|extreme>` only when the tier is already known, or `--model` for a deliberate manual override.
-3. One slice → one **sync** bash call, `timeout: 0` (returns the result in the same turn). Several slices → one bash
-   call each with `async: true`, `timeout: 0`, all in the same turn, then `wait` for them:
-   ```
-   node ~/.agents/skills/team-building/src/main.mjs assign [--worker wN] <<'EOF'
-   Goal / files you own (only these) / constraints / acceptance check / May delete: path-or-none
-   EOF
-   ```
-   No `--worker` = any idle worker; if none is idle the call queues inside the helper until one frees (no polling needed).
-   Follow-up to earlier work → `--worker wN` (that worker keeps its session context).
-4. The helper sends the brief to the worker's terminal and waits for its `results/tNNN.json`; helper exit is the
-   return signal and the harness injects stdout. Automatic routing first prints its family, tier, model, intent, and classifier latency; result output then is one human line + JSON:
-   `status` (succeeded|failed|blocked), `summary`, `files_changed`, `files_deleted`, `verification`, `blockers`,
-   `approval_requests`, and isolated-worktree `branch`/`commit`, plus `model`, `intent`, `difficulty`, `router_model`, `router_duration_ms`, `team`, `worker`, `task`, `duration_s`, `log`.
-   Timeout, model error, terminal exit, invalid result file, signal → `failed`. For a generic `blocked` result, answer from context or ask the user, then follow up with the same worker. Approval requests are separate: obtain explicit user approval, run `approve`, then same-worker `assign --approval tNNN`.
-5. Review each result against its acceptance check, integrate, report to the user. While slices run, do other useful work; once nothing is left, call the harness's background wait tool for pending jobs — never send the final reply with an assignment still running. No sleep/poll loops.
+Gated commands are `git push`, `ssh`, `scp`, `rsync`, `sftp`, `gh`, and `docker push` (plus `TEAM_BUILDING_GATED_EXTRA`). Even read-only SSH needs approval. Approval is exact, bound to the source task and worker; after user approval, run `approve` and submit a same-worker `assign --approval tNNN` follow-up. PATH shims deter mistakes, not malicious workers: absolute paths and harness-native remote tools can bypass them.
 
-## Worker contract (injected by the helper)
+## Dispatch workflow and limits
 
-Workers implement directly, never ask the user (blocked → `blocked` result with the exact need), touch only their slice's files,
-never run team-building or spawn teams (the helper also refuses `init/member/assign/clear` when `TEAM_BUILDING_WORKER` is set),
-and may delete only brief-listed `May delete:` paths or files they created for the assignment. Gated external work is not forbidden:
-return `blocked` with exact `approval_requests`; after the user approves, the manager records it with `approve` and sends a same-worker
-follow-up with `--approval tNNN`. They write `files_deleted` in the result JSON at the named `results/tNNN.json` path.
+1. Split a request into independent slices with non-overlapping file ownership. An indivisible task gets one worker.
+2. Route ordinary OMP work automatically. Use `--difficulty` only when the tier is already known, or `--model` for a deliberate one-task override. Follow-up work goes to the same worker with `--worker wN` to preserve its session.
+3. For parallel slices, launch assignments through the harness's background-job mechanism, then wait for every result; do useful work while they run. No sleep/poll loops and no final reply while an assignment remains pending.
+4. Inspect each structured result, integrate/review changes, and report exact verification and blockers. A generic `blocked` result needs manager/user resolution; an approval request needs explicit user approval.
 
-## Limits
+`--timeout` is the idle limit (default 1200 seconds); `--max` is the absolute cap (default 14400 seconds). The supervisor's 60-second wait checkpoint is not a worker failure. `clear` waits for current work before wrap-up. It removes only recorded worker sessions; clean merged isolated worktrees may be removed, while dirty or unmerged worktrees are left in place. A legacy live terminal remains blocked because its process identity is not broker-owned.
 
-- Workers begin in Orca tabs. After confirmed exit or model change, assignments resume headlessly; `status` shows the pinned session/terminal and transport, and output remains in the worker log. Do not type into a busy worker tab.
-- One assignment at a time per worker; a follow-up to a busy worker queues behind its current task.
-- Permission bypass for Claude Code/Codex is opt-in; omp requires its existing yolo setting.
-- `clear` waits for busy workers to finish their current task before their wrap-up and removes only the recorded worker sessions.
-- Claude Code and omp expose session errors/models in their JSONL records. Codex's local session record is used for resume and cleanup; if it has no reliable error event, timeout remains the fallback.
-- Gated commands are `git push`, `ssh`, `scp`, `rsync`, `sftp`, `gh`, and `docker push` (plus `TEAM_BUILDING_GATED_EXTRA`). PATH shims deter mistakes, not malicious workers: absolute paths and harness-native remote tools (such as `ssh://` URIs) can bypass them; even read-only `ssh` needs approval.
-- A SIGKILLed helper is noticed on the next call. A still-live resumed child keeps its worker busy; an uncertain launch marker blocks another resume. Missing identity or an unconfirmed stopped process requires recovery of the original owner, not a fresh session. PID reuse can still hide process death.
+Memory bounds: current-thread Tokio, at most 32 IPC clients and 4 active workers, 1 MiB frames, 1024 queued tasks, bounded worker output, and rotated logs. Do not add a persistent Node observer or duplicate control/event queues.

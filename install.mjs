@@ -62,6 +62,14 @@ async function main() {
     process.exitCode = result.code ?? 1;
     return;
   }
+  const supervisor = await run("cargo", ["build", "--release", "--locked"], {
+    cwd: join(skillRoot, "supervisor"),
+    stdio: "inherit",
+  });
+  if (supervisor.code !== 0) {
+    process.exitCode = supervisor.code ?? 1;
+    return;
+  }
   await installNativeCommand();
 
   try {
