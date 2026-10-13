@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Rust Supervisor Architecture",
+    "locale": "en",
+    "output": ".archify/architecture-rust-supervisor-20261013-180850/rust-supervisor.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/DamChan0/team-building-skill.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "1fe6853f588600d3993b8f4cde974c3967be53df"
+    }
+  },
+  "components": [
+    {
+      "id": "node_manager",
+      "type": "backend",
+      "label": "Node.js manager",
+      "sublabel": "routing · assignments · task client",
+      "pos": [40, 300],
+      "size": [210, 102],
+      "sources": [
+        { "path": "src/main.mjs", "line": 200, "end_line": 287, "label": "assignment and submit" },
+        { "path": "src/supervisor.mjs", "line": 25, "end_line": 73, "label": "versioned socket client" },
+        { "path": "src/supervisor.mjs", "line": 75, "end_line": 126, "label": "daemon launch" }
+      ]
+    },
+    {
+      "id": "rust_supervisor",
+      "type": "backend",
+      "label": "Rust Supervisor",
+      "sublabel": "Tokio daemon · scheduler · 4 active slots",
+      "pos": [440, 300],
+      "size": [250, 102],
+      "sources": [
+        { "path": "supervisor/src/main.rs", "line": 70, "end_line": 115, "label": "server startup" },
+        { "path": "supervisor/src/main.rs", "line": 131, "end_line": 213, "label": "scheduler and task completion" },
+        { "path": "supervisor/src/main.rs", "line": 316, "end_line": 388, "label": "request dispatch" }
+      ]
+    },
+    {
+      "id": "native_workers",
+      "type": "backend",
+      "label": "Native worker CLIs",
+      "sublabel": "OMP · Claude Code · Codex",
+      "pos": [890, 300],
+      "size": [250, 102],
+      "sources": [
+        { "path": "supervisor/src/worker.rs", "line": 72, "end_line": 137, "label": "backend dispatch and spawn" },
+        { "path": "supervisor/src/worker.rs", "line": 139, "end_line": 242, "label": "OMP adapter" },
+        { "path": "supervisor/src/worker.rs", "line": 244, "end_line": 438, "label": "Claude and Codex adapters" }
+      ]
+    },
+    {
+      "id": "task_store",
+      "type": "database",
+      "label": "SQLite task store",
+      "sublabel": "WAL · tasks · events · sessions",
+      "pos": [440, 50],
+      "size": [250, 88],
+      "sources": [
+        { "path": "supervisor/src/store.rs", "line": 46, "end_line": 80, "label": "database schema and recovery" },
+        { "path": "supervisor/src/store.rs", "line": 83, "end_line": 122, "label": "durable task submission" },
+        { "path": "supervisor/src/store.rs", "line": 234, "end_line": 319, "label": "ownership, sessions, results, events" }
+      ]
+    },
+    {
+      "id": "ui_log",
+      "type": "database",
+      "label": "Worker UI log",
+      "sublabel": "worker.log · versioned type=ui records",
+      "pos": [440, 590],
+      "size": [250, 92],
+      "sources": [
+        { "path": "supervisor/src/worker.rs", "line": 643, "end_line": 665, "label": "append typed UI records" },
+        { "path": "supervisor/src/main.rs", "line": 674, "end_line": 701, "label": "filter and print UI text" }
+      ]
+    },
+    {
+      "id": "orca_observer",
+      "type": "external",
+      "label": "Orca observer",
+      "sublabel": "terminal runs Rust view --log",
+      "pos": [40, 590],
+      "size": [210, 92],
+      "sources": [
+        { "path": "src/main.mjs", "line": 184, "end_line": 197, "label": "create observer terminal" },
+        { "path": "supervisor/src/main.rs", "line": 628, "end_line": 671, "label": "tail the worker log" }
+      ]
+    }
+  ],
+  "connections": [
+    { "id": "manager-to-supervisor", "from": "node_manager", "to": "rust_supervisor", "label": "v1 JSON over UDS", "variant": "emphasis", "fromSide": "right", "toSide": "left" },
+    { "id": "supervisor-to-workers", "from": "rust_supervisor", "to": "native_workers", "label": "spawn + harness I/O", "fromSide": "right", "toSide": "left" },
+    { "id": "supervisor-to-store", "from": "rust_supervisor", "to": "task_store", "label": "persist task state", "fromSide": "top", "toSide": "bottom" },
+    { "id": "supervisor-to-ui-log", "from": "rust_supervisor", "to": "ui_log", "label": "append typed UI text", "fromSide": "bottom", "toSide": "top" },
+    { "id": "ui-log-to-observer", "from": "ui_log", "to": "orca_observer", "label": "tail; display type=ui", "fromSide": "left", "toSide": "right" },
+    { "id": "manager-opens-observer", "from": "node_manager", "to": "orca_observer", "label": "create Orca terminal", "fromSide": "bottom", "toSide": "top" }
+  ]
+}

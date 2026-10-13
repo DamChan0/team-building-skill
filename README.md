@@ -10,6 +10,9 @@
 
 ## Execution model
 
+![Rust supervisor architecture: Node manager submits tasks to the Rust daemon, which starts worker CLIs, persists tasks in SQLite, and appends UI records read by the Orca observer.](.archify/architecture-rust-supervisor-20261013-180850/rust-supervisor.png)
+[Interactive, source-linked diagram](.archify/architecture-rust-supervisor-20261013-180850/rust-supervisor.html) · [Editable Archify candidate](.archify/architecture-rust-supervisor-20261013-180850/candidate.json).
+
 ```mermaid
 sequenceDiagram
     participant M as Node manager
