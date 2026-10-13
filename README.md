@@ -67,6 +67,13 @@ sequenceDiagram
 
   - Claude Code can invoke `/team-building`; Codex can invoke `$team-building` or find it with `/skills`.
   - Start a new manager session after installation if the skill is not yet listed.
+- **Update an existing global installation** and rebuild its runtime setup:
+
+  ```sh
+  npx --yes skills update team-building --global --yes && \
+    node ~/.agents/skills/team-building/install.mjs
+  ```
+
 - **The setup script** installs Node dependencies and builds `supervisor/` with `cargo build --release --locked`.
   - The first supervisor use performs the same locked build if the binary is absent.
   - There is no Node transport fallback.
