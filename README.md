@@ -166,7 +166,7 @@ node ~/.agents/skills/team-building/src/main.mjs status [--team ID]
 node ~/.agents/skills/team-building/src/main.mjs assign [--worker wN] [--approval tNNN] [--request-id UUID] [--model M] [--difficulty TIER] PROMPT
 node ~/.agents/skills/team-building/src/main.mjs approve --worker wN --task tNNN -- COMMAND...
 node ~/.agents/skills/team-building/src/main.mjs stop --worker wN [--team ID]
-node ~/.agents/skills/team-building/src/main.mjs clear [--team ID]
+node ~/.agents/skills/team-building/src/main.mjs clear [--team ID] [--fast]
 ```
 
 - One team per absolute manager path. `init` adopts the current path's team; teams only at other paths make `init` exit 3 until rerun with `--clear-previous` or `--keep-previous`.

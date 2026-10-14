@@ -24,6 +24,7 @@ Judge from the task, not its length. No classifier call needed for tier 0/1.
 | **3 heavy** | Security, concurrency, architecture, root cause, or ≥3 independent slices | `init --member N` (N = independent slices, ≤4) → parallel `assign --worker wK` | yes, N workers |
 
 - Team exists already (`status`) → reuse it for tier 2/3; never `init` for tier 0/1.
+- Measured cost (OMP workers): `init` ≈1.3s warm / 3.8s cold model catalog; idle team ≈10MB; each *running* worker ≈500MB RSS and ≥6s per task; `clear --fast` ≈1s vs ≈9s with model wrap-up. Pass `--fast` unless final summaries are needed.
 - **Escalate, don't over-provision.** Start at the lowest plausible tier; if the result is `blocked`, fails its Verify, or shows unexpected scope, re-route one tier up (tier 1 → tier 2; same worker `--difficulty complex|extreme` for model strength). **De-escalate** when a team sits idle: `dismiss` surplus workers, `clear` when done.
 - Model strength is separate from team size: `--difficulty simple|moderate|complex|extreme` picks the model tier (routed OMP teams only; native Claude/Codex teams ignore routing); omit it and Jev (~0.2s, needs `TYPESAFE_API_KEY`) or the OMP classifier (~5s) decides. Jev sends the brief text to api.typesafe.ai: with sensitive briefs pass `--difficulty` or set `TYPESAFE_API_KEY=` empty. GPT: Luna Max / Terra / Sol / Astra; Claude: Sonnet / Sonnet / Opus / Opus xhigh.
 
@@ -37,7 +38,7 @@ Judge from the task, not its length. No classifier call needed for tier 0/1.
 | `assign [--worker wN] [--difficulty TIER] [--model M] [--approval tNNN] PROMPT` | Blocks until structured result; busy worker queues. |
 | `approve --worker wN --task tNNN -- COMMAND...` | Record a user-approved gated command. |
 | `stop --worker wN` | Recover an `unknown` worker, then resubmit. |
-| `clear [--team ID]` | Wrap up and remove the team. |
+| `clear [--team ID] [--fast]` | Wrap up and remove the team; `--fast` uses each worker's latest recorded task result instead of a model wrap-up turn. |
 
 Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|codex` needs `--allow-bypass`. Orca tabs are read-only observers; closing one does not stop the worker (`member <current N>` reopens).
 

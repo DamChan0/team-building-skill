@@ -1,3 +1,4 @@
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -17,6 +18,7 @@ const JEV_CRITERIA = Object.freeze({
   complex: 'Difficult root-cause analysis, concurrency, security, architecture, or deep reasoning.',
   extreme: 'Exceptionally difficult unresolved multi-system failures, architecture with conflicting correctness constraints, or formal algorithm/security reasoning that needs the strongest model. Reserved for the very hardest work, not routine complex work.',
 });
+const CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
 
 // TYPESAFE_API_KEY from the environment wins; an empty value disables Jev. Otherwise read `TYPESAFE_API_KEY=` from ~/.env.
 function typesafeKey() {
@@ -113,11 +115,9 @@ function workerThinking(family, difficulty, model) {
     : null;
 }
 
-async function catalog(provider, cwd) {
-  const result = await command('omp', ['models', provider, '--json', '--no-extensions'], { cwd });
-  commandError(result, `omp models ${provider}`);
+function parseCatalog(output, provider) {
   try {
-    const body = JSON.parse(result.out);
+    const body = JSON.parse(output);
     if (!Array.isArray(body.models)) throw new Error('models is not an array');
     return body.models;
   } catch (error) {
@@ -125,17 +125,50 @@ async function catalog(provider, cwd) {
   }
 }
 
+function catalogCachePath(provider) {
+  return join(process.env.XDG_CACHE_HOME || join(homedir(), '.cache'), 'team-building', `catalog-${provider}.json`);
+}
+
+async function readCachedCatalog(provider) {
+  const path = catalogCachePath(provider);
+  try {
+    if (Date.now() - (await stat(path)).mtimeMs >= CATALOG_TTL_MS) return null;
+    return parseCatalog(await readFile(path, 'utf8'), provider);
+  } catch {
+    return null;
+  }
+}
+
+async function cacheCatalog(provider, output) {
+  const path = catalogCachePath(provider);
+  try {
+    await mkdir(join(path, '..'), { recursive: true });
+    const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(temporary, output);
+    await rename(temporary, path);
+  } catch {}
+}
+
+async function catalog(provider, cwd, force = false) {
+  if (!force) {
+    const cached = await readCachedCatalog(provider);
+    if (cached) return cached;
+  }
+  const result = await command('omp', ['models', provider, '--json', '--no-extensions'], { cwd });
+  commandError(result, `omp models ${provider}`);
+  const entries = parseCatalog(result.out, provider);
+  await cacheCatalog(provider, result.out);
+  return entries;
+}
+
 // Reads OMP's cached catalog first (a forced `omp models refresh` cost ~4s per init); refreshes once only when the cache lacks a role.
 export async function configureRouter(familyName, { cwd } = {}) {
   const family = Object.hasOwn(FAMILIES, familyName) && FAMILIES[familyName];
   if (!family) throw new Error(`unsupported router family: ${familyName}`);
-  const select = async () => {
-    const entries = await catalog(family.provider, cwd);
-    return family.roles.map(role => roleModel(entries, family, role));
-  };
-  const selected = await select().catch(async () => {
+  const select = force => catalog(family.provider, cwd, force).then(entries => family.roles.map(role => roleModel(entries, family, role)));
+  const selected = await select(false).catch(async () => {
     await command('omp', ['models', 'refresh', '--no-extensions'], { cwd, timeout: 120_000 });
-    return select();
+    return select(true);
   });
   const [simple, moderate, complex, extreme = complex] = selected;
   const worker = familyName === 'claude' ? moderate : null;

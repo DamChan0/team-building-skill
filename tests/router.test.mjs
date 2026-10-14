@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -36,11 +36,16 @@ async function withFakeOmp({ openai = gptModels, anthropic = claudeModels, class
   const bin = join(root, 'bin');
   const previousPath = process.env.PATH;
   const previousKey = process.env.TYPESAFE_API_KEY;
+  const previousCacheHome = process.env.XDG_CACHE_HOME;
+  const calls = join(root, 'omp-calls.jsonl');
   process.env.TYPESAFE_API_KEY = typesafeKey;
+  process.env.XDG_CACHE_HOME = join(root, 'cache');
   try {
     await mkdir(bin);
     await writeFile(join(bin, 'omp'), `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
 const args = process.argv.slice(2);
+appendFileSync(process.env.OMP_CALLS, JSON.stringify(args) + '\\n');
 const catalogs = JSON.parse(process.env.OMP_CATALOGS);
 if (args[0] === 'models') {
   console.log(JSON.stringify(catalogs[args[1]]));
@@ -55,16 +60,40 @@ console.log(process.env.OMP_CLASSIFIER);
       anthropic: catalog('anthropic', anthropic),
     });
     process.env.OMP_CLASSIFIER = classifier;
-    await check();
+    process.env.OMP_CALLS = calls;
+    await check(root);
   } finally {
     process.env.PATH = previousPath;
     if (previousKey === undefined) delete process.env.TYPESAFE_API_KEY;
     else process.env.TYPESAFE_API_KEY = previousKey;
+    if (previousCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = previousCacheHome;
     delete process.env.OMP_CATALOGS;
     delete process.env.OMP_CLASSIFIER;
+    delete process.env.OMP_CALLS;
     await rm(root, { recursive: true, force: true });
   }
 }
+
+test('uses fresh catalog cache, but refreshes stale or corrupt entries', async () => {
+  await withFakeOmp({}, async root => {
+    const cache = join(root, 'cache', 'team-building', 'catalog-openai-codex.json');
+    const calls = async () => (await readFile(join(root, 'omp-calls.jsonl'), 'utf8'))
+      .trim().split('\n').map(JSON.parse).filter(args => args[0] === 'models' && args[1] === 'openai-codex').length;
+
+    await configureRouter('gpt');
+    await configureRouter('gpt');
+    assert.equal(await calls(), 1, 'fresh cache avoids omp');
+
+    await utimes(cache, new Date(0), new Date(0));
+    await configureRouter('gpt');
+    assert.equal(await calls(), 2, 'stale cache reloads omp');
+
+    await writeFile(cache, 'not json');
+    await configureRouter('gpt');
+    assert.equal(await calls(), 3, 'corrupt cache reloads omp');
+  });
+});
 
 test('chooses canonical numeric latest models independently per GPT role', async () => {
   await withFakeOmp({}, async () => {

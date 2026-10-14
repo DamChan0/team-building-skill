@@ -467,7 +467,7 @@ async function rollbackIsolated(data) {
   }));
 }
 
-async function retire(teamDir, ids, timeout, maximum) {
+async function retire(teamDir, ids, timeout, maximum, fast = false) {
   const team = basename(teamDir);
   const broker = await connectSupervisor(STATE_ROOT);
   await syncStatus(teamDir, broker, team);
@@ -484,12 +484,28 @@ async function retire(teamDir, ids, timeout, maximum) {
   await syncStatus(teamDir, broker, team);
   const latestData = await load(teamDir);
   workers = Object.fromEntries(ids.map(id => [id, { ...latestData.workers[id] }]));
+  const lastResults = new Map();
+  if (fast) {
+    await Promise.all((await readdir(join(teamDir, 'results')))
+      .filter(file => /^t\d+\.json$/.test(file))
+      .map(async file => {
+        const result = JSON.parse(await readFile(join(teamDir, 'results', file), 'utf8'));
+        const task = Number(file.slice(1, -5));
+        const previous = lastResults.get(result.worker);
+        if (!previous || task > previous.task) lastResults.set(result.worker, { task, result });
+      }));
+  }
   const finals = {};
   await Promise.all(ids.map(async id => {
     const worker = workers[id];
-    finals[id] = worker.state !== 'idle' || worker.session_id || worker.session_file
-      ? await runAssignment(teamDir, id, 'Wrap-up: this worker is being shut down. Do not start new work. Return a final summary of all work and open issues in the required JSON object.', timeout, maximum, 'final')
-      : { status: 'succeeded', summary: 'no assignments; nothing to summarise', files_changed: [], files_deleted: [], verification: '', blockers: [], team, worker: id, kind: 'final' };
+    const lastResult = lastResults.get(id)?.result;
+    finals[id] = fast
+      ? lastResult
+        ? { ...lastResult, team, worker: id, kind: 'final' }
+        : { status: 'succeeded', summary: 'no assignments; nothing to summarise', files_changed: [], files_deleted: [], verification: '', blockers: [], team, worker: id, kind: 'final' }
+      : worker.state !== 'idle' || worker.session_id || worker.session_file
+        ? await runAssignment(teamDir, id, 'Wrap-up: this worker is being shut down. Do not start new work. Return a final summary of all work and open issues in the required JSON object.', timeout, maximum, 'final')
+        : { status: 'succeeded', summary: 'no assignments; nothing to summarise', files_changed: [], files_deleted: [], verification: '', blockers: [], team, worker: id, kind: 'final' };
     await writeFile(join(teamDir, 'results', `${id}-final.json`), JSON.stringify(finals[id], null, 2));
   }));
   for (const id of ids) await broker.stop(team, id);
@@ -521,19 +537,22 @@ async function init(args) {
   const harness = args.harness || 'omp';
   if (familySelected && harness !== 'omp') die('gpt/claude family routing requires --harness omp; the family selects models, not the harness');
   // One omp spawn proves the binary exists and reads the approval mode.
-  const approvalMode = harness === 'omp' ? await requireOmp(die) : null;
+  const approvalModePromise = harness === 'omp' ? requireOmp(die) : Promise.resolve(null);
+  approvalModePromise.catch(() => {});
   if (requiresBypass(harness) && !args.allowBypass) {
     die(`--harness ${harness} requires explicit --allow-bypass (it enables ${configFor({ harness }).bypass})`, 3);
-  }
-  if (harness === 'omp' && approvalMode !== 'yolo') {
-    die(`tools.approvalMode is ${JSON.stringify(approvalMode)}; omp workers need yolo because nobody can answer their prompts.`, 3);
   }
 
   const cwd = realpathSync(process.cwd());
   const teams = await activeTeams();
   const active = await Promise.all(teams.map(async teamDir => ({ teamDir, data: await load(teamDir) })));
   const existing = active.find(team => team.data.cwd === cwd);
+  let approvalMode;
   if (existing) {
+    approvalMode = await approvalModePromise;
+    if (harness === 'omp' && approvalMode !== 'yolo') {
+      die(`tools.approvalMode is ${JSON.stringify(approvalMode)}; omp workers need yolo because nobody can answer their prompts.`, 3);
+    }
     const teamDir = existing.teamDir;
     console.log(`adopted existing team ${basename(teamDir)} for cwd ${cwd}`);
     // The adopting session becomes the manager; the OMP role badge keys on this id.
@@ -573,6 +592,17 @@ async function init(args) {
     return show(teamDir);
   }
 
+  const worktreePromise = registeredCwd();
+  const routerPromise = harness === 'omp' && !fixedModel
+    ? configureRouter(selectedFamily || 'gpt')
+    : Promise.resolve(null);
+  worktreePromise.catch(() => {});
+  routerPromise.catch(() => {});
+  approvalMode = await approvalModePromise;
+  if (harness === 'omp' && approvalMode !== 'yolo') {
+    die(`tools.approvalMode is ${JSON.stringify(approvalMode)}; omp workers need yolo because nobody can answer their prompts.`, 3);
+  }
+
   if (active.length && !args.clearPrevious && !args.keepPrevious) {
     const previous = active.map(({ data }) => {
       const busy = Object.values(data.workers || {}).filter(worker => worker.state === 'busy').length;
@@ -584,7 +614,7 @@ async function init(args) {
     for (const { teamDir } of active) await clear({ ...args, team: basename(teamDir) });
   }
 
-  const worktree = await registeredCwd();
+  const worktree = await worktreePromise;
   if (!args.isolate && !insideWorktree(worktree, cwd)) {
     die(`manager cwd ${cwd} is outside active Orca worktree ${worktree}; return to that worktree or initialize a new team there`, 4);
   }
@@ -594,9 +624,7 @@ async function init(args) {
   if (args.isolate && (await gitOutput(['status', '--porcelain'], cwd))[1]) {
     console.error('team-building: warning: uncommitted manager changes are not copied into isolated worker worktrees');
   }
-  const router = harness === 'omp' && !fixedModel
-    ? await configureRouter(selectedFamily || 'gpt')
-    : null;
+  const router = await routerPromise;
 
   const stamp = new Date();
   const base = `tb-${String(stamp.getMonth() + 1).padStart(2, '0')}${String(stamp.getDate()).padStart(2, '0')}-${String(stamp.getHours()).padStart(2, '0')}${String(stamp.getMinutes()).padStart(2, '0')}${String(stamp.getSeconds()).padStart(2, '0')}`;
@@ -811,9 +839,13 @@ async function assign(args) {
     });
   }
 
-  await requireOrca(die);
+  const orcaPromise = requireOrca(die);
+  const worktreePromise = registeredCwd();
+  orcaPromise.catch(() => {});
+  worktreePromise.catch(() => {});
+  await orcaPromise;
   let data = await load(teamDir);
-  const currentWorktree = await registeredCwd();
+  const currentWorktree = await worktreePromise;
   if (data.worktree && resolve(data.worktree) !== resolve(currentWorktree)) {
     die(`team initialized worktree ${data.worktree} does not match active Orca worktree ${currentWorktree}; initialize a new team there`, 4);
   }
@@ -925,7 +957,7 @@ async function clear(args) {
     await save(teamDir, data);
   });
 
-  const finals = await retire(teamDir, Object.keys(data.workers), args.timeout, args.max);
+  const finals = await retire(teamDir, Object.keys(data.workers), args.timeout, args.max, args.fast);
   const worktrees = (await Promise.all(Object.values(data.workers).map(worker => removeIsolated(data, worker)))).filter(Boolean);
   for (const file of (await readdir(join(teamDir, 'results'))).filter(name => /^w\d+-final\.json$/.test(name)).sort()) {
     finals[file.replace('-final.json', '')] = JSON.parse(await readFile(join(teamDir, 'results', file), 'utf8'));
@@ -1006,7 +1038,7 @@ Commands:
   assign [--worker wN] [--approval tNNN] [--model MODEL] [--difficulty simple|moderate|complex|extreme] [PROMPT]
   approve --worker wN --task tNNN -- COMMAND...
   stop --worker wN
-  clear
+  clear [--fast]
 
 Common options: --team ID --timeout SECONDS --max SECONDS`);
 }
@@ -1069,6 +1101,8 @@ export function parseArgs(argv) {
       args.allowBypass = true;
     } else if (option === '--isolate') {
       args.isolate = true;
+    } else if (option === '--fast') {
+      args.fast = true;
     } else if (option === '--clear-previous') {
       args.clearPrevious = true;
     } else if (option === '--keep-previous') {

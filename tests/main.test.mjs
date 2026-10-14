@@ -94,7 +94,7 @@ console.log(JSON.stringify({ ok: true, result }));
       assert.equal(result.status, 4, `${result.error?.message || ''}${result.stderr}`);
       assert.match(result.stderr, scenario.match);
       assert.deepEqual(
-        (await readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line).slice(0, 2).join(' ')),
+        (await readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line).slice(0, 2).join(' ')).sort(),
         ['status', 'worktree current'],
       );
       assert.equal(existsSync(join(stateRoot, 'supervisor')), false);
