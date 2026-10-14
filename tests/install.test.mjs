@@ -29,22 +29,27 @@ async function fixture(check) {
       OMP_PROFILE: "review",
     },
   });
-  const command = join(home, ".omp-team", "profiles", "review", "agent", "commands", "team-building.md");
+  const agent = join(home, ".omp-team", "profiles", "review", "agent");
+  const command = join(agent, "commands", "team-building.md");
+  const extension = join(agent, "extensions", "team-role.ts");
   try {
-    await check({ command, run });
+    await check({ command, extension, run });
   } finally {
     await rm(home, { recursive: true, force: true });
   }
 }
 
-test("re-running setup preserves other commands and the managed alias", async () => fixture(async ({ command, run }) => {
+test("re-running setup preserves other commands, managed alias, and role extension", async () => fixture(async ({ command, extension, run }) => {
   assert.equal(run().status, 0);
   const installed = await readFile(command, "utf8");
+  const installedExtension = await readFile(extension, "utf8");
+  assert.match(installedExtension, /^\/\/ team-building managed omp extension/m);
 
   const other = join(command, "..", "other.md");
   await writeFile(other, "user command");
   assert.equal(run().status, 0);
   assert.equal(await readFile(command, "utf8"), installed);
+  assert.equal(await readFile(extension, "utf8"), installedExtension);
   assert.equal(await readFile(other, "utf8"), "user command");
 }));
 
@@ -55,4 +60,13 @@ test("installer leaves a conflicting user-owned alias intact", async () => fixtu
   assert.equal(result.status, 0);
   assert.match(result.stderr, /leaving user-owned \/team-building command/);
   assert.equal(await readFile(command, "utf8"), "user command");
+}));
+
+test("installer leaves a conflicting user-owned role extension intact", async () => fixture(async ({ extension, run }) => {
+  await mkdir(join(extension, ".."), { recursive: true });
+  await writeFile(extension, "user extension");
+  const result = run();
+  assert.equal(result.status, 0);
+  assert.match(result.stderr, /leaving user-owned role extension/);
+  assert.equal(await readFile(extension, "utf8"), "user extension");
 }));

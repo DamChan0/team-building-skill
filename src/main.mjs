@@ -491,6 +491,7 @@ async function init(args) {
   if (args.member !== undefined && (!Number.isInteger(args.member) || args.member < 1 || args.member > MAX_WORKERS)) {
     die(`member must be 1..${MAX_WORKERS} (task.maxConcurrency)`);
   }
+  if (args.clearPrevious && args.keepPrevious) die('choose only one of --clear-previous or --keep-previous');
   const selectedFamily = args.family || (['gpt', 'claude'].includes(args.model) ? args.model : null);
   if (args.family && args.model && args.family !== args.model) die(`conflicting family ${args.family} and --model ${args.model}`);
   const familySelected = !!selectedFamily;
@@ -510,16 +511,20 @@ async function init(args) {
     }
   }
 
+  const cwd = realpathSync(process.cwd());
   const teams = await activeTeams();
-  if (teams.length && !args.new) {
-    if (!args.team && teams.length > 1) {
-      await status(args);
-      console.log('several teams active: rerun `init --team <id>` to adopt one, or `init --new` for a new team');
-      return;
-    }
-    const teamDir = await resolveTeam(args.team, die);
-    console.log(`adopted existing team ${basename(teamDir)} (no new team; \`init --new\` creates one)`);
-    const current = await load(teamDir);
+  const active = await Promise.all(teams.map(async teamDir => ({ teamDir, data: await load(teamDir) })));
+  const existing = active.find(team => team.data.cwd === cwd);
+  if (existing) {
+    const teamDir = existing.teamDir;
+    console.log(`adopted existing team ${basename(teamDir)} for cwd ${cwd}`);
+    // The adopting session becomes the manager; the OMP role badge keys on this id.
+    await withLock(teamDir, async () => {
+      const data = await load(teamDir);
+      data.manager_session = process.env.OMP_SESSION_ID || null;
+      await save(teamDir, data);
+    });
+    const current = existing.data;
     const ompOnly = Object.values(current.workers).filter(worker => !worker.retiring).every(worker => workerHarness(worker, current) === 'omp');
     if (familySelected && !ompOnly) die('family routing requires OMP workers; cannot change the harness of existing sessions');
     if (!fixedModel && ompOnly && (familySelected || !current.model)) {
@@ -549,14 +554,25 @@ async function init(args) {
     return show(teamDir);
   }
 
-  const worktree = await registeredCwd();
-  if (!args.isolate && !insideWorktree(worktree, process.cwd())) {
-    die(`manager cwd ${process.cwd()} is outside active Orca worktree ${worktree}; return to that worktree or initialize a new team there`, 4);
+  if (active.length && !args.clearPrevious && !args.keepPrevious) {
+    const previous = active.map(({ data }) => {
+      const busy = Object.values(data.workers || {}).filter(worker => worker.state === 'busy').length;
+      return `${data.id} cwd=${data.cwd || 'legacy: no cwd'} busy=${busy}`;
+    });
+    die(`active teams at other paths:\n${previous.join('\n')}\nAsk whether to delete the previous manager, then rerun with --clear-previous or --keep-previous.`, 3);
   }
-  if (args.isolate && (await gitOutput(['rev-parse', '--show-toplevel'], process.cwd()))[0]) {
+  if (args.clearPrevious) {
+    for (const { teamDir } of active) await clear({ ...args, team: basename(teamDir) });
+  }
+
+  const worktree = await registeredCwd();
+  if (!args.isolate && !insideWorktree(worktree, cwd)) {
+    die(`manager cwd ${cwd} is outside active Orca worktree ${worktree}; return to that worktree or initialize a new team there`, 4);
+  }
+  if (args.isolate && (await gitOutput(['rev-parse', '--show-toplevel'], cwd))[0]) {
     die('--isolate requires a git repository cwd', 2);
   }
-  if (args.isolate && (await gitOutput(['status', '--porcelain'], process.cwd()))[1]) {
+  if (args.isolate && (await gitOutput(['status', '--porcelain'], cwd))[1]) {
     console.error('team-building: warning: uncommitted manager changes are not copied into isolated worker worktrees');
   }
   const router = harness === 'omp' && !fixedModel
@@ -564,7 +580,19 @@ async function init(args) {
     : null;
 
   const stamp = new Date();
-  const id = `tb-${String(stamp.getMonth() + 1).padStart(2, '0')}${String(stamp.getDate()).padStart(2, '0')}-${String(stamp.getHours()).padStart(2, '0')}${String(stamp.getMinutes()).padStart(2, '0')}${String(stamp.getSeconds()).padStart(2, '0')}`;
+  const base = `tb-${String(stamp.getMonth() + 1).padStart(2, '0')}${String(stamp.getDate()).padStart(2, '0')}-${String(stamp.getHours()).padStart(2, '0')}${String(stamp.getMinutes()).padStart(2, '0')}${String(stamp.getSeconds()).padStart(2, '0')}`;
+  let id = base;
+  await mkdir(STATE_ROOT, { recursive: true });
+  // Same-second inits must never share (and overwrite) a team directory.
+  for (let suffix = 2; ; suffix++) {
+    try {
+      await mkdir(join(STATE_ROOT, id));
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      id = `${base}-${suffix}`;
+    }
+  }
   const teamDir = join(STATE_ROOT, id);
   for (const subdir of ['sessions', 'logs', 'results', 'approvals']) {
     await mkdir(join(teamDir, subdir), { recursive: true });
@@ -573,7 +601,8 @@ async function init(args) {
   const data = {
     id,
     created: now(),
-    cwd: process.cwd(),
+    cwd,
+    manager_session: process.env.OMP_SESSION_ID || null,
     worktree,
     model: fixedModel,
     router,
@@ -591,19 +620,23 @@ async function init(args) {
   try {
     for (let index = 0; index < (args.member || 3); index++) {
       const workerId = `w${data.next_worker}`;
-      const [workerWorktree, cwd] = data.isolate ? await isolatedCwd(data, workerId) : [null, null];
-      newWorker(teamDir, data, null, cwd);
+      const [workerWorktree, workerCwd] = data.isolate ? await isolatedCwd(data, workerId) : [null, cwd];
+      newWorker(teamDir, data, null, workerCwd);
       data.workers[workerId].worktree = workerWorktree;
     }
+    await save(teamDir, data);
+    for (const worker of Object.values(data.workers)) await ensureObserver(teamDir, data, worker);
   } catch (error) {
-    await rollbackIsolated(data);
+    const latest = await load(teamDir).catch(() => data);
+    await Promise.all(Object.values(latest.workers).map(worker => worker.observer && closeTerminal(worker.observer).catch(() => {})));
+    await rollbackIsolated(latest);
     await rm(teamDir, { recursive: true, force: true });
     die(`orca: ${error.message.split('\n')[0]}`, 4);
   }
 
-  await save(teamDir, data);
   console.log(`team ${id} ready: ${args.member || 3} workers, harness=${harness}, model=${fixedModel || 'automatic'}, router=${router?.family || 'off'}, cwd=${data.cwd}`);
   await show(teamDir);
+
 }
 
 async function member(args) {
@@ -611,10 +644,11 @@ async function member(args) {
   if (['gpt', 'claude'].includes(args.model)) die('select a model family with init --model gpt|claude, not member --model');
   if (!Number.isInteger(args.n) || args.n < 1 || args.n > MAX_WORKERS) die(`member must be 1..${MAX_WORKERS} (task.maxConcurrency)`);
 
-  const teamDir = await resolveTeam(args.team, die);
+  const teamDir = await resolveTeam(args.team, die, process.cwd());
   let retirees = [];
   let removed = {};
   let data;
+  const added = [];
   await withLock(teamDir, async () => {
     data = await load(teamDir);
     if (data.closing) die('team is being cleared');
@@ -634,9 +668,10 @@ async function member(args) {
     if (growing) {
       for (let index = liveWorkers.length; index < args.n; index++) {
         const workerId = `w${data.next_worker}`;
-        const [workerWorktree, cwd] = data.isolate ? await isolatedCwd(data, workerId) : [null, null];
+        const [workerWorktree, cwd] = data.isolate ? await isolatedCwd(data, workerId) : [null, data.cwd];
         newWorker(teamDir, data, args.harness, cwd);
         data.workers[workerId].worktree = workerWorktree;
+        added.push(data.workers[workerId]);
       }
     } else if (args.n < liveWorkers.length) {
       retirees = [...liveWorkers]
@@ -653,6 +688,19 @@ async function member(args) {
     }
     await save(teamDir, data);
   });
+  try {
+    for (const worker of added) await ensureObserver(teamDir, data, worker);
+  } catch (error) {
+    await Promise.all(added.map(worker => worker.observer && closeTerminal(worker.observer).catch(() => {})));
+    await rollbackIsolated({ ...data, workers: Object.fromEntries(added.map(worker => [worker.id, worker])) });
+    await withLock(teamDir, async () => {
+      const latest = await load(teamDir);
+      for (const worker of added) delete latest.workers[worker.id];
+      await save(teamDir, latest);
+    });
+    die(`orca: ${error.message.split('\n')[0]}`, 4);
+  }
+
 
   if (retirees.length) {
     const finals = await retire(teamDir, retirees, args.timeout, args.max);
@@ -665,12 +713,27 @@ async function member(args) {
   await show(teamDir);
 }
 
-async function status(args) {
-  const teams = await activeTeams();
-  if (args.team || teams.length < 2) return show(await resolveTeam(args.team, die));
+async function dismiss(args) {
+  forbidWorkerManager();
+  const ids = String(args.worker || '').split(',').filter(Boolean);
+  if (!ids.length) die('dismiss requires --worker wN[,wM...]');
+  const teamDir = await resolveTeam(args.team, die, process.cwd());
+  const data = await load(teamDir);
+  for (const id of ids) {
+    if (!data.workers[id]) die(`unknown worker ${id}`);
+    if (data.workers[id].state === 'busy') die(`${id} is busy; wait for its task first`);
+  }
+  const finals = await retire(teamDir, ids, args.timeout, args.max);
+  for (const [id, result] of Object.entries(finals)) {
+    console.log(`  ${id} final ${result.status}: ${result.summary.slice(0, 200)}`);
+    const note = await removeIsolated(data, data.workers[id]);
+    if (note) console.log(`  ${note}`);
+  }
+  await show(teamDir);
+}
 
-  console.log(`${teams.length} teams active; pass --team <id> to the other commands:`);
-  for (const teamDir of teams) await show(teamDir);
+async function status(args) {
+  return show(await resolveTeam(args.team, die, process.cwd()));
 }
 
 async function readPrompt(prompt) {
@@ -697,7 +760,7 @@ export function routedAssignment(data, args) {
 
 async function assign(args) {
   forbidWorkerManager();
-  const teamDir = await resolveTeam(args.team, die);
+  const teamDir = await resolveTeam(args.team, die, process.cwd());
   const prompt = await readPrompt(args.prompt);
   if (!prompt.trim()) die('empty prompt');
   if (args.approval && !/^t\d{3}$/.test(args.approval)) die('--approval must name a source task such as t001');
@@ -780,7 +843,7 @@ async function assign(args) {
 
 async function approve(args) {
   forbidWorkerManager();
-  const teamDir = await resolveTeam(args.team, die);
+  const teamDir = await resolveTeam(args.team, die, process.cwd());
   if (!/^w\d+$/.test(args.worker) || !/^t\d{3}$/.test(args.task) || !args.command.length) {
     die('approve requires --worker wN --task tNNN -- <command...>');
   }
@@ -813,7 +876,7 @@ async function approve(args) {
 async function stop(args) {
   forbidWorkerManager();
   if (!/^w\d+$/.test(args.worker || '')) die('stop requires --worker wN');
-  const teamDir = await resolveTeam(args.team, die);
+  const teamDir = await resolveTeam(args.team, die, process.cwd());
   const team = basename(teamDir);
   const data = await load(teamDir);
   const worker = data.workers[args.worker];
@@ -835,7 +898,7 @@ function tableCell(value) {
 
 async function clear(args) {
   forbidWorkerManager();
-  const teamDir = await resolveTeam(args.team, die);
+  const teamDir = await resolveTeam(args.team, die, process.cwd());
   let data;
   await withLock(teamDir, async () => {
     data = await load(teamDir);
@@ -917,8 +980,9 @@ function usage() {
 team-building helper: persistent harness-neutral workers driven by one manager session.
 
 Commands:
-  init [gpt|claude] [--model gpt|claude|MODEL] [--member N] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--new]
+  init [gpt|claude] [--model gpt|claude|MODEL] [--member N] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
   member N [--model MODEL] [--harness omp|claude|codex] [--allow-bypass]
+  dismiss --worker wN[,wM...]
   status
   assign [--worker wN] [--approval tNNN] [--model MODEL] [--difficulty simple|moderate|complex|extreme] [PROMPT]
   approve --worker wN --task tNNN -- COMMAND...
@@ -986,8 +1050,10 @@ export function parseArgs(argv) {
       args.allowBypass = true;
     } else if (option === '--isolate') {
       args.isolate = true;
-    } else if (option === '--new') {
-      args.new = true;
+    } else if (option === '--clear-previous') {
+      args.clearPrevious = true;
+    } else if (option === '--keep-previous') {
+      args.keepPrevious = true;
     } else if (option === '--request-id') {
       args.request_id = take(index, '--request-id');
       index++;
@@ -1045,7 +1111,7 @@ async function main() {
   }
 
   await mkdir(STATE_ROOT, { recursive: true });
-  const action = { init, member, status, assign, approve, stop, clear }[args.cmd];
+  const action = { init, member, dismiss, status, assign, approve, stop, clear }[args.cmd];
   if (!action) {
     usage();
     die(`invalid command ${args.cmd}`);

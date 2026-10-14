@@ -115,7 +115,12 @@ fn spawn(spec: &TaskSpec) -> Result<Child> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .envs(&spec.env);
+        .envs(&spec.env)
+        .env("PWD", &spec.cwd);
+    if spec.harness == "omp" {
+        // OMP otherwise relocates launches from the home directory to /tmp.
+        command.arg("--cwd").arg(&spec.cwd);
+    }
     unsafe {
         command.pre_exec(move || {
             // SAFETY: runs only in the freshly forked child before exec; no Rust state is shared afterwards.
@@ -673,7 +678,34 @@ mod writeln {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_frame, parse_result};
+    use super::{parse_frame, parse_result, spawn, TaskSpec};
+    use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn spawned_worker_pwd_matches_cwd() {
+        let spec = TaskSpec {
+            team_dir: "/tmp".into(),
+            team: "team".into(),
+            worker: "worker".into(),
+            task: "task".into(),
+            kind: "task".into(),
+            cwd: "/".into(),
+            harness: "codex".into(),
+            argv: vec!["/usr/bin/printenv".into(), "PWD".into()],
+            env: BTreeMap::from([("PWD".into(), "/tmp".into())]),
+            prompt: String::new(),
+            model: None,
+            thinking: None,
+            session_id: None,
+            session_file: None,
+            log: "/tmp/log".into(),
+            idle_timeout_ms: 1,
+            max_timeout_ms: 1,
+        };
+        let output = spawn(&spec).unwrap().wait_with_output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), spec.cwd);
+    }
 
     #[test]
     fn rejects_bare_native_frames_and_untyped_results() {

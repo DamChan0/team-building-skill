@@ -7,11 +7,21 @@ const skillRoot = dirname(fileURLToPath(import.meta.url));
 
 const COMMAND_NAME = "team-building.md";
 const COMMAND_MARKER = "<!-- team-building native command -->";
+const EXTENSION_NAME = "team-role.ts";
+const EXTENSION_MARKER = "// team-building managed omp extension";
 
-function nativeCommandsDir() {
+function ompAgentDir() {
   const requestedProfile = process.env.OMP_PROFILE ?? process.env.PI_PROFILE;
   const profile = requestedProfile && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(requestedProfile) ? requestedProfile : null;
-  return join(homedir(), process.env.PI_CONFIG_DIR || ".omp", ...(profile ? ["profiles", profile] : []), "agent", "commands");
+  return join(homedir(), process.env.PI_CONFIG_DIR || ".omp", ...(profile ? ["profiles", profile] : []), "agent");
+}
+
+function nativeCommandsDir() {
+  return join(ompAgentDir(), "commands");
+}
+
+function extensionsDir() {
+  return join(ompAgentDir(), "extensions");
 }
 
 function nativeCommand() {
@@ -24,9 +34,7 @@ Read and follow the canonical team-building skill at \`${join(skillRoot, "SKILL.
 `;
 }
 
-async function installNativeCommand() {
-  const target = join(nativeCommandsDir(), COMMAND_NAME);
-  const content = nativeCommand();
+async function installManagedFile(target, content, marker, userOwnedWarning, installedMessage) {
   let existing = null;
   try {
     existing = await readFile(target, "utf8");
@@ -34,13 +42,36 @@ async function installNativeCommand() {
     if (error.code !== "ENOENT") throw error;
   }
   if (existing === content) return;
-  if (existing !== null && !existing.includes(COMMAND_MARKER)) {
-    console.warn(`team-building: leaving user-owned /team-building command at ${target}`);
+  if (existing !== null && !existing.includes(marker)) {
+    console.warn(userOwnedWarning);
     return;
   }
   await mkdir(dirname(target), { recursive: true });
   await writeFile(target, content);
-  console.log(`team-building: installed /team-building command at ${target}`);
+  console.log(installedMessage);
+}
+
+async function installNativeCommand() {
+  const target = join(nativeCommandsDir(), COMMAND_NAME);
+  await installManagedFile(
+    target,
+    nativeCommand(),
+    COMMAND_MARKER,
+    `team-building: leaving user-owned /team-building command at ${target}`,
+    `team-building: installed /team-building command at ${target}`,
+  );
+}
+
+async function installRoleExtension() {
+  const target = join(extensionsDir(), EXTENSION_NAME);
+  const content = await readFile(join(skillRoot, "omp", EXTENSION_NAME), "utf8");
+  await installManagedFile(
+    target,
+    content,
+    EXTENSION_MARKER,
+    `team-building: leaving user-owned role extension at ${target}`,
+    `team-building: installed role extension at ${target}`,
+  );
 }
 
 function run(command, args, options) {
@@ -71,6 +102,7 @@ async function main() {
     return;
   }
   await installNativeCommand();
+  await installRoleExtension();
 
   try {
     const omp = await run("omp", ["--version"], { stdio: "ignore" });

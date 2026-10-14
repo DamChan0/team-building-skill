@@ -267,8 +267,9 @@ export async function closeTerminal(handle) {
   try {
     await orca('terminal', 'close', '--terminal', handle, '--tab');
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    // A stale handle means Orca no longer has the tab: already closed.
+    return /terminal_handle_stale/.test(`${error.message}${error.stdout ?? ''}${error.stderr ?? ''}`);
   }
 }
 export async function cleanupWorker(worker) {

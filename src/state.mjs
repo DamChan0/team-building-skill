@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -53,7 +53,7 @@ export async function activeTeams() {
   return teams.filter(Boolean).sort();
 }
 
-export async function resolveTeam(id, die) {
+export async function resolveTeam(id, die, cwd) {
   if (id) {
     if (!/^tb-\d{4}-\d{6}$/.test(id)) {
       die(`bad team id ${JSON.stringify(id)} (expected tb-MMDD-HHMMSS)`);
@@ -67,6 +67,17 @@ export async function resolveTeam(id, die) {
 
   const teams = await activeTeams();
   if (!teams.length) die('no active team; run `team-building init` first');
+  const path = cwd && await realpath(cwd);
+  if (path) {
+    for (const team of teams) {
+      if ((await load(team)).cwd === path) return team;
+    }
+    const active = await Promise.all(teams.map(async team => {
+      const data = await load(team);
+      return `${data.id} (${data.cwd || 'legacy: no cwd'})`;
+    }));
+    die(`no active team for cwd ${path}; active teams: ${active.join(', ')}; run \`team-building init\` or pass --team <id>`);
+  }
   if (teams.length > 1) {
     die(`several teams active, pass --team: ${teams.map(team => team.split('/').pop()).join(', ')}`);
   }

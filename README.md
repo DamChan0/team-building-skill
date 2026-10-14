@@ -1,6 +1,6 @@
 # team-building
 
-- **Release:** [v0.2.0](https://github.com/DamChan0/team-building-skill/releases/tag/v0.2.0)
+- **Release:** [v0.2.1](https://github.com/DamChan0/team-building-skill/releases/tag/v0.2.1)
 - Persistent AI-worker teams managed from one session.
 - **Manager hosts:** OMP, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
 - **OMP is not needed when Claude Code or Codex is the manager and you select native workers.** OMP remains the default worker backend.
@@ -90,6 +90,13 @@ sequenceDiagram
 
   - See the [OMP quickstart](https://omp.sh/docs/quickstart).
 
+
+## OMP role badge
+
+- Setup installs an OMP extension that shows a blue `🔧 Role: worker` badge for workers and a bold purple `👑 Role: manager` badge for the active manager session.
+- `init` records the manager session, so only that session receives the manager badge for its active team at the current path.
+- Restart OMP after installation before the extension loads.
+
 ## Choose a worker backend
 
 - `init` defaults to OMP.
@@ -144,8 +151,9 @@ node ~/.agents/skills/team-building/src/main.mjs init --harness codex --allow-by
 ## Commands and recovery
 
 ```sh
-node ~/.agents/skills/team-building/src/main.mjs init [gpt|claude] [--member N] [--model M] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--new]
+node ~/.agents/skills/team-building/src/main.mjs init [gpt|claude] [--member N] [--model M] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
 node ~/.agents/skills/team-building/src/main.mjs member N [--model M] [--harness H] [--allow-bypass]
+node ~/.agents/skills/team-building/src/main.mjs dismiss --worker wN[,wM...]
 node ~/.agents/skills/team-building/src/main.mjs status [--team ID]
 node ~/.agents/skills/team-building/src/main.mjs assign [--worker wN] [--approval tNNN] [--request-id UUID] [--model M] [--difficulty TIER] PROMPT
 node ~/.agents/skills/team-building/src/main.mjs approve --worker wN --task tNNN -- COMMAND...
@@ -153,10 +161,11 @@ node ~/.agents/skills/team-building/src/main.mjs stop --worker wN [--team ID]
 node ~/.agents/skills/team-building/src/main.mjs clear [--team ID]
 ```
 
-- `init` adopts an active team; `--new` creates a separate team.
-- If several teams are active, pass `--team <id>`.
+- One team per absolute manager path. `init` adopts the current path's team; teams only at other paths make `init` exit 3 until rerun with `--clear-previous` or `--keep-previous`.
+- Without `--team`, commands select the current path's team.
 - `--timeout` is the idle timeout (default 1200 seconds); `--max` is the absolute cap (default 14400 seconds).
 - A 60-second supervisor wait checkpoint is not a worker failure.
+- Workers receive `PWD` matching their configured cwd; OMP also receives `--cwd` so launches from the home directory do not relocate to `/tmp`.
 - Retry an interrupted submission with the same `--request-id` and identical assignment.
   - A changed prompt, team, worker, model, thinking, difficulty, or approval conflicts rather than rerouting.
   - `assign --approval tNNN` keeps the approved source task and worker bound in the PATH shim.

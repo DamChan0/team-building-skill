@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -97,5 +97,73 @@ console.log(JSON.stringify({ ok: true, result }));
     } finally {
       await rm(home, { recursive: true, force: true });
     }
+  }
+});
+
+test('keeps one team per path and creates observers for new workers', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'team-building-paths-'));
+  const root = join(home, 'worktree');
+  const first = join(root, 'first');
+  const second = join(root, 'second');
+  const stateRoot = join(home, '.local', 'state', 'team-building');
+  const calls = join(home, 'orca-calls.jsonl');
+  const orca = join(home, 'orca-ide');
+  const run = (cwd, ...args) => spawnSync(process.execPath, [main, ...args], {
+    cwd,
+    encoding: 'utf8',
+    timeout: 10_000,
+    env: { ...process.env, HOME: home, ORCA_CLI_COMMAND: orca, ORCA_TEST_CALLS: calls },
+  });
+  try {
+    await mkdir(first, { recursive: true });
+    await mkdir(second, { recursive: true });
+    await mkdir(join(root, 'missing'));
+    await writeFile(orca, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+const args = process.argv.slice(2, -1);
+appendFileSync(process.env.ORCA_TEST_CALLS, JSON.stringify(args) + '\\n');
+const result = args[0] === 'worktree'
+  ? { worktree: { path: ${JSON.stringify(root)} } }
+  : args[0] === 'terminal'
+    ? { terminal: { handle: 'observer-' + Date.now() } }
+    : { app: { running: true }, runtime: { reachable: true } };
+console.log(JSON.stringify({ ok: true, result }));
+`);
+    await chmod(orca, 0o755);
+    const teamIds = async () => (await readdir(stateRoot)).filter(team => /^tb-/.test(team));
+
+
+    const created = run(first, 'init', '--harness', 'claude', '--allow-bypass', '--member', '1');
+    assert.equal(created.status, 0, created.stderr);
+    const [firstTeam] = await teamIds();
+    assert.equal(JSON.parse(await readFile(join(stateRoot, firstTeam, 'team.json'), 'utf8')).cwd, first);
+
+    const adopted = run(first, 'init', '--harness', 'claude', '--allow-bypass');
+    assert.equal(adopted.status, 0, adopted.stderr);
+    assert.deepEqual(await teamIds(), [firstTeam]);
+
+    const refused = run(second, 'init', '--harness', 'claude', '--allow-bypass');
+    assert.equal(refused.status, 3);
+    assert.match(refused.stderr, new RegExp(`${firstTeam}.*${first}`));
+    assert.match(refused.stderr, /--clear-previous.*--keep-previous/);
+    assert.deepEqual(await teamIds(), [firstTeam]);
+
+    const kept = run(second, 'init', '--harness', 'claude', '--allow-bypass', '--keep-previous', '--member', '1');
+    assert.equal(kept.status, 0, kept.stderr);
+    const teams = await teamIds();
+    assert.equal(teams.length, 2);
+    const secondTeam = teams.find(team => team !== firstTeam);
+    assert.equal(JSON.parse(await readFile(join(stateRoot, secondTeam, 'team.json'), 'utf8')).cwd, second);
+
+    const selected = run(second, 'member', '2', '--allow-bypass');
+    assert.equal(selected.status, 0, selected.stderr);
+    assert.equal(Object.keys(JSON.parse(await readFile(join(stateRoot, secondTeam, 'team.json'), 'utf8')).workers).length, 2);
+
+    const missing = run(join(root, 'missing'), 'status');
+    assert.equal(missing.status, 2);
+    assert.match(missing.stderr, /run `team-building init` or pass --team <id>/);
+    assert.match(await readFile(calls, 'utf8'), /"terminal","create"/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
   }
 });

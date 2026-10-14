@@ -16,15 +16,20 @@ Run `node ~/.agents/skills/team-building/src/main.mjs`. Node manages team metada
 
 | Request | Command and behavior |
 |---|---|
-| `init [gpt\|claude] [--member N] [--model M] [--harness omp\|claude\|codex] [--isolate]` | `node ~/.agents/skills/team-building/src/main.mjs init ...`. An active team is adopted; routed OMP teams refresh the selected/current routing family. `--new` creates another team only when requested. OMP requires `tools.approvalMode=yolo`; native Claude Code/Codex require explicit `--allow-bypass`. `--isolate` creates one Orca worktree per worker. |
-| `member N [--model M] [--harness H]` | Resize the selected team. An omitted harness retains the existing team harness. |
+| `init [gpt\|claude] [--member N] [--model M] [--harness omp\|claude\|codex] [--isolate] [--clear-previous\|--keep-previous]` | `node ~/.agents/skills/team-building/src/main.mjs init ...`. One manager team per absolute manager path: a team at the current path is adopted (routed OMP teams refresh the selected/current family). If teams exist only at other paths, init exits 3 and lists them; the manager MUST ask the user whether to delete the previous manager, then rerun with `--clear-previous` (clear them first) or `--keep-previous`. New workers run in that path and their Orca observer tabs open immediately. OMP requires `tools.approvalMode=yolo`; native Claude Code/Codex require explicit `--allow-bypass`. `--isolate` creates one Orca worktree per worker. |
+| `member N [--model M] [--harness H]` | Resize the selected team; added workers get Orca observer tabs immediately. An omitted harness retains the existing team harness. |
+| `dismiss --worker wN[,wM...]` | Retire the named idle workers (wrap-up summary, broker stop, observer close, session cleanup). Use for "퇴근" of specific workers. |
 | `status [--team ID]` | Show workers, harness, requested/resolved model, router family, state, current task, queue, and log path. |
 | `assign [--worker wN] [--approval tNNN] [--request-id UUID] [--model M] [--difficulty TIER] PROMPT` | Submit work and wait for the durable native result. A busy selected worker is queued behind its current task. |
 | `approve --worker wN --task tNNN -- COMMAND...` | Record an exact external-command approval for one worker and source task. |
 | `stop --worker wN [--team ID]` | Broker-proven recovery of a broker-owned `unknown` worker. Queued tasks are blocked, not replayed. |
 | `clear [--team ID]` | Wrap up workers, clean only recoverable/owned sessions, report assignment history, and remove the selected team's state. |
 
-If several teams are active, pass `--team <id>`. `--model <exact selector>` pins a fixed model; `--difficulty` requires a routed OMP worker. On a new or restarted manager session, run `status` first and adopt the active team with `init`; never use `--new` unless asked.
+Without `--team`, commands select the team registered for the current path; with none there, they fail and list active teams. `--model <exact selector>` pins a fixed model; `--difficulty` requires a routed OMP worker. On a new or restarted manager session, run `status` first and adopt the path's team with `init`.
+
+## OMP role badge
+
+Setup installs an OMP extension that shows blue `🔧 Role: worker` for workers and bold purple `👑 Role: manager` only for the active manager session. `init` records that manager session. Restart OMP after installation before the extension loads.
 
 ## Broker and message contract
 
