@@ -46,10 +46,12 @@ export async function requireOrca(die) {
 }
 
 export async function requireOmp(die) {
-  const result = await command('omp', ['--version']).catch(() => null);
-  if (!result || result.code !== 0) {
-    die('OMP is required for the default harness but was not found. Install it: curl -fsSL https://omp.sh/install | sh\nSee https://omp.sh/docs/quickstart', 4);
-  }
+  const result = await command('omp', ['config', 'get', 'tools.approvalMode']).catch(error => {
+    if (error.code === 'ENOENT') die('OMP is required for the default harness but was not found. Install it: curl -fsSL https://omp.sh/install | sh\nSee https://omp.sh/docs/quickstart', 4);
+    throw error;
+  });
+  if (result.code !== 0) die(`omp config get tools.approvalMode failed: ${(result.err || result.out).trim().slice(-300)}`, 4);
+  return result.out.trim();
 }
 
 async function sessionHeader(path) {
@@ -217,6 +219,7 @@ export const contract = (team, wid) => `You are team-building worker ${wid} of t
 
 Rules:
 - Implement the assigned slice directly; never run team-building commands, manage teams, or create workers.
+- You are not the lead. The manager triages and reviews your result, so skip lead-only startup: do not read ~/.codex/orchestration.md or output-style skills (caveman), and do not run an independent-review gate.
 - Do not ask the user. If blocked, return status "blocked" and state the exact need.
 - Touch only assigned files. Delete only paths explicitly allowed by the brief or files you created; never delete a directory wholesale or rewrite git history.
 - External/gated commands need manager approval. If not approved, do not retry; return a blocked result with approval_requests containing the exact command argv, target, and reason. Local commands need no approval.

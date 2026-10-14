@@ -31,16 +31,17 @@ function catalog(provider, entries) {
   };
 }
 
-async function withFakeOmp({ openai = gptModels, anthropic = claudeModels, classifier = '{"intent":"implement","difficulty":"moderate"}' }, check) {
+async function withFakeOmp({ openai = gptModels, anthropic = claudeModels, classifier = '{"intent":"implement","difficulty":"moderate"}', typesafeKey = '' }, check) {
   const root = await mkdtemp(join(tmpdir(), 'team-router-'));
   const bin = join(root, 'bin');
   const previousPath = process.env.PATH;
+  const previousKey = process.env.TYPESAFE_API_KEY;
+  process.env.TYPESAFE_API_KEY = typesafeKey;
   try {
     await mkdir(bin);
     await writeFile(join(bin, 'omp'), `#!/usr/bin/env node
 const args = process.argv.slice(2);
 const catalogs = JSON.parse(process.env.OMP_CATALOGS);
-if (args[0] === 'models' && args[1] === 'refresh') process.exit(0);
 if (args[0] === 'models') {
   console.log(JSON.stringify(catalogs[args[1]]));
   process.exit(0);
@@ -57,6 +58,8 @@ console.log(process.env.OMP_CLASSIFIER);
     await check();
   } finally {
     process.env.PATH = previousPath;
+    if (previousKey === undefined) delete process.env.TYPESAFE_API_KEY;
+    else process.env.TYPESAFE_API_KEY = previousKey;
     delete process.env.OMP_CATALOGS;
     delete process.env.OMP_CLASSIFIER;
     await rm(root, { recursive: true, force: true });
@@ -140,6 +143,34 @@ test('highest difficulty selects Astra or Opus xhigh without changing ordinary r
       assert.equal(route.model, family === 'gpt' ? 'openai-codex/gpt-6-astra' : 'anthropic/claude-opus-5-5');
       assert.equal(route.thinking, family === 'claude' ? 'xhigh' : null);
     });
+  }
+});
+
+test('Jev decides the route when available and any Jev failure falls back to the OMP classifier', async () => {
+  const previousFetch = globalThis.fetch;
+  const prompt = '# Goal\nFind the deadlock between the task queue and worker registry.';
+  try {
+    await withFakeOmp({ typesafeKey: 'test-key', classifier: '{"intent":"omp says","difficulty":"simple"}' }, async () => {
+      const router = await configureRouter('gpt');
+      globalThis.fetch = async () => new Response(JSON.stringify({ model: 'jev-1.13.0', answers: { difficulty: { type: 'choice', choice: 'complex' } } }));
+      assert.deepEqual(await classifyRequest(router, prompt), {
+        intent: 'Find the deadlock between the task queue and worker registry.',
+        difficulty: 'complex',
+        router_model: 'typesafe/jev-1.13.0',
+        model: 'openai-codex/gpt-6.1-sol',
+        thinking: null,
+      });
+      for (const reply of [
+        () => new Response('{"error":"unauthorized"}', { status: 401 }),
+        () => new Response(JSON.stringify({ answers: { difficulty: { choice: 'expert' } } })),
+        () => { throw new TypeError('fetch failed'); },
+      ]) {
+        globalThis.fetch = async () => reply();
+        assert.equal((await classifyRequest(router, prompt)).router_model, 'openai-codex/gpt-6-luna');
+      }
+    });
+  } finally {
+    globalThis.fetch = previousFetch;
   }
 });
 

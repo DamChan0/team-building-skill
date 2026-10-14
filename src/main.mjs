@@ -184,7 +184,9 @@ const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 async function ensureObserver(teamDir, data, worker) {
   const worktree = data.isolate ? worker.worktree : data.worktree;
   if (!worktree) throw new OrcaError(`worker ${worker.id} has no Orca worktree for its observer`);
-  const title = `${data.id} ${worker.id} observer`;
+  // OMP workers get a live transcript of their session; other harnesses keep the summary log.
+  const live = workerHarness(worker, data) === 'omp';
+  const title = `${data.id} ${worker.id} ${live ? 'session' : 'observer'}`;
   if (worker.observer) {
     const listing = await orca('terminal', 'list', '--worktree', `path:${worktree}`);
     if (!Array.isArray(listing.terminals)) throw new OrcaError(`observer census returned no terminals for ${worker.id}`);
@@ -194,13 +196,15 @@ async function ensureObserver(teamDir, data, worker) {
       if (!terminal.title || terminal.title === title) return;
       await orca('terminal', 'close', '--terminal', worker.observer);
     }
-    console.error(`team-building: warning: ${worker.id} observer ${worker.observer} is closed, missing, or incorrectly titled; recreating log viewer (worker session unchanged)`);
+    console.error(`team-building: warning: ${worker.id} observer ${worker.observer} is closed, missing, or incorrectly titled; recreating viewer (worker session unchanged)`);
   }
   // Shell preexec hooks overwrite --title; restore it after the hook runs.
-  const response = await orca('terminal', 'create', '--worktree', `path:${worktree}`, '--title', title, '--command', `printf '\\033]0;%s\\007' ${shellQuote(title)}; exec ${shellQuote(supervisorBinary)} view --log ${shellQuote(worker.log)}`);
+  const view = `view --log ${shellQuote(worker.log)}${live ? ` --session-dir ${shellQuote(worker.session_dir)}` : ''}`;
+  const response = await orca('terminal', 'create', '--worktree', `path:${worktree}`, '--title', title, '--command', `printf '\\033]0;%s\\007' ${shellQuote(title)}; exec ${shellQuote(supervisorBinary)} ${view}`);
   const terminal = response.terminal || response;
   if (!terminal.handle) throw new OrcaError(`observer create returned no handle for ${worker.id}`);
   if (terminal.orphaned || terminal.connected === false) console.error(`team-building: warning: ${worker.id} observer ${terminal.handle} was created without a connected Orca pane; use terminal switch to reveal it`);
+  worker.observer = terminal.handle; // rollback reads the in-memory handle
   await withLock(teamDir, async () => {
     const latest = await load(teamDir);
     if (latest.workers[worker.id]) {
@@ -208,6 +212,11 @@ async function ensureObserver(teamDir, data, worker) {
       await save(teamDir, latest);
     }
   });
+}
+// Settle every create before failing so rollback sees each recorded observer handle.
+async function ensureObservers(teamDir, data, workers) {
+  const failed = (await Promise.allSettled(workers.map(worker => ensureObserver(teamDir, data, worker)))).find(result => result.status === 'rejected');
+  if (failed) throw failed.reason;
 }
 
 export async function runAssignment(teamDir, preferredWorker, prompt, timeout, maximum, kind = 'task', approval = null, assignment = {}) {
@@ -511,17 +520,13 @@ async function init(args) {
   const fixedModel = familySelected ? null : args.model || null;
   const harness = args.harness || 'omp';
   if (familySelected && harness !== 'omp') die('gpt/claude family routing requires --harness omp; the family selects models, not the harness');
-  if (harness === 'omp') await requireOmp(die);
+  // One omp spawn proves the binary exists and reads the approval mode.
+  const approvalMode = harness === 'omp' ? await requireOmp(die) : null;
   if (requiresBypass(harness) && !args.allowBypass) {
     die(`--harness ${harness} requires explicit --allow-bypass (it enables ${configFor({ harness }).bypass})`, 3);
   }
-
-  let approvalMode = null;
-  if (harness === 'omp') {
-    approvalMode = (await command('omp', ['config', 'get', 'tools.approvalMode'])).out.trim();
-    if (approvalMode !== 'yolo') {
-      die(`tools.approvalMode is ${JSON.stringify(approvalMode)}; omp workers need yolo because nobody can answer their prompts.`, 3);
-    }
+  if (harness === 'omp' && approvalMode !== 'yolo') {
+    die(`tools.approvalMode is ${JSON.stringify(approvalMode)}; omp workers need yolo because nobody can answer their prompts.`, 3);
   }
 
   const cwd = realpathSync(process.cwd());
@@ -564,7 +569,7 @@ async function init(args) {
     if (args.member || fixedModel) {
       return member({ ...args, model: fixedModel, n: args.member || Object.keys(current.workers).length, team: basename(teamDir) });
     }
-    for (const worker of Object.values(current.workers).filter(worker => !worker.retiring)) await ensureObserver(teamDir, current, worker);
+    await ensureObservers(teamDir, current, Object.values(current.workers).filter(worker => !worker.retiring));
     return show(teamDir);
   }
 
@@ -639,7 +644,7 @@ async function init(args) {
       data.workers[workerId].worktree = workerWorktree;
     }
     await save(teamDir, data);
-    for (const worker of Object.values(data.workers)) await ensureObserver(teamDir, data, worker);
+    await ensureObservers(teamDir, data, Object.values(data.workers));
   } catch (error) {
     const latest = await load(teamDir).catch(() => data);
     await Promise.all(Object.values(latest.workers).map(worker => worker.observer && closeTerminal(worker.observer).catch(() => {})));
@@ -703,7 +708,7 @@ async function member(args) {
     await save(teamDir, data);
   });
   try {
-    for (const worker of Object.values(data.workers).filter(worker => !worker.retiring && !retirees.includes(worker.id))) await ensureObserver(teamDir, data, worker);
+    await ensureObservers(teamDir, data, Object.values(data.workers).filter(worker => !worker.retiring && !retirees.includes(worker.id)));
   } catch (error) {
     await Promise.all(added.map(worker => worker.observer && closeTerminal(worker.observer).catch(() => {})));
     await rollbackIsolated({ ...data, workers: Object.fromEntries(added.map(worker => [worker.id, worker])) });
@@ -818,7 +823,7 @@ async function assign(args) {
     if (error) die(error);
   }
   if (args.difficulty && !args.model && !data.model && !data.router) {
-    const router = await configureRouter('gpt', { refresh: false });
+    const router = await configureRouter('gpt');
     router.enabled = false;
     await withLock(teamDir, async () => {
       data = await load(teamDir);

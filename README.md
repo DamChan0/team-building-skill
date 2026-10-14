@@ -1,12 +1,16 @@
 # team-building
 
-- **Release:** [v0.2.2](https://github.com/DamChan0/team-building-skill/releases/tag/v0.2.2)
+- **Release:** [v0.3.0](https://github.com/DamChan0/team-building-skill/releases/tag/v0.3.0)
 - Persistent AI-worker teams managed from one session.
 - **Manager hosts:** OMP, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
 - **OMP is not needed when Claude Code or Codex is the manager and you select native workers.** OMP remains the default worker backend.
 - **Orca remains required in every mode:** run the Orca app and CLI with the active worktree registered.
 
 ![team-building concept: the manager splits a user command into briefs, native worker sessions execute them, Orca observer terminals show typed UI messages, and the manager reviews results](concept.webp)
+
+## Weight routing
+
+`SKILL.md` makes the manager pick the lightest executor first: tier 0 inline, tier 1 one-shot host subagent (no team), tier 2 a 1–2 worker team, tier 3 a parallel team sized to the independent slices (≤4). Failed or blocked results escalate one tier; idle workers are dismissed. `--difficulty` chooses model strength independently of team size.
 
 ## Execution model
 
@@ -32,9 +36,9 @@ sequenceDiagram
   - `omp` uses OMP RPC and is the default.
   - `claude` launches the native Claude Code CLI with `stream-json`.
   - `codex` launches the native Codex CLI through `app-server` JSON-RPC.
-- **Orca:** provides the active worktree and read-only observer terminals. Observer terminals show typed UI messages only; they never receive native protocol traffic or `TaskResult` JSON.
+- **Orca:** provides the active worktree and read-only worker tabs. OMP worker tabs redraw the worker's live session transcript with `omp render` whenever the session file grows. Claude/Codex tabs show one typed UI summary line per finished task. Tabs never receive native protocol traffic or `TaskResult` JSON.
 - Closing an observer tab does not stop its supervisor-owned worker. To restore closed or missing observers, run `member` with the team's current worker count from the manager, for example `node ~/.agents/skills/team-building/src/main.mjs member 3 --team <team-id>`. Connected observers are reused; native sessions are unchanged. Re-adopting the same team with `init` also restores observers. A live observer without an Orca pane produces a warning instead of launching another viewer; use `orca-ide terminal switch --terminal <handle>` to reveal it.
-- Observer titles are `<team-id> <worker-id> observer`. The launch command restores this title with OSC 0 after shell preexec hooks run. Re-adoption replaces an incorrectly titled viewer (including `exec`) without restarting its native worker session.
+- Tab titles are `<team-id> <worker-id> session` (OMP) or `<team-id> <worker-id> observer` (Claude/Codex). The launch command restores this title with OSC 0 after shell preexec hooks run. Re-adoption or the next assignment replaces an incorrectly titled viewer (including `exec` or an older log-only OMP tab) without restarting its native worker session.
 - **Local IPC:** every request uses an object envelope such as `{ "version": 1, "id": "<uuid>", "type": "<command>", "payload": { ... } }`.
   - Envelopes and payloads must be objects; scalar requests are rejected.
   - Responses and events are correlated objects.
@@ -127,7 +131,7 @@ node ~/.agents/skills/team-building/src/main.mjs init --harness codex --allow-by
 
 ## OMP model routing
 
-- Refresh and pin the GPT-family map, then let the classifier route each brief:
+- Pin the GPT-family map from OMP's cached model catalog (`omp models <provider>`; `omp models refresh` runs only when the cache lacks a role), then let the classifier route each brief:
 
   ```sh
   node ~/.agents/skills/team-building/src/main.mjs init --member 3
@@ -148,6 +152,7 @@ node ~/.agents/skills/team-building/src/main.mjs init --harness codex --allow-by
 - Initialization fails rather than downgrading if the required model or effort is unavailable.
 - The saved model map stays stable until the next `init` adoption.
 - `assign --difficulty simple|moderate|complex|extreme` uses a saved tier without classification; `assign --model <selector>` overrides the model for one task.
+- **Classifier:** with `TYPESAFE_API_KEY` set (environment, or a `TYPESAFE_API_KEY=` line in `~/.env`), a TypeSafe Jev Choice picks the tier in ~0.2s instead of a ~5s `omp -p` call; the brief text is sent to `api.typesafe.ai`. HTTP, timeout (5s), or invalid-answer failures warn and fall back to the OMP classifier. `TYPESAFE_API_KEY=` (empty) disables Jev.
 - Invalid classifier output, routing errors, or a changed map fail closed.
 - OMP resume reapplies its configured `defaultThinkingLevel`; an earlier extreme task's `xhigh` cannot leak into ordinary work.
 
