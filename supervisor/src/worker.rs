@@ -723,4 +723,55 @@ mod tests {
             parse_result(r#"{"status":"succeeded","summary":"ok","verification":"done"}"#).is_ok()
         );
     }
+
+    #[test]
+    fn normalizes_verification_array_from_final_text() {
+        let result = parse_result(
+            r#"{"status":"succeeded","summary":"done","verification":["cargo test passed","smoke passed"]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.status, "succeeded");
+        assert_eq!(result.verification, "cargo test passed\nsmoke passed");
+    }
+
+    #[test]
+    fn normalizes_null_branch_and_commit_from_structured_output() {
+        let result = super::parse_result_value(&serde_json::json!({
+            "status": "succeeded", "summary": "done", "verification": "checked",
+            "branch": null, "commit": null
+        }))
+        .unwrap();
+        assert_eq!(result.branch, "");
+        assert_eq!(result.commit, "");
+    }
+
+    #[test]
+    fn normalizes_optional_result_fields_without_losing_details() {
+        let result = parse_result(
+            r#"{"status":"blocked","summary":"needs approval","files_changed":"a.rs","files_deleted":null,"blockers":"approval required","verification":null,"branch":["feature","local"]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.files_changed, ["a.rs"]);
+        assert!(result.files_deleted.is_empty());
+        assert_eq!(result.blockers, ["approval required"]);
+        assert_eq!(result.verification, "");
+        assert_eq!(result.branch, "feature\nlocal");
+        assert_eq!(result.commit, "");
+        let missing = parse_result(r#"{"status":"succeeded","summary":"done"}"#).unwrap();
+        assert_eq!(missing.verification, "");
+    }
+
+    #[test]
+    fn preserves_required_result_validation() {
+        for text in [
+            r#"{"summary":"done"}"#,
+            r#"{"status":"succeeded"}"#,
+            r#"{"status":null,"summary":"done"}"#,
+            r#"{"status":"succeeded","summary":["done"]}"#,
+            r#"{"status":"unknown","summary":"done"}"#,
+            r#"{"status":"succeeded","summary":"done","verification":[42]}"#,
+        ] {
+            assert!(parse_result(text).is_err(), "{text}");
+        }
+    }
 }

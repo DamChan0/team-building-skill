@@ -161,7 +161,7 @@ async function running(client, request) {
       after = Math.max(after, event.seq);
       await client.ack(request, event.seq);
     }
-    if (reply.task.state === 'running') return reply.task;
+    if (reply.task.state === 'running' && reply.events.some(event => event.state === 'started')) return reply.task;
     if (['failed', 'blocked', 'unknown'].includes(reply.task.state)) throw new Error(`worker failed before running: ${JSON.stringify(reply.task)}`);
   }
 }
@@ -218,6 +218,36 @@ test('broker keeps native work pending through acceptance and reuses its exact s
     assert.equal((await terminal(daemon.client, second)).session_id, completed.session_id);
     assert.equal((await daemon.client.status('team')).workers[0].assignments, 2);
     assert.deepEqual(readFileSync(effect, 'utf8').trim().split('\n'), [completed.session_id, completed.session_id]);
+  } finally {
+    if (daemon) await stop(daemon);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('broker preserves successful results with loose optional field types', { skip: !available, concurrency: false }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'team-supervisor-normalization-'));
+  let daemon;
+  try {
+    const loose = JSON.stringify({
+      status: 'succeeded', summary: 'fixture completed',
+      verification: ['test passed', 'smoke passed'],
+      branch: null, commit: null, files_changed: 'output.txt', blockers: null,
+    });
+    await writeFile(join(root, 'fixture.mjs'), fixture.replaceAll(JSON.stringify(result), JSON.stringify(loose)));
+    daemon = await start(root);
+    const request = uuid(9);
+    const control = join(root, 'result.sock');
+    await daemon.client.submit(task(root, request, control, join(root, 'effect')), request);
+    await running(daemon.client, request);
+    await waitForFile(`${control}.ready`, async () => (await daemon.client.get(request)).task);
+    await connectControl(control);
+    const completed = await terminal(daemon.client, request);
+    assert.equal(completed.state, 'succeeded');
+    assert.equal(completed.result.verification, 'test passed\nsmoke passed');
+    assert.equal(completed.result.branch, '');
+    assert.equal(completed.result.commit, '');
+    assert.deepEqual(completed.result.files_changed, ['output.txt']);
+    assert.deepEqual(completed.result.blockers, []);
   } finally {
     if (daemon) await stop(daemon);
     await rm(root, { recursive: true, force: true });

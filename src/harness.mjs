@@ -221,7 +221,7 @@ Rules:
 - Touch only assigned files. Delete only paths explicitly allowed by the brief or files you created; never delete a directory wholesale or rewrite git history.
 - External/gated commands need manager approval. If not approved, do not retry; return a blocked result with approval_requests containing the exact command argv, target, and reason. Local commands need no approval.
 - In an isolated worktree, make a local commit and report its branch and commit. Never push.
-- Return exactly one JSON object, without prose or Markdown, containing status ("succeeded", "failed", or "blocked"), summary, files_changed, files_deleted, verification, blockers, approval_requests, branch, and commit. Do not write a result file; the supervisor receives the structured native result.`;
+- Return exactly one JSON object, without prose or Markdown, containing status ("succeeded", "failed", or "blocked"), summary, files_changed, files_deleted, verification, blockers, approval_requests, branch, and commit. summary, verification, branch, and commit must be strings; use "\\n" inside verification for multiple checks and "" for unavailable branch/commit, never null. files_changed, files_deleted, and blockers must be arrays of strings; approval_requests must be an array of request objects; use [] when empty. Do not write a result file; the supervisor receives the structured native result.`;
 export function launchConfig(worker) {
   return { model: worker.task_model ?? worker.model ?? null, thinking: worker.task_thinking ?? null };
 }

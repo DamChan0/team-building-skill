@@ -1,6 +1,6 @@
 # team-building
 
-- **Release:** [v0.2.1](https://github.com/DamChan0/team-building-skill/releases/tag/v0.2.1)
+- **Release:** [v0.2.2](https://github.com/DamChan0/team-building-skill/releases/tag/v0.2.2)
 - Persistent AI-worker teams managed from one session.
 - **Manager hosts:** OMP, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
 - **OMP is not needed when Claude Code or Codex is the manager and you select native workers.** OMP remains the default worker backend.
@@ -33,11 +33,14 @@ sequenceDiagram
   - `claude` launches the native Claude Code CLI with `stream-json`.
   - `codex` launches the native Codex CLI through `app-server` JSON-RPC.
 - **Orca:** provides the active worktree and read-only observer terminals. Observer terminals show typed UI messages only; they never receive native protocol traffic or `TaskResult` JSON.
+- Closing an observer tab does not stop its supervisor-owned worker. To restore closed or missing observers, run `member` with the team's current worker count from the manager, for example `node ~/.agents/skills/team-building/src/main.mjs member 3 --team <team-id>`. Connected observers are reused; native sessions are unchanged. Re-adopting the same team with `init` also restores observers. A live observer without an Orca pane produces a warning instead of launching another viewer; use `orca-ide terminal switch --terminal <handle>` to reveal it.
+- Observer titles are `<team-id> <worker-id> observer`. The launch command restores this title with OSC 0 after shell preexec hooks run. Re-adoption replaces an incorrectly titled viewer (including `exec`) without restarting its native worker session.
 - **Local IPC:** every request uses an object envelope such as `{ "version": 1, "id": "<uuid>", "type": "<command>", "payload": { ... } }`.
   - Envelopes and payloads must be objects; scalar requests are rejected.
   - Responses and events are correlated objects.
 - **Disconnects and retries:**
   - Manager EOF never cancels accepted work.
+  - `running` records scheduler dispatch; `started` confirms native prompt acceptance. Integration fixtures wait for `started` before requesting completion.
   - Retrying the same `--request-id` with the identical assignment replays it; a changed assignment conflicts.
   - Queues are FIFO per worker.
 - **Restart recovery:**
@@ -193,6 +196,7 @@ node ~/.agents/skills/team-building/src/main.mjs clear [--team ID]
 
 - `~/.local/state/team-building/<team-id>/` — team metadata, approvals, results, worker logs, and session references; `clear` removes this only after verified recovery or retirement.
 - `~/.local/state/team-building/supervisor/` — singleton supervisor SQLite database and lock.
+  - Tests own their temporary supervisor processes, request `shutdown`, and wait for exit before removing temporary state. Team cleanup does not shut down the shared production supervisor.
 - `~/work-notes/team-building/<date>-<team-id>.md` — summary written by `clear`.
 - `~/.omp/agent/commands/team-building.md` — generated OMP command alias. `PI_CONFIG_DIR` and `OMP_PROFILE`/`PI_PROFILE` select its config/profile directory. Setup leaves conflicting user-owned aliases unchanged.
 - **Uninstall:** run `team clear` first, then `npx skills remove -g team-building`.

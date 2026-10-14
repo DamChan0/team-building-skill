@@ -182,12 +182,25 @@ async function syncStatus(teamDir, client, team) {
 
 const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 async function ensureObserver(teamDir, data, worker) {
-  if (worker.observer) return;
   const worktree = data.isolate ? worker.worktree : data.worktree;
   if (!worktree) throw new OrcaError(`worker ${worker.id} has no Orca worktree for its observer`);
-  const response = await orca('terminal', 'create', '--worktree', `path:${worktree}`, '--title', `${data.id} ${worker.id} observer`, '--command', `exec ${shellQuote(supervisorBinary)} view --log ${shellQuote(worker.log)}`);
+  const title = `${data.id} ${worker.id} observer`;
+  if (worker.observer) {
+    const listing = await orca('terminal', 'list', '--worktree', `path:${worktree}`);
+    if (!Array.isArray(listing.terminals)) throw new OrcaError(`observer census returned no terminals for ${worker.id}`);
+    const terminal = listing.terminals.find(item => item.handle === worker.observer);
+    if (terminal?.connected && !terminal.exitCause) {
+      if (terminal.orphaned) console.error(`team-building: warning: ${worker.id} observer ${worker.observer} is running without a visible Orca pane; use terminal switch to reveal it`);
+      if (!terminal.title || terminal.title === title) return;
+      await orca('terminal', 'close', '--terminal', worker.observer);
+    }
+    console.error(`team-building: warning: ${worker.id} observer ${worker.observer} is closed, missing, or incorrectly titled; recreating log viewer (worker session unchanged)`);
+  }
+  // Shell preexec hooks overwrite --title; restore it after the hook runs.
+  const response = await orca('terminal', 'create', '--worktree', `path:${worktree}`, '--title', title, '--command', `printf '\\033]0;%s\\007' ${shellQuote(title)}; exec ${shellQuote(supervisorBinary)} view --log ${shellQuote(worker.log)}`);
   const terminal = response.terminal || response;
   if (!terminal.handle) throw new OrcaError(`observer create returned no handle for ${worker.id}`);
+  if (terminal.orphaned || terminal.connected === false) console.error(`team-building: warning: ${worker.id} observer ${terminal.handle} was created without a connected Orca pane; use terminal switch to reveal it`);
   await withLock(teamDir, async () => {
     const latest = await load(teamDir);
     if (latest.workers[worker.id]) {
@@ -551,6 +564,7 @@ async function init(args) {
     if (args.member || fixedModel) {
       return member({ ...args, model: fixedModel, n: args.member || Object.keys(current.workers).length, team: basename(teamDir) });
     }
+    for (const worker of Object.values(current.workers).filter(worker => !worker.retiring)) await ensureObserver(teamDir, current, worker);
     return show(teamDir);
   }
 
@@ -689,7 +703,7 @@ async function member(args) {
     await save(teamDir, data);
   });
   try {
-    for (const worker of added) await ensureObserver(teamDir, data, worker);
+    for (const worker of Object.values(data.workers).filter(worker => !worker.retiring && !retirees.includes(worker.id))) await ensureObserver(teamDir, data, worker);
   } catch (error) {
     await Promise.all(added.map(worker => worker.observer && closeTerminal(worker.observer).catch(() => {})));
     await rollbackIsolated({ ...data, workers: Object.fromEntries(added.map(worker => [worker.id, worker])) });

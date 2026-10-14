@@ -35,19 +35,45 @@ pub(crate) struct TaskSpec {
 pub(crate) struct TaskResult {
     pub(crate) status: String,
     pub(crate) summary: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "result_strings")]
     pub(crate) files_changed: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "result_strings")]
     pub(crate) files_deleted: Vec<String>,
+    #[serde(default, deserialize_with = "result_string")]
     pub(crate) verification: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "result_strings")]
     pub(crate) blockers: Vec<String>,
     #[serde(default)]
     pub(crate) approval_requests: Vec<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "result_string")]
     pub(crate) branch: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "result_string")]
     pub(crate) commit: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ResultText {
+    String(String),
+    Strings(Vec<String>),
+}
+
+fn result_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(match Option::<ResultText>::deserialize(deserializer)? {
+        Some(ResultText::String(text)) => text,
+        Some(ResultText::Strings(lines)) => lines.join("\n"),
+        None => String::new(),
+    })
+}
+
+fn result_strings<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    Ok(match Option::<ResultText>::deserialize(deserializer)? {
+        Some(ResultText::String(text)) => vec![text],
+        Some(ResultText::Strings(lines)) => lines,
+        None => Vec::new(),
+    })
 }
 
 impl TaskResult {
