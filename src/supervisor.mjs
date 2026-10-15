@@ -86,7 +86,8 @@ async function start(paths, client) {
   try { await client.health(); return; } catch {}
   await buildSupervisor();
   await new Promise((resolve, reject) => {
-    const child = spawn(supervisorBinary, ['serve', '--state-dir', paths.stateDir, '--socket', paths.socket], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const daemonEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('HERDR_')));
+    const child = spawn(supervisorBinary, ['serve', '--state-dir', paths.stateDir, '--socket', paths.socket], { detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: daemonEnv });
     let output = Buffer.alloc(0);
     let settled = false;
     const finish = error => {

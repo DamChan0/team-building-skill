@@ -11,6 +11,7 @@ export const DEFAULT_TIMEOUT = 1200;
 export const DEFAULT_MAX = 14400;
 export const WORKER_ENV = 'TEAM_BUILDING_WORKER';
 export const GATED = ['git', 'ssh', 'scp', 'rsync', 'sftp', 'gh', 'docker'];
+export const backendName = () => (process.env.HERDR_ENV === '1' ? 'herdr' : 'orca');
 
 export const now = () => new Date().toISOString().replace(/\.\d{3}Z$/, '');
 
@@ -48,7 +49,8 @@ export async function activeTeams() {
   const entries = await readdir(STATE_ROOT, { withFileTypes: true });
   const teams = await Promise.all(entries.filter(entry => entry.isDirectory()).map(async entry => {
     const dir = join(STATE_ROOT, entry.name);
-    return await exists(join(dir, 'team.json')) ? dir : null;
+    if (!(await exists(join(dir, 'team.json')))) return null;
+    return ((await load(dir)).backend || 'orca') === backendName() ? dir : null;
   }));
   return teams.filter(Boolean).sort();
 }

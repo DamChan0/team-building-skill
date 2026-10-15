@@ -5,10 +5,12 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { exists, GATED, STATE_ROOT, WORKER_ENV, dropPointers, load, save, withLock } from './state.mjs';
+import { backendName, exists, GATED, STATE_ROOT, WORKER_ENV, dropPointers, load, save, withLock } from './state.mjs';
 
 const ORCA = process.env.ORCA_CLI_COMMAND || 'orca-ide';
+const HERDR = process.env.HERDR_CLI_COMMAND || 'herdr';
 export class OrcaError extends Error {}
+export { backendName };
 export const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 export const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 
@@ -35,7 +37,28 @@ export async function orca(...args) {
   }
 }
 
-export async function requireOrca(die) {
+export async function herdr(...args) {
+  const response = await command(HERDR, args);
+  let body;
+  try { body = JSON.parse(response.out); } catch { body = null; }
+  if (!body) { try { body = JSON.parse(response.err); } catch { body = null; } }
+  if (response.code === 0 && !body?.error) return body?.result ?? {};
+  const code = body?.error?.code;
+  const message = body?.error?.message || (response.err || response.out).trim().slice(-300);
+  throw new OrcaError(`${HERDR} ${args.slice(0, 2).join(' ')}: ${code ? `${code}: ` : ''}${message}`);
+}
+
+export async function requireBackend(die) {
+  if (backendName() === 'herdr') {
+    try {
+      const status = await herdr('pane', 'current', '--current');
+      if (status.pane) return;
+    } catch (error) {
+      die(`herdr is not reachable from this pane (${error.message}); team workers run as herdr panes. Start a herdr pane and retry.`, 4);
+    }
+    die('herdr is not reachable from this pane; start a herdr pane and retry.', 4);
+    return;
+  }
   try {
     const status = await orca('status');
     if (status.app.running && status.runtime.reachable) return;
@@ -265,8 +288,16 @@ export async function nativeTask(team, worker, { prompt, teamDir, cwd }) {
   argv.push('-c', `developer_instructions=${JSON.stringify(instruction)}`, 'app-server');
   return { argv, env: {}, thinking: configuredThinking };
 }
-export async function closeTerminal(handle) {
+export async function closeTerminal(handle, backend = 'orca') {
   if (!handle) return true;
+  if (backend === 'herdr') {
+    try {
+      await herdr('tab', 'close', handle);
+      return true;
+    } catch (error) {
+      return /_not_found/.test(error.message);
+    }
+  }
   try {
     await orca('terminal', 'close', '--terminal', handle, '--tab');
     return true;

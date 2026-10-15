@@ -29,14 +29,16 @@ import {
   writeResult,
 } from './state.mjs';
 import {
+  backendName,
   cleanupWorker,
   closeTerminal,
   command,
   configFor,
+  herdr,
   OrcaError,
   orca,
+  requireBackend,
   requireOmp,
-  requireOrca,
   writeShims,
   nativeTask,
 } from './harness.mjs';
@@ -55,6 +57,15 @@ function die(message, code = 2) {
   console.error(`team-building: ${message}`);
   process.exitCode = code;
   throw new Error('__team_die__');
+}
+
+const BACKEND_LABEL = { orca: 'Orca', herdr: 'herdr' };
+
+function backendMismatchError(data) {
+  const recorded = data.backend || 'orca';
+  const current = backendName();
+  if (recorded === current) return null;
+  return `team ${data.id} was created under ${recorded}; run it from ${recorded === 'herdr' ? 'a herdr pane' : 'Orca (not inside a herdr pane)'}`;
 }
 
 function workerIndex(id) {
@@ -183,10 +194,41 @@ async function syncStatus(teamDir, client, team) {
 const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 async function ensureObserver(teamDir, data, worker) {
   const worktree = data.isolate ? worker.worktree : data.worktree;
-  if (!worktree) throw new OrcaError(`worker ${worker.id} has no Orca worktree for its observer`);
   // OMP workers get a live transcript of their session; other harnesses keep the summary log.
   const live = workerHarness(worker, data) === 'omp';
   const title = `${data.id} ${worker.id} ${live ? 'session' : 'observer'}`;
+  const view = `view --log ${shellQuote(worker.log)}${live ? ` --session-dir ${shellQuote(worker.session_dir)}` : ''}`;
+  if ((data.backend || 'orca') === 'herdr') {
+    if (!worktree) throw new OrcaError(`worker ${worker.id} has no herdr worktree for its observer`);
+    if (worker.observer) {
+      const existing = await herdr('tab', 'get', worker.observer).catch(() => null);
+      if (existing?.tab?.label === title) return;
+      if (existing) await herdr('tab', 'close', worker.observer).catch(() => {});
+      console.error(`team-building: warning: ${worker.id} observer ${worker.observer} is closed, missing, or incorrectly titled; recreating viewer (worker session unchanged)`);
+    }
+    const workspace = data.isolate ? worker.herdr_workspace : process.env.HERDR_WORKSPACE_ID;
+    if (!workspace) throw new OrcaError(`worker ${worker.id} has no herdr workspace for its observer`);
+    const tab = await herdr('tab', 'create', '--workspace', workspace, '--cwd', worktree, '--label', title, '--no-focus');
+    const tabId = tab.tab?.tab_id;
+    const rootPane = tab.root_pane?.pane_id;
+    if (!tabId || !rootPane) throw new OrcaError(`observer create returned no tab for ${worker.id}`);
+    try {
+      await herdr('pane', 'run', rootPane, `exec ${shellQuote(supervisorBinary)} ${view}`);
+    } catch (error) {
+      await herdr('tab', 'close', tabId).catch(() => {});
+      throw error;
+    }
+    worker.observer = tabId; // rollback reads the in-memory handle
+    await withLock(teamDir, async () => {
+      const latest = await load(teamDir);
+      if (latest.workers[worker.id]) {
+        latest.workers[worker.id].observer = tabId;
+        await save(teamDir, latest);
+      }
+    });
+    return;
+  }
+  if (!worktree) throw new OrcaError(`worker ${worker.id} has no Orca worktree for its observer`);
   if (worker.observer) {
     const listing = await orca('terminal', 'list', '--worktree', `path:${worktree}`);
     if (!Array.isArray(listing.terminals)) throw new OrcaError(`observer census returned no terminals for ${worker.id}`);
@@ -199,7 +241,6 @@ async function ensureObserver(teamDir, data, worker) {
     console.error(`team-building: warning: ${worker.id} observer ${worker.observer} is closed, missing, or incorrectly titled; recreating viewer (worker session unchanged)`);
   }
   // Shell preexec hooks overwrite --title; restore it after the hook runs.
-  const view = `view --log ${shellQuote(worker.log)}${live ? ` --session-dir ${shellQuote(worker.session_dir)}` : ''}`;
   const response = await orca('terminal', 'create', '--worktree', `path:${worktree}`, '--title', title, '--command', `printf '\\033]0;%s\\007' ${shellQuote(title)}; exec ${shellQuote(supervisorBinary)} ${view}`);
   const terminal = response.terminal || response;
   if (!terminal.handle) throw new OrcaError(`observer create returned no handle for ${worker.id}`);
@@ -348,6 +389,7 @@ function newWorker(teamDir, data, harness, cwd) {
     session_file: null,
     cwd: cwd || data.cwd,
     worktree: null,
+    herdr_workspace: null,
     terminal_started: false,
     terminal_stopped: false,
     approval_task: null,
@@ -372,6 +414,11 @@ export async function show(teamDir) {
 }
 
 async function registeredCwd() {
+  if (backendName() === 'herdr') {
+    await requireBackend(die);
+    const [code, root] = await gitOutput(['rev-parse', '--show-toplevel'], process.cwd());
+    return code === 0 ? root : process.cwd();
+  }
   const program = process.env.ORCA_CLI_COMMAND || 'orca-ide';
   const result = await command(program, ['worktree', 'current', '--json']);
   let response;
@@ -405,7 +452,7 @@ function assignmentWorktreeError(data, worker, currentWorktree) {
   if (!worktree || !cwd || !insideWorktree(worktree, cwd)) {
     return data.isolate
       ? `isolated worker ${worker.id} cwd ${cwd || '(unknown)'} is outside its recorded worktree`
-      : `worker cwd ${cwd || '(unknown)'} is outside current Orca worktree ${worktree || '(unknown)'}`;
+      : `worker cwd ${cwd || '(unknown)'} is outside current ${BACKEND_LABEL[data.backend || 'orca']} worktree ${worktree || '(unknown)'}`;
   }
   return null;
 }
@@ -420,6 +467,22 @@ export async function isolatedCwd(data, workerId) {
   if (rootCode) die('--isolate requires a git repository cwd', 2);
   const [headCode, base] = await gitOutput(['rev-parse', 'HEAD'], data.cwd);
   if (headCode) die('--isolate requires a repository with HEAD', 2);
+  const nested = relative(root, data.cwd);
+
+  if ((data.backend || 'orca') === 'herdr') {
+    const response = await herdr(
+      'worktree', 'create',
+      '--cwd', data.cwd,
+      '--branch', `${data.id}-${workerId}`,
+      '--base', base,
+      '--label', `${data.id}-${workerId}`,
+      '--no-focus',
+    );
+    const worktree = response.workspace?.worktree?.checkout_path;
+    const workspace = response.workspace?.workspace_id;
+    if (!worktree || !workspace) throw new OrcaError('herdr worktree create returned no checkout path');
+    return [worktree, join(worktree, nested === '.' ? '' : nested), workspace];
+  }
 
   const response = await orca(
     'worktree',
@@ -437,8 +500,7 @@ export async function isolatedCwd(data, workerId) {
   const worktree = JSON.stringify(response).match(/"path"\s*:\s*"([^"]+)"/)?.[1];
   if (!worktree) throw new OrcaError('orca worktree create returned no path');
 
-  const nested = relative(root, data.cwd);
-  return [worktree, join(worktree, nested === '.' ? '' : nested)];
+  return [worktree, join(worktree, nested === '.' ? '' : nested), null];
 }
 
 export async function removeIsolated(data, worker) {
@@ -452,7 +514,11 @@ export async function removeIsolated(data, worker) {
 
   if (statusCode === 0 && !dirty && merged === 0) {
     try {
-      await orca('worktree', 'rm', '--worktree', `path:${worker.worktree}`);
+      if ((data.backend || 'orca') === 'herdr') {
+        await herdr('worktree', 'remove', '--workspace', worker.herdr_workspace);
+      } else {
+        await orca('worktree', 'rm', '--worktree', `path:${worker.worktree}`);
+      }
       return `removed isolated worktree ${worker.worktree} (${branch})`;
     } catch (error) {
       return `left isolated worktree ${worker.worktree} (${branch}): ${error.message}`;
@@ -462,7 +528,12 @@ export async function removeIsolated(data, worker) {
 }
 
 async function rollbackIsolated(data) {
+  const backend = data.backend || 'orca';
   await Promise.all(Object.values(data.workers).map(async worker => {
+    if (backend === 'herdr') {
+      if (worker.herdr_workspace) await herdr('worktree', 'remove', '--workspace', worker.herdr_workspace, '--force').catch(() => {});
+      return;
+    }
     if (worker.worktree) await orca('worktree', 'rm', '--worktree', `path:${worker.worktree}`).catch(() => {});
   }));
 }
@@ -515,7 +586,7 @@ async function retire(teamDir, ids, timeout, maximum, fast = false) {
     for (const id of ids) {
       const worker = data.workers[id];
       if (worker?.state !== 'idle') throw new Error(`broker has not proven ${id} stopped; refusing cleanup`);
-      if (worker.observer && !(await closeTerminal(worker.observer))) throw new Error(`observer for ${id} is not proven closed`);
+      if (worker.observer && !(await closeTerminal(worker.observer, data.backend || 'orca'))) throw new Error(`observer for ${id} is not proven closed`);
       await cleanupWorker(worker);
       delete data.workers[id];
     }
@@ -554,6 +625,8 @@ async function init(args) {
       die(`tools.approvalMode is ${JSON.stringify(approvalMode)}; omp workers need yolo because nobody can answer their prompts.`, 3);
     }
     const teamDir = existing.teamDir;
+    const adoptMismatch = backendMismatchError(existing.data);
+    if (adoptMismatch) die(adoptMismatch, 4);
     console.log(`adopted existing team ${basename(teamDir)} for cwd ${cwd}`);
     // The adopting session becomes the manager; the OMP role badge keys on this id.
     await withLock(teamDir, async () => {
@@ -616,7 +689,7 @@ async function init(args) {
 
   const worktree = await worktreePromise;
   if (!args.isolate && !insideWorktree(worktree, cwd)) {
-    die(`manager cwd ${cwd} is outside active Orca worktree ${worktree}; return to that worktree or initialize a new team there`, 4);
+    die(`manager cwd ${cwd} is outside active ${BACKEND_LABEL[backendName()]} worktree ${worktree}; return to that worktree or initialize a new team there`, 4);
   }
   if (args.isolate && (await gitOutput(['rev-parse', '--show-toplevel'], cwd))[0]) {
     die('--isolate requires a git repository cwd', 2);
@@ -651,6 +724,7 @@ async function init(args) {
     cwd,
     manager_session: process.env.OMP_SESSION_ID || null,
     worktree,
+    backend: backendName(),
     model: fixedModel,
     router,
     harness,
@@ -667,18 +741,19 @@ async function init(args) {
   try {
     for (let index = 0; index < (args.member || 3); index++) {
       const workerId = `w${data.next_worker}`;
-      const [workerWorktree, workerCwd] = data.isolate ? await isolatedCwd(data, workerId) : [null, cwd];
+      const [workerWorktree, workerCwd, herdrWorkspace] = data.isolate ? await isolatedCwd(data, workerId) : [null, cwd, null];
       newWorker(teamDir, data, null, workerCwd);
       data.workers[workerId].worktree = workerWorktree;
+      data.workers[workerId].herdr_workspace = herdrWorkspace;
     }
     await save(teamDir, data);
     await ensureObservers(teamDir, data, Object.values(data.workers));
   } catch (error) {
     const latest = await load(teamDir).catch(() => data);
-    await Promise.all(Object.values(latest.workers).map(worker => worker.observer && closeTerminal(worker.observer).catch(() => {})));
+    await Promise.all(Object.values(latest.workers).map(worker => worker.observer && closeTerminal(worker.observer, latest.backend || 'orca').catch(() => {})));
     await rollbackIsolated(latest);
     await rm(teamDir, { recursive: true, force: true });
-    die(`orca: ${error.message.split('\n')[0]}`, 4);
+    die(`${backendName()}: ${error.message.split('\n')[0]}`, 4);
   }
 
   console.log(`team ${id} ready: ${args.member || 3} workers, harness=${harness}, model=${fixedModel || 'automatic'}, router=${router?.family || 'off'}, cwd=${data.cwd}`);
@@ -699,6 +774,8 @@ async function member(args) {
   await withLock(teamDir, async () => {
     data = await load(teamDir);
     if (data.closing) die('team is being cleared');
+    const memberMismatch = backendMismatchError(data);
+    if (memberMismatch) die(memberMismatch, 4);
 
     const effectiveHarness = args.harness || data.harness || 'omp';
     const liveWorkers = Object.values(data.workers)
@@ -715,9 +792,10 @@ async function member(args) {
     if (growing) {
       for (let index = liveWorkers.length; index < args.n; index++) {
         const workerId = `w${data.next_worker}`;
-        const [workerWorktree, cwd] = data.isolate ? await isolatedCwd(data, workerId) : [null, data.cwd];
+        const [workerWorktree, cwd, herdrWorkspace] = data.isolate ? await isolatedCwd(data, workerId) : [null, data.cwd, null];
         newWorker(teamDir, data, args.harness, cwd);
         data.workers[workerId].worktree = workerWorktree;
+        data.workers[workerId].herdr_workspace = herdrWorkspace;
         added.push(data.workers[workerId]);
       }
     } else if (args.n < liveWorkers.length) {
@@ -738,7 +816,7 @@ async function member(args) {
   try {
     await ensureObservers(teamDir, data, Object.values(data.workers).filter(worker => !worker.retiring && !retirees.includes(worker.id)));
   } catch (error) {
-    await Promise.all(added.map(worker => worker.observer && closeTerminal(worker.observer).catch(() => {})));
+    await Promise.all(added.map(worker => worker.observer && closeTerminal(worker.observer, data.backend || 'orca').catch(() => {})));
     await rollbackIsolated({ ...data, workers: Object.fromEntries(added.map(worker => [worker.id, worker])) });
     await withLock(teamDir, async () => {
       const latest = await load(teamDir);
@@ -839,15 +917,17 @@ async function assign(args) {
     });
   }
 
-  const orcaPromise = requireOrca(die);
+  const backendPromise = requireBackend(die);
   const worktreePromise = registeredCwd();
-  orcaPromise.catch(() => {});
+  backendPromise.catch(() => {});
   worktreePromise.catch(() => {});
-  await orcaPromise;
+  await backendPromise;
   let data = await load(teamDir);
+  const assignMismatch = backendMismatchError(data);
+  if (assignMismatch) die(assignMismatch, 4);
   const currentWorktree = await worktreePromise;
   if (data.worktree && resolve(data.worktree) !== resolve(currentWorktree)) {
-    die(`team initialized worktree ${data.worktree} does not match active Orca worktree ${currentWorktree}; initialize a new team there`, 4);
+    die(`team initialized worktree ${data.worktree} does not match active ${BACKEND_LABEL[data.backend || 'orca']} worktree ${currentWorktree}; initialize a new team there`, 4);
   }
   const automatic = data.router?.enabled && !data.model && !args.model && !args.difficulty;
   if (automatic || (args.difficulty && !args.model)) {
@@ -953,6 +1033,8 @@ async function clear(args) {
   let data;
   await withLock(teamDir, async () => {
     data = await load(teamDir);
+    const clearMismatch = backendMismatchError(data);
+    if (clearMismatch) die(clearMismatch, 4);
     data.closing = true;
     await save(teamDir, data);
   });

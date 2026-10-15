@@ -1,10 +1,10 @@
 # team-building
 
-- **Release:** [v0.3.0](https://github.com/DamChan0/team-building-skill/releases/tag/v0.3.0)
+- **Release:** [v0.4.0](https://github.com/DamChan0/team-building-skill/releases/tag/v0.4.0)
 - Persistent AI-worker teams managed from one session.
 - **Manager hosts:** OMP, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
 - **OMP is not needed when Claude Code or Codex is the manager and you select native workers.** OMP remains the default worker backend.
-- **Orca remains required in every mode:** run the Orca app and CLI with the active worktree registered.
+- **A terminal/worktree backend is required in every mode:** Orca (run the Orca app and CLI with the active worktree registered), or herdr when the manager runs inside a herdr pane (`HERDR_ENV=1`). A team stays bound to the backend it was created under.
 
 ![team-building concept: the manager splits a user command into briefs, native worker sessions execute them, Orca observer terminals show typed UI messages, and the manager reviews results](concept.webp)
 
@@ -22,7 +22,7 @@ sequenceDiagram
     participant M as Node manager
     participant S as Rust supervisor
     participant W as Native worker
-    participant O as Orca observer
+    participant O as Observer (Orca/herdr)
     M->>S: versioned object IPC
     S->>W: private native structured protocol
     W-->>S: validated result + exact session identity
@@ -36,7 +36,7 @@ sequenceDiagram
   - `omp` uses OMP RPC and is the default.
   - `claude` launches the native Claude Code CLI with `stream-json`.
   - `codex` launches the native Codex CLI through `app-server` JSON-RPC.
-- **Orca:** provides the active worktree and read-only worker tabs. OMP worker tabs redraw the worker's live session transcript with `omp render` whenever the session file grows. Claude/Codex tabs show one typed UI summary line per finished task. Tabs never receive native protocol traffic or `TaskResult` JSON.
+- **Orca/herdr:** provides the active worktree and read-only worker tabs. Orca is the default; herdr is used instead when the manager runs inside a herdr pane (`HERDR_ENV=1`), and a team stays bound to the backend it was created under. OMP worker tabs redraw the worker's live session transcript with `omp render` whenever the session file grows. Claude/Codex tabs show one typed UI summary line per finished task. Tabs never receive native protocol traffic or `TaskResult` JSON.
 - Closing an observer tab does not stop its supervisor-owned worker. To restore closed or missing observers, run `member` with the team's current worker count from the manager, for example `node ~/.agents/skills/team-building/src/main.mjs member 3 --team <team-id>`. Connected observers are reused; native sessions are unchanged. Re-adopting the same team with `init` also restores observers. A live observer without an Orca pane produces a warning instead of launching another viewer; use `orca-ide terminal switch --terminal <handle>` to reveal it.
 - Tab titles are `<team-id> <worker-id> session` (OMP) or `<team-id> <worker-id> observer` (Claude/Codex). The launch command restores this title with OSC 0 after shell preexec hooks run. Re-adoption or the next assignment replaces an incorrectly titled viewer (including `exec` or an older log-only OMP tab) without restarting its native worker session.
 - **Local IPC:** every request uses an object envelope such as `{ "version": 1, "id": "<uuid>", "type": "<command>", "payload": { ... } }`.
@@ -62,10 +62,10 @@ sequenceDiagram
 - **Setup prerequisites:** Node.js 20+, npm, Rust/Cargo.
 - **Runtime prerequisites:**
   - Node.js 20+.
-  - A running Orca app and CLI (`orca-ide`) with the current worktree registered.
+  - A running Orca app and CLI (`orca-ide`) with the current worktree registered, or a reachable `herdr` CLI when the manager runs inside a herdr pane (`HERDR_ENV=1`).
   - The selected worker CLI in `PATH` (`omp`, `claude`, or `codex`).
 - On Linux, do not use bare `orca`; it is the GNOME screen reader.
-- Set `ORCA_CLI_COMMAND` if the Orca CLI binary has another name.
+- Set `ORCA_CLI_COMMAND` if the Orca CLI binary has another name; set `HERDR_CLI_COMMAND` if the herdr CLI binary has another name.
 - **Install the skill for Claude Code and Codex** using the [Skills CLI](https://github.com/vercel-labs/skills):
 
   ```sh
@@ -181,13 +181,13 @@ node ~/.agents/skills/team-building/src/main.mjs clear [--team ID] [--fast]
   - The broker verifies native process ownership, blocks queued tasks instead of replaying them, and preserves the exact session.
   - Resubmit follow-up work afterward.
   - A legacy live terminal has no broker-owned process identity and stays blocked.
-  - Closing an Orca tab is not proof that its process stopped.
+  - Closing an observer tab/pane is not proof that its process stopped.
 
 ## Worktrees and permissions
 
-- Shared teams bind to the active Orca worktree.
+- Shared teams bind to the active worktree of the manager's backend (Orca, or herdr when the manager runs inside a herdr pane). A team stays bound to the backend it was created under; commands die if run from the other backend.
   - Every assignment checks that the team worktree still matches and the selected worker's cwd stays inside it.
-- `--isolate` creates a separate Orca worktree per worker.
+- `--isolate` creates a separate worktree per worker on the manager's backend.
   - Uncommitted manager changes are not copied into isolated worktrees.
   - Review isolated commits in the manager worktree and merge or cherry-pick locally.
   - Workers never push.

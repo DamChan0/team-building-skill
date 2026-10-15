@@ -53,5 +53,6 @@ Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|code
 
 - Workers touch only assigned files, never push, never ask the user; blocked work returns `blocked` with the exact need.
 - Gated commands: `git push`, `ssh`, `scp`, `rsync`, `sftp`, `gh`, `docker push`. On `approval_requests`, ask the user; after approval run `approve`, then same-worker `assign --approval tNNN`.
-- `--isolate`: one Orca worktree per worker; ask for a local commit, then merge/cherry-pick in the manager worktree.
+- Backend: herdr when the manager runs inside a herdr pane (`HERDR_ENV=1`), Orca otherwise. A team stays bound to the backend it was created under; commands from the other backend exit 4, and `status`/`init` list only this backend's teams.
+- `--isolate`: one worktree per worker (Orca or herdr); ask for a local commit, then merge/cherry-pick in the manager worktree.
 - `unknown` worker state: do not submit, clear, or clean up until `stop --worker wN` succeeds.

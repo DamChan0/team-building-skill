@@ -230,3 +230,53 @@ console.log(JSON.stringify({ ok: true, result }));
     }
   }
 });
+
+test('assign on an orca-created team dies with a backend mismatch when run from a herdr pane', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'team-building-herdr-'));
+  const team = 'tb-0101-000002';
+  const stateRoot = join(home, '.local', 'state', 'team-building');
+  const teamDir = join(stateRoot, team);
+  const herdrBin = join(home, 'herdr');
+  try {
+    await mkdir(teamDir, { recursive: true });
+    await writeFile(herdrBin, `#!/usr/bin/env node
+console.log(JSON.stringify({ id: '1', result: { pane: { pane_id: 'p1', tab_id: 't1', workspace_id: 'ws1', cwd: '/workspace' } } }));
+`);
+    await chmod(herdrBin, 0o755);
+    await writeFile(join(teamDir, 'team.json'), JSON.stringify({
+      id: team,
+      cwd: '/workspace/project',
+      worktree: '/workspace',
+      isolate: false,
+      model: 'openai-codex/gpt-6-sol',
+      harness: 'omp',
+      next_task: 1,
+      next_worker: 2,
+      queue: [],
+      workers: {
+        w1: {
+          id: 'w1',
+          state: 'idle',
+          retiring: false,
+          assignments: 0,
+          harness: 'omp',
+          session_id: null,
+          session_file: null,
+          cwd: '/workspace/project',
+          worktree: null,
+          log: join(teamDir, 'w1.log'),
+        },
+      },
+    }));
+    const result = spawnSync(process.execPath, [main, 'assign', '--team', team, '--worker', 'w1', 'work'], {
+      cwd: home,
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: { ...process.env, HOME: home, HERDR_ENV: '1', HERDR_CLI_COMMAND: herdrBin, HERDR_WORKSPACE_ID: 'ws1' },
+    });
+    assert.equal(result.status, 4, `${result.error?.message || ''}${result.stderr}`);
+    assert.match(result.stderr, /created under orca.*run it from Orca/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
