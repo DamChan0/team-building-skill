@@ -117,7 +117,7 @@ test('keeps one team per path and creates observers for new workers', async () =
     cwd,
     encoding: 'utf8',
     timeout: 10_000,
-    env: { ...process.env, HOME: home, ORCA_CLI_COMMAND: orca, ORCA_TEST_CALLS: calls, ORCA_TEST_TERMINALS: terminals },
+    env: { ...process.env, HERDR_ENV: '', HOME: home, ORCA_CLI_COMMAND: orca, ORCA_TEST_CALLS: calls, ORCA_TEST_TERMINALS: terminals },
   });
   const paths = supervisorPaths(stateRoot);
   const client = new Supervisor(paths);

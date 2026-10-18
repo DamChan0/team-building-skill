@@ -1,10 +1,10 @@
 # team-building
 
-- **Release:** [v0.4.0](https://github.com/DamChan0/team-building-skill/releases/tag/v0.4.0)
+- **Release:** [v0.5.0](https://github.com/DamChan0/team-building-skill/releases/tag/v0.5.0)
 - Persistent AI-worker teams managed from one session.
 - **Manager hosts:** OMP, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
 - **OMP is not needed when Claude Code or Codex is the manager and you select native workers.** OMP remains the default worker backend.
-- **A terminal/worktree backend is required in every mode:** Orca (run the Orca app and CLI with the active worktree registered), or herdr when the manager runs inside a herdr pane (`HERDR_ENV=1`). A team stays bound to the backend it was created under.
+- **A terminal multiplexer is required in every mode:** Orca (app and CLI with the active worktree registered) or herdr (manager running inside a herdr pane).
 
 ![team-building concept: the manager splits a user command into briefs, native worker sessions execute them, Orca observer terminals show typed UI messages, and the manager reviews results](concept.webp)
 
@@ -22,7 +22,7 @@ sequenceDiagram
     participant M as Node manager
     participant S as Rust supervisor
     participant W as Native worker
-    participant O as Observer (Orca/herdr)
+    participant O as Orca observer
     M->>S: versioned object IPC
     S->>W: private native structured protocol
     W-->>S: validated result + exact session identity
@@ -33,12 +33,13 @@ sequenceDiagram
 - **Manager:** Node.js handles team metadata, model routing, and task submission.
 - **Supervisor:** one Rust process owns native worker processes, scheduling, sessions, and durable task state.
 - **Worker backends:**
-  - `omp` uses OMP RPC and is the default.
+  - `omp` (default) runs the worker as a live interactive OMP session in its Orca tab. The `team-role` extension inside that session exchanges task/result files with the supervisor (`<team-dir>/tabs/<worker>/`: `ready.json`, `beat`, `task.json`, `started.json`, `outcome.json`, `abort.json`), so you can watch and type into the worker while the manager's `assign` still blocks for the structured result.
   - `claude` launches the native Claude Code CLI with `stream-json`.
   - `codex` launches the native Codex CLI through `app-server` JSON-RPC.
-- **Orca/herdr:** provides the active worktree and read-only worker tabs. Orca is the default; herdr is used instead when the manager runs inside a herdr pane (`HERDR_ENV=1`), and a team stays bound to the backend it was created under. OMP worker tabs redraw the worker's live session transcript with `omp render` whenever the session file grows. Claude/Codex tabs show one typed UI summary line per finished task. Tabs never receive native protocol traffic or `TaskResult` JSON.
-- Closing an observer tab does not stop its supervisor-owned worker. To restore closed or missing observers, run `member` with the team's current worker count from the manager, for example `node ~/.agents/skills/team-building/src/main.mjs member 3 --team <team-id>`. Connected observers are reused; native sessions are unchanged. Re-adopting the same team with `init` also restores observers. A live observer without an Orca pane produces a warning instead of launching another viewer; use `orca-ide terminal switch --terminal <handle>` to reveal it.
-- Tab titles are `<team-id> <worker-id> session` (OMP) or `<team-id> <worker-id> observer` (Claude/Codex). The launch command restores this title with OSC 0 after shell preexec hooks run. Re-adoption or the next assignment replaces an incorrectly titled viewer (including `exec` or an older log-only OMP tab) without restarting its native worker session.
+- **Terminal/worktree backend:** Orca by default, herdr when the manager runs inside a herdr pane (`HERDR_ENV=1`). A team stays bound to the backend it was created under (`team.json` `backend`; teams without it are Orca teams); commands from the other backend exit 4 and `status`/`init` list only this backend's teams. Under herdr the worker is a tab in the manager's workspace (label `<team-id> <worker-id> session`) whose pane runs the launch command via `<team-dir>/tabs/<worker>/launch.sh`; the tab id is the stored handle, a vanished tab means a closed worker tab, and calls are pinned to the herdr server recorded at init (`HERDR_SOCKET_PATH`). herdr worktrees (`--isolate`) keep their branch after removal.
+- **Worker tabs:** An OMP worker's tab *is* the worker: the full interactive session, resumed from its recorded session file. Claude/Codex tabs are read-only observers showing one typed UI summary line per finished task and never receive native protocol traffic or `TaskResult` JSON.
+- Closing an OMP worker tab ends that worker (a running task becomes `failed: worker tab exited`); the session file survives. The next assignment, `member <current N>`, or `init` re-adoption reopens the tab and resumes the same session. Closing a Claude/Codex observer does not stop its worker. Connected tabs are reused. A live Orca tab without a pane produces a warning instead of launching another; use `orca-ide terminal switch --terminal <handle>` to reveal it.
+- Typing into an OMP worker tab while a task runs is allowed but unsupervised: its output is part of that task's final message. The extension needs `team-role.ts` installed (`node install.mjs`) before the tab starts, and omp tab titles are managed by omp itself (`<team-id> <worker-id> observer` applies only to Claude/Codex).
 - **Local IPC:** every request uses an object envelope such as `{ "version": 1, "id": "<uuid>", "type": "<command>", "payload": { ... } }`.
   - Envelopes and payloads must be objects; scalar requests are rejected.
   - Responses and events are correlated objects.
@@ -62,10 +63,10 @@ sequenceDiagram
 - **Setup prerequisites:** Node.js 20+, npm, Rust/Cargo.
 - **Runtime prerequisites:**
   - Node.js 20+.
-  - A running Orca app and CLI (`orca-ide`) with the current worktree registered, or a reachable `herdr` CLI when the manager runs inside a herdr pane (`HERDR_ENV=1`).
+  - A running Orca app and CLI (`orca-ide`) with the current worktree registered, **or** a running herdr with the manager inside a herdr pane (`HERDR_ENV=1`).
   - The selected worker CLI in `PATH` (`omp`, `claude`, or `codex`).
 - On Linux, do not use bare `orca`; it is the GNOME screen reader.
-- Set `ORCA_CLI_COMMAND` if the Orca CLI binary has another name; set `HERDR_CLI_COMMAND` if the herdr CLI binary has another name.
+- Set `ORCA_CLI_COMMAND` if the Orca CLI binary has another name; `HERDR_CLI_COMMAND` likewise for herdr.
 - **Install the skill for Claude Code and Codex** using the [Skills CLI](https://github.com/vercel-labs/skills):
 
   ```sh
@@ -181,13 +182,13 @@ node ~/.agents/skills/team-building/src/main.mjs clear [--team ID] [--fast]
   - The broker verifies native process ownership, blocks queued tasks instead of replaying them, and preserves the exact session.
   - Resubmit follow-up work afterward.
   - A legacy live terminal has no broker-owned process identity and stays blocked.
-  - Closing an observer tab/pane is not proof that its process stopped.
+  - Closing an Orca tab is not proof that its process stopped.
 
 ## Worktrees and permissions
 
-- Shared teams bind to the active worktree of the manager's backend (Orca, or herdr when the manager runs inside a herdr pane). A team stays bound to the backend it was created under; commands die if run from the other backend.
+- Shared teams bind to the active worktree (herdr: the git root of the manager's cwd).
   - Every assignment checks that the team worktree still matches and the selected worker's cwd stays inside it.
-- `--isolate` creates a separate worktree per worker on the manager's backend.
+- `--isolate` creates a separate worktree per worker (Orca worktree or herdr worktree, per the team's multiplexer).
   - Uncommitted manager changes are not copied into isolated worktrees.
   - Review isolated commits in the manager worktree and merge or cherry-pick locally.
   - Workers never push.

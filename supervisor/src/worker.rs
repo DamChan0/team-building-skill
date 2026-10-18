@@ -1,4 +1,4 @@
-use std::{io, path::Path, process::Stdio, time::Duration};
+use std::{fs, io, path::{Path, PathBuf}, process::Stdio, time::Duration};
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -24,6 +24,9 @@ pub(crate) async fn execute(
 ) -> WorkerOutcome {
     if *cancel.borrow() {
         return failed("cancelled before native spawn".into(), spec);
+    }
+    if spec.harness == "omp" {
+        return omp_tab(request_id, spec, &mut cancel, &events).await;
     }
     let mut child = match spawn(spec) {
         Ok(child) => child,
@@ -70,7 +73,6 @@ pub(crate) async fn execute(
         kept
     });
     let outcome = match spec.harness.as_str() {
-        "omp" => omp(request_id, spec, &mut child, &mut cancel, &events).await,
         "claude" => claude(request_id, spec, &mut child, &mut cancel, &events).await,
         "codex" => codex(request_id, spec, &mut child, &mut cancel, &events).await,
         _ => Err(anyhow!("unsupported native harness")),
@@ -141,109 +143,170 @@ fn spawn(spec: &TaskSpec) -> Result<Child> {
     Ok(command.spawn()?)
 }
 
-async fn omp(
+// OMP workers are interactive `omp` sessions living in their Orca tab. The team-role
+// extension inside that session exchanges small JSON files with the broker:
+//   ready.json/beat/progress  extension -> broker  identity, liveness, activity
+//   task.json                 broker -> extension  one prompt (claimed by renaming it)
+//   started.json/outcome.json extension -> broker  prompt accepted / final assistant text
+//   abort.json                broker -> extension  interrupt the running prompt
+const TAB_READY_WAIT: Duration = Duration::from_secs(30);
+const TAB_BEAT_STALE: Duration = Duration::from_secs(15);
+const TAB_ABORT_WAIT: Duration = Duration::from_secs(10);
+const TAB_POLL: Duration = Duration::from_millis(100);
+
+fn read_object(path: &Path) -> Option<Value> {
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn write_object(path: &Path, value: &Value) -> io::Result<()> {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, serde_json::to_vec(value)?)?;
+    fs::rename(temporary, path)
+}
+
+fn age(path: &Path) -> Option<Duration> {
+    fs::metadata(path).ok()?.modified().ok()?.elapsed().ok()
+}
+
+fn answered(dir: &Path, name: &str, request_id: &str) -> Option<Value> {
+    read_object(&dir.join(name))
+        .filter(|value| value.get("request_id").and_then(Value::as_str) == Some(request_id))
+}
+
+async fn omp_tab(
     request_id: &str,
     spec: &TaskSpec,
-    child: &mut Child,
     cancel: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<WorkerEvent>,
-) -> Result<WorkerOutcome> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("OMP stdin unavailable"))?;
-    let mut stdout = BufReader::new(
-        child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("OMP stdout unavailable"))?,
-    );
+) -> WorkerOutcome {
+    let dir: PathBuf = Path::new(&spec.team_dir).join("tabs").join(&spec.worker);
     let max = Instant::now() + Duration::from_millis(spec.max_timeout_ms);
-    let mut idle = Instant::now() + Duration::from_millis(spec.idle_timeout_ms);
-    let mut state_checked = false;
-    let mut accepted = false;
-    let mut prompt_completed = false;
-    let mut session = (None, None);
-    loop {
-        let frame = parse_frame(&next_line(&mut stdout, cancel, idle.min(max)).await?)?;
-        idle = Instant::now() + Duration::from_millis(spec.idle_timeout_ms);
-        match frame.get("type").and_then(Value::as_str) {
-            Some("ready") => {
-                if frame.get("protocolVersion").and_then(Value::as_u64) != Some(1)
-                    || !frame
-                        .get("supportedProtocolVersions")
-                        .and_then(Value::as_array)
-                        .is_some_and(|versions| versions.iter().any(|v| v.as_u64() == Some(1)))
-                {
-                    return Err(anyhow!("OMP v1 protocol unavailable"));
-                }
-                send(&mut stdin, &json!({"id":"state","type":"get_state"})).await?;
-            }
-            Some("response") if frame.get("id").and_then(Value::as_str) == Some("state") => {
-                if frame.get("success").and_then(Value::as_bool) != Some(true) {
-                    return Err(anyhow!("OMP get_state rejected"));
-                }
-                session = session_from_state(frame.get("data"));
-                ensure_session_id(spec, &session.0)?;
-                ensure_session_file(spec, &session.1)?;
-                emit_session(events, &session).await?;
-                state_checked = true;
-                send(
-                    &mut stdin,
-                    &json!({"id":request_id,"type":"prompt","message":spec.prompt}),
-                )
-                .await?;
-            }
-            Some("response") if frame.get("id").and_then(Value::as_str) == Some(request_id) => {
-                if !state_checked || frame.get("success").and_then(Value::as_bool) != Some(true) {
-                    return Err(anyhow!("OMP rejected prompt"));
-                }
-                accepted = true;
-                emit(events, WorkerEvent::Started).await?;
-            }
-            Some("prompt_result")
-                if frame.get("id").and_then(Value::as_str) == Some(request_id) =>
-            {
-                if frame.get("status").and_then(Value::as_str) != Some("completed") {
-                    return Err(anyhow!("OMP provider error"));
-                }
-                prompt_completed = true;
-                if frame.get("sessionSettled").and_then(Value::as_bool) == Some(true) {
-                    send(&mut stdin, &json!({"id":"settled","type":"get_state"})).await?;
-                }
-            }
-            Some("session_settled") if prompt_completed => {
-                send(&mut stdin, &json!({"id":"settled","type":"get_state"})).await?
-            }
-            Some("response") if frame.get("id").and_then(Value::as_str) == Some("settled") => {
-                if !accepted
-                    || !prompt_completed
-                    || frame.pointer("/data/isSettled").and_then(Value::as_bool) != Some(true)
-                {
-                    return Err(anyhow!("OMP session did not settle"));
-                }
-                send(
-                    &mut stdin,
-                    &json!({"id":"result","type":"get_last_assistant_text"}),
-                )
-                .await?;
-            }
-            Some("response") if frame.get("id").and_then(Value::as_str) == Some("result") => {
-                if frame.get("success").and_then(Value::as_bool) != Some(true) {
-                    return Err(anyhow!("OMP final result rejected"));
-                }
-                let result = parse_result(
-                    frame
-                        .pointer("/data/text")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow!("OMP final result missing"))?,
-                )?;
-                append_ui(spec, &result.summary);
-                return Ok(success(result, session.0, session.1, spec));
-            }
-            _ => {}
+    let idle = Duration::from_millis(spec.idle_timeout_ms);
+    let ready_by = Instant::now() + TAB_READY_WAIT;
+    let (ready, identity) = loop {
+        let identity = read_object(&dir.join("ready.json"))
+            .filter(|_| age(&dir.join("beat")).is_some_and(|age| age < TAB_BEAT_STALE))
+            .and_then(|ready| {
+                let pid = u32::try_from(ready.get("pid")?.as_u64()?).ok()?;
+                Some((ready, capture(pid).ok()?))
+            });
+        if let Some(found) = identity {
+            break found;
         }
+        if Instant::now() >= ready_by {
+            return failed(
+                "worker tab is not running; reopen it with `member <N>`".into(),
+                spec,
+            );
+        }
+        tokio::select! {
+            _ = cancel.changed() => return failed("cancelled before the worker tab was ready".into(), spec),
+            _ = sleep(TAB_POLL) => {}
+        }
+    };
+    let text = |name: &str| ready.get(name).and_then(Value::as_str).map(str::to_owned);
+    let session = (text("session_id"), text("session_file"));
+    if let Err(error) = ensure_session_id(spec, &session.0)
+        .and_then(|()| ensure_session_file(spec, &session.1))
+    {
+        return failed(error.to_string(), spec);
     }
+    let owned = WorkerEvent::Owned {
+        pid: identity.pid,
+        starttime: identity.starttime,
+        pgid: identity.pgid,
+    };
+    if emit(events, owned).await.is_err() || emit_session(events, &session).await.is_err() {
+        return failed("event receiver closed".into(), spec);
+    }
+    for name in ["outcome.json", "started.json", "abort.json", "task.taken.json"] {
+        let _ = fs::remove_file(dir.join(name));
+    }
+    let env: serde_json::Map<String, Value> = spec
+        .env
+        .iter()
+        .filter(|(key, _)| key.starts_with("TEAM_BUILDING_") && *key != "TEAM_BUILDING_WORKER")
+        .map(|(key, value)| (key.clone(), json!(value)))
+        .collect();
+    let task = json!({"request_id":request_id,"prompt":spec.prompt,"model":spec.model,"thinking":spec.thinking,"env":env});
+    if let Err(error) = write_object(&dir.join("task.json"), &task) {
+        return failed(format!("could not hand the task to the worker tab: {error}"), spec);
+    }
+    let mut started = false;
+    let mut last_progress = Instant::now();
+    let mut seen_progress = None;
+    let reason = loop {
+        if let Some(outcome) = answered(&dir, "outcome.json", request_id) {
+            return tab_outcome(&outcome, session, spec);
+        }
+        if !started && answered(&dir, "started.json", request_id).is_some() {
+            started = true;
+            if emit(events, WorkerEvent::Started).await.is_err() {
+                return abandon(&dir, request_id, "event receiver closed", spec).await;
+            }
+        }
+        let progress = fs::metadata(dir.join("progress")).and_then(|meta| meta.modified()).ok();
+        if progress != seen_progress {
+            seen_progress = progress;
+            last_progress = Instant::now();
+        }
+        if Instant::now() >= max {
+            break "native max timeout";
+        }
+        if last_progress.elapsed() >= idle {
+            break "native timeout";
+        }
+        if age(&dir.join("beat")).is_none_or(|age| age >= TAB_BEAT_STALE) {
+            let _ = fs::remove_file(dir.join("task.json"));
+            return match capture(identity.pid) {
+                Ok(now) if now.starttime == identity.starttime => {
+                    unknown("worker tab stopped responding".into(), spec)
+                }
+                _ => failed("worker tab exited".into(), spec),
+            };
+        }
+        tokio::select! {
+            _ = cancel.changed() => break "cancelled",
+            _ = sleep(TAB_POLL) => {}
+        }
+    };
+    abandon(&dir, request_id, reason, spec).await
+}
+
+fn tab_outcome(
+    outcome: &Value,
+    session: (Option<String>, Option<String>),
+    spec: &TaskSpec,
+) -> WorkerOutcome {
+    if let Some(error) = outcome.get("error").and_then(Value::as_str) {
+        return failed(error.to_owned(), spec);
+    }
+    match outcome
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("OMP final result missing"))
+        .and_then(parse_result)
+    {
+        Ok(result) => success(result, session.0, session.1, spec),
+        Err(error) => failed(error.to_string(), spec),
+    }
+}
+
+// Stops the in-flight prompt. An unclaimed task.json proves the tab never started it;
+// otherwise the extension must confirm the abort, or the worker stays unknown.
+async fn abandon(dir: &Path, request_id: &str, reason: &str, spec: &TaskSpec) -> WorkerOutcome {
+    if fs::remove_file(dir.join("task.json")).is_ok() {
+        return failed(reason.into(), spec);
+    }
+    let _ = write_object(&dir.join("abort.json"), &json!({"request_id":request_id}));
+    let until = Instant::now() + TAB_ABORT_WAIT;
+    while Instant::now() < until {
+        if answered(dir, "outcome.json", request_id).is_some() {
+            return failed(reason.into(), spec);
+        }
+        sleep(TAB_POLL).await;
+    }
+    unknown(format!("{reason}; worker tab did not confirm the abort"), spec)
 }
 
 async fn claude(
@@ -537,18 +600,6 @@ fn assistant_text(value: &Value) -> Option<&str> {
         .or_else(|| value.pointer("/item/text").and_then(Value::as_str))
         .or_else(|| value.pointer("/item/content").and_then(Value::as_str))
         .or_else(|| value.get("text").and_then(Value::as_str))
-}
-fn session_from_state(value: Option<&Value>) -> (Option<String>, Option<String>) {
-    (
-        value
-            .and_then(|v| v.get("sessionId"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        value
-            .and_then(|v| v.get("sessionFile"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-    )
 }
 async fn emit(events: &mpsc::Sender<WorkerEvent>, event: WorkerEvent) -> Result<()> {
     events

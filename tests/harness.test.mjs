@@ -4,7 +4,7 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { isDockerPush, isGitPush, nativeTask, writeShims } from '../src/harness.mjs';
+import { isDockerPush, isGitPush, nativeTask, ompTabCommand, writeShims } from '../src/harness.mjs';
 
 test('gates publish commands only', () => {
   assert.equal(isGitPush(['push', 'origin', 'main']), true);
@@ -13,7 +13,7 @@ test('gates publish commands only', () => {
   assert.equal(isDockerPush(['build', '.']), false);
 });
 
-test('native launches reset OMP effort and pin only exact Claude session IDs', async () => {
+test('OMP workers launch as interactive tabs; native launches pin only exact Claude session IDs', async () => {
   const root = await mkdtemp(join(tmpdir(), 'team-building-native-'));
   const previousPath = process.env.PATH;
   try {
@@ -22,13 +22,18 @@ test('native launches reset OMP effort and pin only exact Claude session IDs', a
     await writeFile(join(bin, 'omp'), '#!/bin/sh\nprintf "low\\n"\n');
     await chmod(join(bin, 'omp'), 0o755);
     process.env.PATH = `${bin}:${previousPath || ''}`;
-    const omp = await nativeTask('team', {
-      id: 'w1', harness: 'omp', session_dir: join(root, 'sessions', 'w1'),
-      task_model: 'openai-codex/gpt-6-luna', task_thinking: null,
-    }, { prompt: 'smoke', teamDir: root, cwd: root });
-    assert.ok(omp.argv.includes('--no-ui'));
-    assert.deepEqual(omp.argv.slice(-2), ['--thinking', 'low']);
+    const worker = { id: 'w1', harness: 'omp', session_dir: join(root, "sessions 'w1'"), session_file: join(root, 'w1.jsonl'), model: 'openai-codex/gpt-6-luna' };
+    const omp = await nativeTask('team', { ...worker, session_file: null }, { prompt: 'smoke', teamDir: root, cwd: root });
+    // The tab session is the worker: no headless argv, only the thinking level the broker records.
+    assert.deepEqual(omp.argv, []);
     assert.equal(omp.thinking, 'low');
+
+    const launch = ompTabCommand('team', worker, { teamDir: root, cwd: root });
+    const printed = spawnSync('/bin/sh', ['-c', launch.replace(/exec [\s\S]*$/, 'printf "%s|%s|%s" "$PWD" "$TEAM_BUILDING_WORKER" "$TEAM_BUILDING_TAB_DIR"')], { encoding: 'utf8' });
+    assert.equal(printed.stdout, `${root}|team/w1|${join(root, 'tabs', 'w1')}`);
+    const exec = launch.slice(launch.indexOf('exec '));
+    assert.ok(!exec.includes("'--mode'") && !exec.includes("'--no-ui'"), 'the tab must run the interactive TUI');
+    assert.ok(exec.includes(`'--resume' '${join(root, 'w1.jsonl')}'`) && exec.includes(`'--model' 'openai-codex/gpt-6-luna'`));
   } finally {
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;

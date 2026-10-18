@@ -40,7 +40,7 @@ writeFileSync(path, JSON.stringify(terminals));
 console.log(JSON.stringify({ ok: true, result }));
 `);
     await chmod(orca, 0o755);
-    const env = { ...process.env, HOME: home, ORCA_CLI_COMMAND: orca, TITLE_CALLS: calls, TITLE_STATE: terminalState };
+    const env = { ...process.env, HERDR_ENV: '', HOME: home, ORCA_CLI_COMMAND: orca, TITLE_CALLS: calls, TITLE_STATE: terminalState };
     delete env.TEAM_BUILDING_WORKER;
     await mkdir(paths.stateDir, { recursive: true });
     daemon = spawn(supervisorBinary, ['serve', '--state-dir', paths.stateDir, '--socket', paths.socket], { stdio: ['ignore', 'pipe', 'pipe'] });

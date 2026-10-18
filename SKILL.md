@@ -40,7 +40,7 @@ Judge from the task, not its length. No classifier call needed for tier 0/1.
 | `stop --worker wN` | Recover an `unknown` worker, then resubmit. |
 | `clear [--team ID] [--fast]` | Wrap up and remove the team; `--fast` uses each worker's latest recorded task result instead of a model wrap-up turn. |
 
-Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|codex` needs `--allow-bypass`. Orca tabs are read-only observers; closing one does not stop the worker (`member <current N>` reopens).
+Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|codex` needs `--allow-bypass`. Workers live in Orca tabs, or herdr tabs when the manager runs inside a herdr pane (`HERDR_ENV=1`); a team stays bound to its creating backend (other backend: exit 4; `status`/`init` list only this backend's teams). An OMP worker's tab is the worker itself (live interactive session); closing it ends the worker, and `member <current N>` or the next `assign` reopens it with the same session. Claude/Codex tabs are read-only observers; closing one does not stop the worker.
 
 ## Dispatch
 
@@ -53,6 +53,5 @@ Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|code
 
 - Workers touch only assigned files, never push, never ask the user; blocked work returns `blocked` with the exact need.
 - Gated commands: `git push`, `ssh`, `scp`, `rsync`, `sftp`, `gh`, `docker push`. On `approval_requests`, ask the user; after approval run `approve`, then same-worker `assign --approval tNNN`.
-- Backend: herdr when the manager runs inside a herdr pane (`HERDR_ENV=1`), Orca otherwise. A team stays bound to the backend it was created under; commands from the other backend exit 4, and `status`/`init` list only this backend's teams.
-- `--isolate`: one worktree per worker (Orca or herdr); ask for a local commit, then merge/cherry-pick in the manager worktree.
+- `--isolate`: one worktree per worker (Orca or herdr, as the team's multiplexer); ask for a local commit, then merge/cherry-pick in the manager worktree.
 - `unknown` worker state: do not submit, clear, or clean up until `stop --worker wN` succeeds.

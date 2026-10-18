@@ -6,7 +6,7 @@ import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import { Supervisor, supervisorBinary, supervisorPaths } from '../src/supervisor.mjs';
 
 const result = JSON.stringify({ status: 'succeeded', summary: 'fixture completed', verification: 'fixture' });
@@ -14,32 +14,26 @@ const delay = milliseconds => new Promise(resolve => setTimeout(resolve, millise
 const uuid = index => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
 const cli = fileURLToPath(new URL('../src/main.mjs', import.meta.url));
 
+// Codex worker fixture: a native child process speaking JSON-RPC on stdio.
 const fixture = `
 import { appendFileSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import readline from 'node:readline';
-const mode = process.env.FIXTURE_MODE;
 const session = process.env.FIXTURE_SESSION;
-const sessionFile = process.env.FIXTURE_SESSION_FILE;
 const control = process.env.FIXTURE_CONTROL;
 const effect = process.env.FIXTURE_EFFECT;
-let request;
 let thread;
 let turn;
 let complete;
-writeFileSync(sessionFile, session);
+writeFileSync(process.env.FIXTURE_SESSION_FILE, session);
 const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
 const finish = () => {
   if (!complete) return;
   appendFileSync(effect, session + '\\n');
-  if (mode === 'codex') {
-    send({ jsonrpc: '2.0', method: 'item/completed', params: { threadId: thread, turnId: turn, item: { type: 'agentMessage', text: ${JSON.stringify(result)} } } });
-    send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: thread, turnId: turn, turn: { status: 'completed' } } });
-  } else {
-    send({ type: 'prompt_result', id: request, status: 'completed', sessionSettled: true });
-  }
+  send({ jsonrpc: '2.0', method: 'item/completed', params: { threadId: thread, turnId: turn, item: { type: 'agentMessage', text: ${JSON.stringify(result)} } } });
+  send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: thread, turnId: turn, turn: { status: 'completed' } } });
 };
-const server = net.createServer(socket => {
+net.createServer(socket => {
   let input = '';
   socket.on('data', chunk => {
     input += chunk;
@@ -52,37 +46,80 @@ const server = net.createServer(socket => {
       socket.end(JSON.stringify({ type: 'ack' }) + '\\n');
     }
   });
-});
-server.listen(control, () => {
-  if (mode !== 'codex') send({ type: 'ready', protocolVersion: 1, supportedProtocolVersions: [1] });
-});
+}).listen(control);
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line);
-  if (mode === 'codex') {
-    if (message.id === 1) {
-      send({ jsonrpc: '2.0', id: 1, result: {} });
-    } else if (message.id === 2) {
-      thread = 'thread-' + session;
-      send({ jsonrpc: '2.0', id: 2, result: { thread: { id: thread } } });
-    } else if (message.id === 3) {
-      turn = 'turn-' + session;
-      send({ jsonrpc: '2.0', id: 3, result: { turn: { id: turn } } });
-      send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: thread, turnId: 'wrong-turn', turn: { status: 'completed' } } });
-    }
-    return;
-  }
-  if (message.type === 'get_state') {
-    send({ type: 'response', id: message.id, success: true, data: { sessionId: session, sessionFile, isSettled: message.id === 'settled' } });
-  } else if (message.type === 'prompt') {
-    request = message.id;
-    send({ type: 'response', id: request, success: true });
-    writeFileSync(process.env.FIXTURE_READY, 'ready');
-    send({ type: 'session_settled' });
-  } else if (message.type === 'get_last_assistant_text') {
-    send({ type: 'response', id: message.id, success: true, data: { text: ${JSON.stringify(result)} } });
+  if (message.id === 1) {
+    send({ jsonrpc: '2.0', id: 1, result: {} });
+  } else if (message.id === 2) {
+    thread = 'thread-' + session;
+    send({ jsonrpc: '2.0', id: 2, result: { thread: { id: thread } } });
+  } else if (message.id === 3) {
+    turn = 'turn-' + session;
+    send({ jsonrpc: '2.0', id: 3, result: { turn: { id: turn } } });
+    send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: thread, turnId: 'wrong-turn', turn: { status: 'completed' } } });
   }
 });
 `;
+
+// OMP worker fixture: a long-lived "tab" process that speaks the broker's file protocol
+// (supervisor/src/worker.rs) the way the team-role extension does inside a real omp tab.
+const tabFixture = `
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import net from 'node:net';
+const dir = process.env.FIXTURE_TAB;
+const session = process.env.FIXTURE_SESSION;
+const sessionFile = process.env.FIXTURE_SESSION_FILE;
+const put = (name, value) => { writeFileSync(dir + '/' + name + '.tmp', JSON.stringify(value)); renameSync(dir + '/' + name + '.tmp', dir + '/' + name); };
+let active;
+let completeRequested = false;
+const finish = () => {
+  if (!active || !completeRequested) return;
+  appendFileSync(process.env.FIXTURE_EFFECT, session + '\\n');
+  put('outcome.json', { request_id: active, text: ${JSON.stringify(result)} });
+  active = undefined;
+  completeRequested = false;
+};
+mkdirSync(dir, { recursive: true });
+writeFileSync(sessionFile, session);
+put('ready.json', { pid: process.pid, session_id: session, session_file: sessionFile });
+net.createServer(socket => {
+  let input = '';
+  socket.on('data', chunk => {
+    input += chunk;
+    const end = input.indexOf('\\n');
+    if (end < 0) return;
+    if (JSON.parse(input.slice(0, end))?.type === 'complete') {
+      completeRequested = true;
+      finish();
+      socket.end(JSON.stringify({ type: 'ack' }) + '\\n');
+    }
+  });
+}).listen(process.env.FIXTURE_CONTROL);
+setInterval(() => {
+  writeFileSync(dir + '/beat', String(Date.now()));
+  if (active) return;
+  try { renameSync(dir + '/task.json', dir + '/task.taken.json'); } catch { return; }
+  active = JSON.parse(readFileSync(dir + '/task.taken.json', 'utf8')).request_id;
+  put('started.json', { request_id: active });
+  writeFileSync(process.env.FIXTURE_READY, 'ready');
+  finish();
+}, 50);
+`;
+
+const tabs = [];
+// Starts the fixture tab in its own process group (the broker may SIGTERM that group).
+async function startTab(root, control, { source = tabFixture, session = 'session-tab', worker = 'w1' } = {}) {
+  await writeFile(join(root, 'tab.mjs'), source);
+  const child = spawn(process.execPath, [join(root, 'tab.mjs')], {
+    detached: true,
+    stdio: 'ignore',
+    env: { ...process.env, FIXTURE_TAB: join(root, 'tabs', worker), FIXTURE_SESSION: session, FIXTURE_SESSION_FILE: join(root, `${worker}.session`), FIXTURE_CONTROL: control, FIXTURE_EFFECT: join(root, 'effect'), FIXTURE_READY: `${control}.ready` },
+  });
+  tabs.push(child);
+  return child;
+}
+afterEach(() => { for (const child of tabs.splice(0)) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} } });
 
 async function connectControl(path) {
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -143,13 +180,15 @@ async function stop(daemon, signal = false) {
 
 function task(root, request, control, effect, { team = 'team', harness = 'omp', session = null, sessionFile = null, worker = 'w1', task: name = 't001' } = {}) {
   const nativeSessionFile = sessionFile || join(root, `${request}.session`);
+  const native = harness === 'omp';
   return {
     team_dir: root,
     team, worker, task: name, kind: 'task', cwd: root, harness,
-    argv: [process.execPath, join(root, 'fixture.mjs')],
-    env: { FIXTURE_MODE: harness, FIXTURE_SESSION: session || `session-${request}`, FIXTURE_SESSION_FILE: nativeSessionFile, FIXTURE_CONTROL: control, FIXTURE_EFFECT: effect, FIXTURE_READY: `${control}.ready` },
+    argv: native ? [] : [process.execPath, join(root, 'fixture.mjs')],
+    env: native ? {} : { FIXTURE_SESSION: session || `session-${request}`, FIXTURE_SESSION_FILE: nativeSessionFile, FIXTURE_CONTROL: control, FIXTURE_EFFECT: effect, FIXTURE_READY: `${control}.ready` },
     prompt: 'Complete this fixture task and report a structured result.',
     log: join(root, `${request}.log`), idle_timeout_ms: 10_000, max_timeout_ms: 30_000,
+    ...(native && session ? { session_id: session, session_file: sessionFile } : {}),
   };
 }
 
@@ -193,10 +232,10 @@ test('broker keeps native work pending through acceptance and reuses its exact s
   const effect = join(root, 'effect');
   let daemon;
   try {
-    await writeFile(join(root, 'fixture.mjs'), fixture);
     daemon = await start(root);
     const first = uuid(1);
     const firstControl = join(root, 'first.sock');
+    await startTab(root, firstControl);
     await daemon.client.submit(task(root, first, firstControl, effect), first);
     await running(daemon.client, first);
     await waitForFile(`${firstControl}.ready`, async () => (await daemon.client.get(first)).task);
@@ -208,10 +247,10 @@ test('broker keeps native work pending through acceptance and reuses its exact s
     assert.ok(completedReply, 'terminal event must wake an active waiter before its checkpoint');
     const completed = completedReply.task;
     assert.equal(completed.state, 'succeeded');
-    assert.equal(completed.session_id, `session-${first}`);
+    assert.equal(completed.session_id, 'session-tab');
 
     const second = uuid(2);
-    const secondControl = join(root, 'second.sock');
+    const secondControl = firstControl;
     await daemon.client.submit(task(root, second, secondControl, effect, { session: completed.session_id, sessionFile: completed.session_file, task: 't002' }), second);
     await running(daemon.client, second);
     await connectControl(secondControl);
@@ -233,8 +272,8 @@ test('broker preserves successful results with loose optional field types', { sk
       verification: ['test passed', 'smoke passed'],
       branch: null, commit: null, files_changed: 'output.txt', blockers: null,
     });
-    await writeFile(join(root, 'fixture.mjs'), fixture.replaceAll(JSON.stringify(result), JSON.stringify(loose)));
     daemon = await start(root);
+    await startTab(root, join(root, 'result.sock'), { source: tabFixture.replaceAll(JSON.stringify(result), JSON.stringify(loose)) });
     const request = uuid(9);
     const control = join(root, 'result.sock');
     await daemon.client.submit(task(root, request, control, join(root, 'effect')), request);
@@ -259,10 +298,10 @@ test('broker survives manager EOF and makes identical request retries single-exe
   const effect = join(root, 'effect');
   let daemon;
   try {
-    await writeFile(join(root, 'fixture.mjs'), fixture);
     daemon = await start(root);
-    const request = uuid(3);
     const control = join(root, 'eof.sock');
+    await startTab(root, control);
+    const request = uuid(3);
     const spec = task(root, request, control, effect);
     await new Promise((resolve, reject) => {
       const socket = net.createConnection(daemon.client.paths.socket);
@@ -318,10 +357,10 @@ test('restart marks running work unknown and fences its queued successor until v
       queue: [],
       workers: { w1: { id: 'w1', state: 'idle', harness: 'omp', log: join(teamDir, 'w1.log'), assignments: 0 } },
     }));
-    await writeFile(join(root, 'fixture.mjs'), fixture);
     daemon = await start(root, 'supervisor', paths);
     const first = uuid(5);
     const firstControl = join(root, 'restart-first.sock');
+    await startTab(root, firstControl);
     await daemon.client.submit(task(root, first, firstControl, effect, { team }), first);
     await running(daemon.client, first);
     await owned(daemon.client, first);
@@ -344,7 +383,7 @@ test('restart marks running work unknown and fences its queued successor until v
     assert.match(result.stdout, /broker-proven idle/);
     const saved = JSON.parse(readFileSync(join(teamDir, 'team.json'), 'utf8'));
     assert.equal(saved.workers.w1.state, 'idle');
-    assert.equal(saved.workers.w1.session_id, `session-${first}`);
+    assert.equal(saved.workers.w1.session_id, 'session-tab');
     assert.equal((await daemon.client.get(second)).task.state, 'blocked');
     assert.equal((await daemon.client.status(team)).queued, 0);
   } finally {

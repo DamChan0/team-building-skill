@@ -42,9 +42,6 @@ enum Command {
     View {
         #[arg(long)]
         log: PathBuf,
-        /// OMP session directory: show the live worker transcript instead of the UI log.
-        #[arg(long)]
-        session_dir: Option<PathBuf>,
     },
 }
 struct Daemon {
@@ -66,11 +63,7 @@ enum FrameError {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Serve { state_dir, socket } => serve(state_dir, socket).await,
-        Command::View {
-            session_dir: Some(dir),
-            ..
-        } => view_session(dir),
-        Command::View { log, .. } => view(log),
+        Command::View { log } => view(log),
     }
 }
 
@@ -598,7 +591,7 @@ fn validate_spec(spec: &TaskSpec) -> Result<(), &'static str> {
         || spec.task.is_empty()
         || spec.prompt.len() > protocol::MAX_TEXT
         || !matches!(spec.harness.as_str(), "omp" | "claude" | "codex")
-        || spec.argv.is_empty()
+        || (spec.harness != "omp" && spec.argv.is_empty())
         || spec.max_timeout_ms == 0
     {
         Err("invalid")
@@ -675,62 +668,6 @@ fn view(log: PathBuf) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
         std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-// Redraws the newest OMP session transcript through `omp render` whenever it grows or the pane resizes.
-// ponytail: full re-render per change; switch to incremental rendering if long sessions repaint slowly.
-fn view_session(dir: PathBuf) -> Result<()> {
-    let mut stdout = std::io::stdout();
-    writeln!(stdout, "waiting for the first assignment")?;
-    stdout.flush()?;
-    let mut shown = None;
-    loop {
-        let newest = fs::read_dir(&dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
-            .filter_map(|entry| {
-                let metadata = entry.metadata().ok()?;
-                Some((metadata.modified().ok()?, metadata.len(), entry.path()))
-            })
-            .max();
-        if let Some((_, len, path)) = newest {
-            let width = terminal_width();
-            let key = Some((path.clone(), len, width));
-            if key != shown {
-                let rendered = std::process::Command::new("omp")
-                    .arg("render")
-                    .arg(&path)
-                    .arg("--width")
-                    .arg(width.to_string())
-                    .stdin(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .output();
-                // A failed render (e.g. a half-written line) retries on the next tick.
-                if let Ok(rendered) = rendered {
-                    if rendered.status.success() {
-                        stdout.write_all(b"\x1b[H\x1b[2J\x1b[3J")?;
-                        stdout.write_all(&rendered.stdout)?;
-                        stdout.flush()?;
-                        shown = key;
-                    }
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
-fn terminal_width() -> u16 {
-    // SAFETY: TIOCGWINSZ only writes into the zeroed winsize we pass.
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0;
-    if ok && size.ws_col > 0 {
-        size.ws_col
-    } else {
-        120
     }
 }
 

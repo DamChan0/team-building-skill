@@ -521,12 +521,9 @@ fn apply_resume(spec: &mut TaskSpec) -> Result<()> {
     }
     match spec.harness.as_str() {
         "omp" => {
-            let session_file = spec
-                .session_file
-                .clone()
-                .ok_or_else(|| anyhow!("OMP session file missing"))?;
-            if !spec.argv.iter().any(|argument| argument == "--resume") {
-                spec.argv.extend(["--resume".into(), session_file]);
+            // The tab hosts the session; the pin only needs its file to exist.
+            if spec.session_file.is_none() {
+                return Err(anyhow!("OMP session file missing"));
             }
         }
         "claude" => {

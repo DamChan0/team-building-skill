@@ -5,18 +5,15 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { backendName, exists, GATED, STATE_ROOT, WORKER_ENV, dropPointers, load, save, withLock } from './state.mjs';
+import { exists, GATED, STATE_ROOT, WORKER_ENV, dropPointers, load, save, withLock } from './state.mjs';
 
-const ORCA = process.env.ORCA_CLI_COMMAND || 'orca-ide';
-const HERDR = process.env.HERDR_CLI_COMMAND || 'herdr';
 export class OrcaError extends Error {}
-export { backendName };
 export const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 export const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 
-export function command(program, args, { cwd, timeout = 60_000 } = {}) {
+export function command(program, args, { cwd, env, timeout = 60_000 } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(program, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(program, args, { cwd, env: env && { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = '';
     const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`${program} timed out`)); }, timeout);
     child.stdout.on('data', chunk => { out += chunk; });
@@ -24,48 +21,6 @@ export function command(program, args, { cwd, timeout = 60_000 } = {}) {
     child.once('error', error => { clearTimeout(timer); reject(error); });
     child.once('close', code => { clearTimeout(timer); resolve({ code, out, err }); });
   });
-}
-
-export async function orca(...args) {
-  try {
-    const response = await command(ORCA, [...args, '--json']);
-    const body = JSON.parse(response.out);
-    if (response.code === 0 && body.ok) return body.result;
-    throw new Error((response.err || response.out).trim().slice(-300));
-  } catch (error) {
-    throw new OrcaError(`${ORCA} ${args.slice(0, 2).join(' ')}: ${error.message}`);
-  }
-}
-
-export async function herdr(...args) {
-  const response = await command(HERDR, args);
-  let body;
-  try { body = JSON.parse(response.out); } catch { body = null; }
-  if (!body) { try { body = JSON.parse(response.err); } catch { body = null; } }
-  if (response.code === 0 && !body?.error) return body?.result ?? {};
-  const code = body?.error?.code;
-  const message = body?.error?.message || (response.err || response.out).trim().slice(-300);
-  throw new OrcaError(`${HERDR} ${args.slice(0, 2).join(' ')}: ${code ? `${code}: ` : ''}${message}`);
-}
-
-export async function requireBackend(die) {
-  if (backendName() === 'herdr') {
-    try {
-      const status = await herdr('pane', 'current', '--current');
-      if (status.pane) return;
-    } catch (error) {
-      die(`herdr is not reachable from this pane (${error.message}); team workers run as herdr panes. Start a herdr pane and retry.`, 4);
-    }
-    die('herdr is not reachable from this pane; start a herdr pane and retry.', 4);
-    return;
-  }
-  try {
-    const status = await orca('status');
-    if (status.app.running && status.runtime.reachable) return;
-  } catch (error) {
-    die(`Orca is not available (${error.message}); team workers run as Orca terminal sessions. Start Orca (\`${ORCA} open\`) and retry.`, 4);
-  }
-  die(`Orca is not running/reachable; start it (\`${ORCA} open\`) and retry.`, 4);
 }
 
 export async function requireOmp(die) {
@@ -267,12 +222,8 @@ export async function nativeTask(team, worker, { prompt, teamDir, cwd }) {
   const harness = worker.harness || 'omp';
   if (worker.session_file) await recordSession(teamDir, worker, cwd);
   if (harness === 'omp') {
-    const thinking = configuredThinking ?? await defaultOmpThinking();
-    const argv = ['omp', '--mode', 'rpc', '--no-ui', '--no-title', '--session-dir', worker.session_dir, '--append-system-prompt', instruction];
-    if (worker.session_file) argv.push('--resume', worker.session_file);
-    if (model) argv.push('--model', model);
-    argv.push('--thinking', thinking);
-    return { argv, env: {}, thinking };
+    // The worker is the interactive omp in its multiplexer tab (see ompTabCommand); the broker only needs the thinking level.
+    return { argv: [], env: {}, thinking: configuredThinking ?? await defaultOmpThinking() };
   }
   if (harness === 'claude') {
     const schema = JSON.stringify({ type: 'object', additionalProperties: false, required: ['status', 'summary', 'files_changed', 'files_deleted', 'verification', 'blockers', 'approval_requests', 'branch', 'commit'], properties: { status: { enum: ['succeeded', 'failed', 'blocked'] }, summary: { type: 'string' }, files_changed: { type: 'array', items: { type: 'string' } }, files_deleted: { type: 'array', items: { type: 'string' } }, verification: { type: 'string' }, blockers: { type: 'array', items: { type: 'string' } }, approval_requests: { type: 'array' }, branch: { type: 'string' }, commit: { type: 'string' } } });
@@ -288,23 +239,22 @@ export async function nativeTask(team, worker, { prompt, teamDir, cwd }) {
   argv.push('-c', `developer_instructions=${JSON.stringify(instruction)}`, 'app-server');
   return { argv, env: {}, thinking: configuredThinking };
 }
-export async function closeTerminal(handle, backend = 'orca') {
-  if (!handle) return true;
-  if (backend === 'herdr') {
-    try {
-      await herdr('tab', 'close', handle);
-      return true;
-    } catch (error) {
-      return /_not_found/.test(error.message);
-    }
-  }
-  try {
-    await orca('terminal', 'close', '--terminal', handle, '--tab');
-    return true;
-  } catch (error) {
-    // A stale handle means Orca no longer has the tab: already closed.
-    return /terminal_handle_stale/.test(`${error.message}${error.stdout ?? ''}${error.stderr ?? ''}`);
-  }
+
+export const tabDir = (teamDir, worker) => join(teamDir, 'tabs', worker.id);
+
+// Shell command that turns a multiplexer tab into the OMP worker: the team-role extension in this
+// interactive session receives broker prompts via TEAM_BUILDING_TAB_DIR. Per-task model and
+// thinking are applied by the extension; the launch model only seeds a fixed-model team.
+export function ompTabCommand(team, worker, { teamDir, cwd }) {
+  const argv = ['omp', '--no-title', '--cwd', cwd, '--session-dir', worker.session_dir, '--append-system-prompt', contract(team, worker.id)];
+  if (worker.session_file) argv.push('--resume', worker.session_file);
+  if (worker.model) argv.push('--model', worker.model);
+  const env = {
+    TEAM_BUILDING_WORKER: `${team}/${worker.id}`,
+    TEAM_BUILDING_TAB_DIR: tabDir(teamDir, worker),
+    PATH: `${join(teamDir, 'shim')}:${process.env.PATH || ''}`,
+  };
+  return [`cd ${shellQuote(cwd)}`, ...Object.entries(env).map(([key, value]) => `export ${key}=${shellQuote(value)}`), `exec ${argv.map(shellQuote).join(' ')}`].join(' && ');
 }
 export async function cleanupWorker(worker) {
   await configFor(worker).cleanup(worker);
