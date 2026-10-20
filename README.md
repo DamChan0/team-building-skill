@@ -1,6 +1,6 @@
 # team-building
 
-- **Release:** [v0.5.1](https://github.com/DamChan0/team-building-skill/releases/tag/v0.5.1)
+- **Release:** [v0.5.2](https://github.com/DamChan0/team-building-skill/releases/tag/v0.5.2)
 - Persistent AI-worker teams managed from one session.
 - **Manager hosts:** OMP, Pi, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
 - **OMP is not needed when Pi, Claude Code, or Codex is the manager and you select native workers.** OMP remains the default worker backend.
