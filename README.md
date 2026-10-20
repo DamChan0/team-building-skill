@@ -164,7 +164,8 @@ node ~/.agents/skills/team-building/src/main.mjs init [gpt|claude] [--member N] 
 node ~/.agents/skills/team-building/src/main.mjs member N [--model M] [--harness H] [--allow-bypass]
 node ~/.agents/skills/team-building/src/main.mjs dismiss --worker wN[,wM...]
 node ~/.agents/skills/team-building/src/main.mjs status [--team ID]
-node ~/.agents/skills/team-building/src/main.mjs assign [--worker wN] [--approval tNNN] [--request-id UUID] [--model M] [--difficulty TIER] PROMPT
+node ~/.agents/skills/team-building/src/main.mjs assign [--detach] [--worker wN] [--approval tNNN] [--request-id UUID] [--model M] [--difficulty TIER] PROMPT
+node ~/.agents/skills/team-building/src/main.mjs wait [--task tNNN[,tMMM]] [--worker wN] [--all|--any] [--timeout S]
 node ~/.agents/skills/team-building/src/main.mjs approve --worker wN --task tNNN -- COMMAND...
 node ~/.agents/skills/team-building/src/main.mjs stop --worker wN [--team ID]
 node ~/.agents/skills/team-building/src/main.mjs clear [--team ID] [--fast]
@@ -178,6 +179,9 @@ node ~/.agents/skills/team-building/src/main.mjs clear [--team ID] [--fast]
 - Retry an interrupted submission with the same `--request-id` and identical assignment.
   - A changed prompt, team, worker, model, thinking, difficulty, or approval conflicts rather than rerouting.
   - `assign --approval tNNN` keeps the approved source task and worker bound in the PATH shim.
+- `assign` blocks by default. `assign --detach` submits the durable task and prints only its task ID (`tNNN`) on stdout, so blocking bash can dispatch independent slices serially without parsing chatter.
+- `wait` waits for detached tasks in the current team and prints one compact JSON result per completed task. It defaults to all selected work; use `--task t001,t002` and/or `--worker wN` to select, `--any` for the first completion (whose status controls the exit code), and `--all` to make the default explicit. `wait --all` with no filters waits for every detached task.
+- A wait exits nonzero for failed, blocked, unknown, or timed-out work. Completed mappings are removed; unfinished mappings remain available for a later `wait`.
 - **Recover an `unknown` worker:** run `stop --team <id> --worker wN`.
   - The broker verifies native process ownership, blocks queued tasks instead of replaying them, and preserves the exact session.
   - Resubmit follow-up work afterward.

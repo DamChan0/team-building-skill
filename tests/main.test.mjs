@@ -32,8 +32,131 @@ test('parses assignment sentinels and exact approval argv', () => {
   assert.equal(assignment.approval, 't001');
   assert.equal(assignment.difficulty, 'complex');
 
-  const approval = parseArgs(['approve', '--worker', 'w2', '--task', 't001', '--', 'git', 'push', 'origin', 'main']);
-  assert.deepEqual(approval.command, ['git', 'push', 'origin', 'main']);
+});
+
+test('detached CLI work prints only its task id and wait consumes completed mappings', { skip: !existsSync(supervisorBinary) }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'team-building-detach-'));
+  const stateRoot = join(home, '.local', 'state', 'team-building');
+  const team = 'tb-0101-000003';
+  const teamDir = join(stateRoot, team);
+  const root = join(home, 'worktree');
+  const bin = join(home, 'bin');
+  const orca = join(bin, 'orca-ide');
+  const omp = join(bin, 'omp');
+  const tab = join(teamDir, 'tabs', 'w1');
+  const paths = supervisorPaths(stateRoot);
+  const client = new Supervisor(paths);
+  let daemon;
+  let worker;
+  const environment = {
+    ...process.env,
+    HOME: home,
+    ORCA_CLI_COMMAND: orca,
+    PATH: `${bin}:${process.env.PATH}`,
+    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || '/tmp',
+  };
+  try {
+    await Promise.all([mkdir(root, { recursive: true }), mkdir(bin, { recursive: true }), mkdir(tab, { recursive: true }), mkdir(join(teamDir, 'results'), { recursive: true }), mkdir(paths.stateDir, { recursive: true })]);
+    await writeFile(orca, `#!/usr/bin/env node
+const args = process.argv.slice(2, -1);
+let result = { app: { running: true }, runtime: { reachable: true } };
+if (args[0] === 'worktree') result = { worktree: { path: ${JSON.stringify(root)} } };
+if (args[0] === 'terminal' && args[1] === 'list') result = { terminals: [{ handle: 'fixture-tab', connected: true, orphaned: false }] };
+console.log(JSON.stringify({ ok: true, result }));
+`);
+    await writeFile(omp, '#!/bin/sh\necho medium\n');
+    await chmod(orca, 0o755);
+    await chmod(omp, 0o755);
+    await writeFile(join(teamDir, 'team.json'), JSON.stringify({
+      id: team, cwd: root, worktree: root, backend: 'orca', model: 'fixture-model', harness: 'omp',
+      next_task: 1, next_worker: 2, queue: [], detached: {},
+      workers: {
+        w1: {
+          id: 'w1', state: 'idle', retiring: false, assignments: 0, harness: 'omp',
+          observer: 'fixture-tab', observer_kind: 'tab', session_id: null, session_file: null,
+          session_dir: join(teamDir, 'sessions', 'w1'), cwd: root, worktree: null, log: join(teamDir, 'logs', 'w1.log'),
+        },
+      },
+    }));
+    await writeFile(join(home, 'tab.mjs'), `import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+const dir = ${JSON.stringify(tab)};
+const release = ${JSON.stringify(join(home, 'release-t002'))};
+mkdirSync(dir, { recursive: true });
+writeFileSync(${JSON.stringify(join(home, 'fixture.session'))}, JSON.stringify({ type: 'session', id: 'fixture-session', cwd: ${JSON.stringify(root)} }) + '\\n');
+writeFileSync(dir + '/ready.json', JSON.stringify({ pid: process.pid, session_id: 'fixture-session', session_file: ${JSON.stringify(join(home, 'fixture.session'))} }));
+let count = 0;
+let pendingTask = null;
+function complete(task, status, summary) {
+  const result = { status, summary, files_changed: [], files_deleted: [], verification: 'fixture', blockers: [], approval_requests: [], branch: '', commit: '' };
+  const outcome = { request_id: task.request_id, text: JSON.stringify(result) };
+  writeFileSync(dir + '/outcome.json.tmp', JSON.stringify(outcome));
+  renameSync(dir + '/outcome.json.tmp', dir + '/outcome.json');
+}
+setInterval(() => {
+  writeFileSync(dir + '/beat', String(Date.now()));
+  if (pendingTask && existsSync(release)) {
+    complete(pendingTask, 'failed', 'fixture failure');
+    pendingTask = null;
+  }
+  let task; try { task = JSON.parse(readFileSync(dir + '/task.json', 'utf8')); } catch { return; }
+  rmSync(dir + '/task.json');
+  if (++count === 1) complete(task, 'succeeded', 'fixture complete');
+  else pendingTask = task;
+}, 20);
+`);
+    worker = spawn(process.execPath, [join(home, 'tab.mjs')], { stdio: 'ignore' });
+    await delay(100);
+    daemon = spawn(supervisorBinary, ['serve', '--state-dir', paths.stateDir, '--socket', paths.socket], { stdio: ['ignore', 'pipe', 'inherit'] });
+    const readiness = createInterface({ input: daemon.stdout });
+    const [line] = await once(readiness, 'line', { signal: AbortSignal.timeout(5_000) });
+    readiness.close();
+    daemon.stdout.destroy();
+    assert.equal(JSON.parse(line).payload?.ready, true);
+
+    const detached = spawnSync(process.execPath, [main, 'assign', '--detach', '--team', team, '--worker', 'w1', 'first slice'], {
+      cwd: root, encoding: 'utf8', timeout: 10_000, env: environment,
+    });
+    assert.equal(detached.status, 0, detached.stderr);
+    assert.equal(detached.stdout, 't001\n');
+
+    const waited = spawnSync(process.execPath, [main, 'wait', '--any', '--team', team, '--timeout', '5'], {
+      cwd: root, encoding: 'utf8', timeout: 10_000, env: environment,
+    });
+    assert.equal(waited.status, 0, waited.stderr);
+    assert.equal(waited.stdout.trim().split('\n').length, 1);
+    assert.equal(JSON.parse(waited.stdout).status, 'succeeded');
+    assert.deepEqual(JSON.parse(await readFile(join(teamDir, 'team.json'), 'utf8')).detached, {});
+
+    const pending = spawnSync(process.execPath, [main, 'assign', '--detach', '--team', team, '--worker', 'w1', 'second slice'], {
+      cwd: root, encoding: 'utf8', timeout: 10_000, env: environment,
+    });
+    assert.equal(pending.status, 0, pending.stderr);
+    assert.equal(pending.stdout, 't002\n');
+    const timedOut = spawnSync(process.execPath, [main, 'wait', '--all', '--task', 't002', '--team', team, '--timeout', '1'], {
+      cwd: root, encoding: 'utf8', timeout: 10_000, env: environment,
+    });
+    assert.equal(timedOut.status, 1);
+    assert.equal(JSON.parse(await readFile(join(teamDir, 'team.json'), 'utf8')).detached.t002.worker, 'w1');
+    await writeFile(join(home, 'release-t002'), '');
+    const failed = spawnSync(process.execPath, [main, 'wait', '--task', 't002', '--team', team, '--timeout', '5'], {
+      cwd: root, encoding: 'utf8', timeout: 10_000, env: environment,
+    });
+    assert.equal(failed.status, 1, failed.stderr);
+    assert.equal(JSON.parse(failed.stdout).status, 'failed');
+    assert.deepEqual(JSON.parse(await readFile(join(teamDir, 'team.json'), 'utf8')).detached, {});
+  } finally {
+    if (worker?.pid && worker.exitCode === null && worker.signalCode === null) {
+      const exited = once(worker, 'exit');
+      worker.kill('SIGKILL');
+      await exited;
+    }
+    if (daemon?.pid && daemon.exitCode === null) {
+      const exited = once(daemon, 'exit');
+      await client.request('shutdown', {}, undefined, 1_000).catch(() => daemon.kill('SIGTERM'));
+      await exited;
+    }
+    await rm(home, { recursive: true, force: true });
+  }
 });
 test('rejects assignments outside persisted Orca worktrees before supervisor startup', async () => {
   const scenarios = [

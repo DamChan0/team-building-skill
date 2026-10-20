@@ -1,4 +1,9 @@
-use std::{fs, io, path::{Path, PathBuf}, process::Stdio, time::Duration};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -15,6 +20,7 @@ use crate::{
 };
 
 const LOG_LIMIT: u64 = 8 * 1024 * 1024;
+const RAW_OUTPUT_EXCERPT_LIMIT: usize = 2 * 1024;
 
 pub(crate) async fn execute(
     request_id: &str,
@@ -206,8 +212,8 @@ async fn omp_tab(
     };
     let text = |name: &str| ready.get(name).and_then(Value::as_str).map(str::to_owned);
     let session = (text("session_id"), text("session_file"));
-    if let Err(error) = ensure_session_id(spec, &session.0)
-        .and_then(|()| ensure_session_file(spec, &session.1))
+    if let Err(error) =
+        ensure_session_id(spec, &session.0).and_then(|()| ensure_session_file(spec, &session.1))
     {
         return failed(error.to_string(), spec);
     }
@@ -219,7 +225,12 @@ async fn omp_tab(
     if emit(events, owned).await.is_err() || emit_session(events, &session).await.is_err() {
         return failed("event receiver closed".into(), spec);
     }
-    for name in ["outcome.json", "started.json", "abort.json", "task.taken.json"] {
+    for name in [
+        "outcome.json",
+        "started.json",
+        "abort.json",
+        "task.taken.json",
+    ] {
         let _ = fs::remove_file(dir.join(name));
     }
     let env: serde_json::Map<String, Value> = spec
@@ -230,7 +241,10 @@ async fn omp_tab(
         .collect();
     let task = json!({"request_id":request_id,"prompt":spec.prompt,"model":spec.model,"thinking":spec.thinking,"env":env});
     if let Err(error) = write_object(&dir.join("task.json"), &task) {
-        return failed(format!("could not hand the task to the worker tab: {error}"), spec);
+        return failed(
+            format!("could not hand the task to the worker tab: {error}"),
+            spec,
+        );
     }
     let mut started = false;
     let mut last_progress = Instant::now();
@@ -245,7 +259,9 @@ async fn omp_tab(
                 return abandon(&dir, request_id, "event receiver closed", spec).await;
             }
         }
-        let progress = fs::metadata(dir.join("progress")).and_then(|meta| meta.modified()).ok();
+        let progress = fs::metadata(dir.join("progress"))
+            .and_then(|meta| meta.modified())
+            .ok();
         if progress != seen_progress {
             seen_progress = progress;
             last_progress = Instant::now();
@@ -279,7 +295,7 @@ fn tab_outcome(
     spec: &TaskSpec,
 ) -> WorkerOutcome {
     if let Some(error) = outcome.get("error").and_then(Value::as_str) {
-        return failed(error.to_owned(), spec);
+        return failed_with_session(error.to_owned(), session, spec);
     }
     match outcome
         .get("text")
@@ -288,7 +304,7 @@ fn tab_outcome(
         .and_then(parse_result)
     {
         Ok(result) => success(result, session.0, session.1, spec),
-        Err(error) => failed(error.to_string(), spec),
+        Err(error) => failed_with_session(error.to_string(), session, spec),
     }
 }
 
@@ -306,7 +322,10 @@ async fn abandon(dir: &Path, request_id: &str, reason: &str, spec: &TaskSpec) ->
         }
         sleep(TAB_POLL).await;
     }
-    unknown(format!("{reason}; worker tab did not confirm the abort"), spec)
+    unknown(
+        format!("{reason}; worker tab did not confirm the abort"),
+        spec,
+    )
 }
 
 async fn claude(
@@ -567,13 +586,46 @@ fn parse_frame(line: &str) -> Result<Value> {
 }
 fn parse_result(text: &str) -> Result<TaskResult> {
     if text.len() > MAX_TEXT {
-        return Err(anyhow!("native result exceeds limit"));
+        return Err(result_error("native result exceeds limit", text));
     }
-    let result: TaskResult = serde_json::from_str(text)?;
+    let result: TaskResult =
+        serde_json::from_str(unfence_result(text)).map_err(|error| result_error(error, text))?;
     result
         .valid()
         .then_some(result)
-        .ok_or_else(|| anyhow!("invalid task result"))
+        .ok_or_else(|| result_error("invalid task result", text))
+}
+
+fn unfence_result(text: &str) -> &str {
+    let text = text.trim();
+    let Some(fence) = text.strip_prefix("```") else {
+        return text;
+    };
+    let Some((language, content)) = fence.split_once('\n') else {
+        return text;
+    };
+    if !matches!(language.trim_end_matches('\r'), "" | "json") {
+        return text;
+    }
+    let Some((body, closing)) = content.rsplit_once('\n') else {
+        return text;
+    };
+    if closing.trim() != "```" {
+        return text;
+    }
+    body.trim()
+}
+
+fn result_error(error: impl std::fmt::Display, text: &str) -> anyhow::Error {
+    anyhow!("{error}; output excerpt: {}", output_excerpt(text))
+}
+
+fn output_excerpt(text: &str) -> &str {
+    let mut end = text.len().min(RAW_OUTPUT_EXCERPT_LIMIT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 fn parse_result_value(value: &Value) -> Result<TaskResult> {
     if serde_json::to_vec(value)?.len() > MAX_TEXT {
@@ -670,6 +722,25 @@ fn failed(error: String, spec: &TaskSpec) -> WorkerOutcome {
         model: spec.model.clone(),
     }
 }
+
+fn failed_with_session(
+    error: String,
+    session: (Option<String>, Option<String>),
+    spec: &TaskSpec,
+) -> WorkerOutcome {
+    let error = match session.1.as_deref() {
+        Some(path) => format!("{error}; session file: {path}"),
+        None => error,
+    };
+    WorkerOutcome {
+        status: "failed".into(),
+        result: None,
+        error: Some(error),
+        session_id: session.0.or_else(|| spec.session_id.clone()),
+        session_file: session.1.or_else(|| spec.session_file.clone()),
+        model: spec.model.clone(),
+    }
+}
 fn unknown(error: String, spec: &TaskSpec) -> WorkerOutcome {
     WorkerOutcome {
         status: "unknown".into(),
@@ -729,7 +800,9 @@ mod writeln {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_frame, parse_result, spawn, TaskSpec};
+    use super::{
+        parse_frame, parse_result, spawn, tab_outcome, TaskSpec, RAW_OUTPUT_EXCERPT_LIMIT,
+    };
     use std::collections::BTreeMap;
 
     #[tokio::test]
@@ -773,6 +846,71 @@ mod tests {
         assert!(
             parse_result(r#"{"status":"succeeded","summary":"ok","verification":"done"}"#).is_ok()
         );
+    }
+
+    #[test]
+    fn accepts_unfenced_and_single_json_fenced_results() {
+        let result = r#"{"status":"succeeded","summary":"ok","verification":"done"}"#;
+        for text in [
+            result,
+            &format!("\n```json\n{result}\n```\n"),
+            &format!("```\n{result}\n```"),
+        ] {
+            assert_eq!(parse_result(text).unwrap().summary, "ok");
+        }
+        assert!(parse_result(&format!("```yaml\n{result}\n```")).is_err());
+    }
+
+    #[test]
+    fn result_parse_errors_include_bounded_output_excerpt() {
+        let text = format!(
+            "worker prose: completed\n{}END-OF-WORKER-OUTPUT",
+            "x".repeat(RAW_OUTPUT_EXCERPT_LIMIT)
+        );
+        let error = parse_result(&text).unwrap_err().to_string();
+        assert!(error.contains("output excerpt: worker prose: completed"));
+        assert!(!error.contains("END-OF-WORKER-OUTPUT"));
+        assert!(error.len() < RAW_OUTPUT_EXCERPT_LIMIT + 256);
+    }
+
+    #[test]
+    fn omp_parse_errors_keep_actual_session_file() {
+        let spec = TaskSpec {
+            team_dir: "/tmp".into(),
+            team: "team".into(),
+            worker: "worker".into(),
+            task: "task".into(),
+            kind: "task".into(),
+            cwd: "/".into(),
+            harness: "omp".into(),
+            argv: vec![],
+            env: BTreeMap::new(),
+            prompt: String::new(),
+            model: None,
+            thinking: None,
+            session_id: None,
+            session_file: None,
+            log: "/tmp/log".into(),
+            idle_timeout_ms: 1,
+            max_timeout_ms: 1,
+        };
+        let outcome = tab_outcome(
+            &serde_json::json!({"text":"worker prose: completed"}),
+            (
+                Some("session".into()),
+                Some("/tmp/actual-session.jsonl".into()),
+            ),
+            &spec,
+        );
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(
+            outcome.session_file.as_deref(),
+            Some("/tmp/actual-session.jsonl")
+        );
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("session file: /tmp/actual-session.jsonl")));
     }
 
     #[test]

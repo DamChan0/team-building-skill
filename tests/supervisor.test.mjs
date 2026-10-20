@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test, { afterEach } from 'node:test';
-import { Supervisor, supervisorBinary, supervisorPaths } from '../src/supervisor.mjs';
+import { Supervisor, supervisorBinary, supervisorCompatibility, supervisorPaths } from '../src/supervisor.mjs';
 
 const result = JSON.stringify({ status: 'succeeded', summary: 'fixture completed', verification: 'fixture' });
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -227,6 +227,53 @@ async function terminal(client, request) {
 }
 
 const available = existsSync(supervisorBinary);
+
+test('health reports the current supervisor compatibility marker', { skip: !available, concurrency: false }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'team-supervisor-health-'));
+  let daemon;
+  try {
+    daemon = await start(root);
+    assert.equal((await daemon.client.health()).compatibility, supervisorCompatibility);
+  } finally {
+    if (daemon) await stop(daemon);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('legacy or mismatched health rejects submit without sending its incompatible payload', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'team-supervisor-legacy-'));
+  const socket = join(root, 'supervisor.sock');
+  const commands = [];
+  const healthMarkers = [undefined, supervisorCompatibility + 1];
+  const server = net.createServer(connection => connection.once('data', chunk => {
+    const request = JSON.parse(chunk.toString('utf8').trim());
+    commands.push(request.type);
+    const marker = request.type === 'health' ? healthMarkers.shift() : undefined;
+    const payload = request.type === 'health'
+      ? { ok: true, healthy: true, ...(marker === undefined ? {} : { compatibility: marker }) }
+      : { ok: true, workers: [], queued: 0, next_after: 0, has_more: false };
+    connection.end(`${JSON.stringify({ version: 1, id: request.id, type: 'response', payload })}\n`);
+  }));
+  try {
+    await new Promise((resolve, reject) => server.listen(socket, error => error ? reject(error) : resolve()));
+    const client = new Supervisor({ stateDir: root, socket });
+    assert.deepEqual((await client.status()).workers, []);
+    for (const requestId of [uuid(99), uuid(100)]) {
+      await assert.rejects(
+        client.submit({}, requestId),
+        error => error.code === 'stale_supervisor'
+          && /stale or incompatible/.test(error.message)
+          && /let tasks finish/.test(error.message)
+          && /only while it is idle/.test(error.message)
+          && /retry/.test(error.message),
+      );
+    }
+    assert.deepEqual(commands, ['status', 'health', 'health']);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  }
+});
 test('broker keeps native work pending through acceptance and reuses its exact session', { skip: !available, concurrency: false }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'team-supervisor-'));
   const effect = join(root, 'effect');

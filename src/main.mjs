@@ -239,7 +239,7 @@ async function ensureObservers(teamDir, data, workers) {
   if (failed) throw failed.reason;
 }
 
-export async function runAssignment(teamDir, preferredWorker, prompt, timeout, maximum, kind = 'task', approval = null, assignment = {}) {
+export async function runAssignment(teamDir, preferredWorker, prompt, timeout, maximum, kind = 'task', approval = null, assignment = {}, detach = false) {
   const team = basename(teamDir);
   const requestId = assignment.request_id || randomUUID();
   const client = await connectSupervisor(STATE_ROOT);
@@ -253,9 +253,15 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
       || (assignment.thinking !== undefined && spec.thinking !== assignment.thinking)) {
       throw new Error(`request ${requestId} conflicts with its durable assignment`);
     }
+    const fallback = { team, worker: spec.worker, task: spec.task, kind: spec.kind, log: spec.log };
+    if (detach) {
+      await rememberDetached(teamDir, { ...fallback, request_id: requestId });
+      await syncStatus(teamDir, client, team);
+      return fallback;
+    }
     const snapshot = await waitForTask(client, requestId, timeout);
     await syncStatus(teamDir, client, team);
-    return taskOutput(snapshot);
+    return taskOutput(snapshot, fallback);
   }
 
   let data; let worker; let task;
@@ -321,18 +327,54 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
     log: worker.log, idle_timeout_ms: Math.max(1_000, timeout * 1000), max_timeout_ms: Math.max(1_000, maximum * 1000),
   };
   const accepted = await client.submit(spec, requestId);
+  const fallback = { team, worker: worker.id, task, kind, log: worker.log };
+  if (detach) {
+    await rememberDetached(teamDir, { ...fallback, request_id: accepted.request_id });
+    await syncStatus(teamDir, client, team);
+    return fallback;
+  }
   await syncStatus(teamDir, client, team);
   const snapshot = await waitForTask(client, accepted.request_id, timeout);
   await syncStatus(teamDir, client, team);
-  const output = { ...taskOutput(snapshot, { team, worker: worker.id, task, kind, log: worker.log }), finished: now() };
+  const output = { ...taskOutput(snapshot, fallback), finished: now() };
   if (output.status !== 'unknown') await writeResult(teamDir, output);
   return output;
+}
+
+async function rememberDetached(teamDir, task) {
+  await withLock(teamDir, async () => {
+    const data = await load(teamDir);
+    data.detached = {
+      ...(data.detached || {}),
+      [task.task]: {
+        request_id: task.request_id,
+        worker: task.worker,
+        kind: task.kind,
+        log: task.log,
+      },
+    };
+    await save(teamDir, data);
+  });
 }
 
 async function waitForTask(client, requestId, timeout) {
   let after = 0;
   for (;;) {
     const reply = await client.wait(requestId, after, Math.min(60_000, Math.max(1_000, timeout * 1000)));
+    for (const event of reply.events) {
+      after = Math.max(after, event.seq);
+      await client.ack(requestId, event.seq);
+    }
+    if (['succeeded', 'failed', 'blocked', 'unknown'].includes(reply.task?.state)) return reply.task;
+  }
+}
+
+async function waitForTaskUntil(client, requestId, deadline) {
+  let after = 0;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    const reply = await client.wait(requestId, after, Math.min(60_000, Math.max(1, remaining)));
     for (const event of reply.events) {
       after = Math.max(after, event.seq);
       await client.ack(requestId, event.seq);
@@ -649,6 +691,7 @@ async function init(args) {
     closing: false,
     workers: {},
     queue: [],
+    detached: {},
     isolate: !!args.isolate,
   };
   await writeShims(teamDir, data);
@@ -812,7 +855,9 @@ async function assign(args) {
         thinking: prior.spec.thinking,
       });
       if (args.model !== undefined) retry.model = args.model;
-      printResult(await runAssignment(teamDir, args.worker, prompt, args.timeout, args.max, 'task', args.approval, retry));
+      const output = await runAssignment(teamDir, args.worker, prompt, args.timeout, args.max, 'task', args.approval, retry, args.detach);
+      if (args.detach) console.log(output.task);
+      else printResult(output);
       return;
     }
   }
@@ -864,7 +909,9 @@ async function assign(args) {
     const started = Date.now();
     assignment = await classifyRequest(data.router, prompt, { cwd: data.cwd });
     assignment.router_duration_ms = Date.now() - started;
-    console.log(`route ${data.router.family}: ${assignment.difficulty} model=${assignment.model} intent=${JSON.stringify(assignment.intent)} (${assignment.router_duration_ms}ms)`);
+    const route = `route ${data.router.family}: ${assignment.difficulty} model=${assignment.model} intent=${JSON.stringify(assignment.intent)} (${assignment.router_duration_ms}ms)`;
+    if (args.detach) console.error(route);
+    else console.log(route);
   } else {
     assignment = routedAssignment(data, args);
   }
@@ -882,7 +929,76 @@ async function assign(args) {
   assignment.current_worktree = currentWorktree;
   assignment.request_id = args.request_id;
   if (interrupted()) throw interrupted();
-  printResult(await runAssignment(teamDir, args.worker, prompt, args.timeout, args.max, 'task', args.approval, assignment));
+  const output = await runAssignment(teamDir, args.worker, prompt, args.timeout, args.max, 'task', args.approval, assignment, args.detach);
+  if (args.detach) console.log(output.task);
+  else printResult(output);
+}
+
+async function wait(args) {
+  forbidWorkerManager();
+  const teamDir = await resolveTeam(args.team, die, process.cwd());
+  const data = await load(teamDir);
+  const mismatch = backendMismatchError(data);
+  if (mismatch) die(mismatch, 4);
+  const detached = data.detached || {};
+  const requestedTasks = args.task ? [...new Set(args.task.split(','))] : null;
+  if (requestedTasks?.some(task => !/^t\d{3}$/.test(task))) die('--task must name detached tasks such as t001,t002');
+  if (args.worker && !/^w\d+$/.test(args.worker)) die('--worker must name a worker such as w1');
+  if (requestedTasks?.some(task => !detached[task])) die(`no detached task ${requestedTasks.find(task => !detached[task])}`);
+  const selected = Object.entries(detached)
+    .filter(([task, entry]) => (!requestedTasks || requestedTasks.includes(task)) && (!args.worker || entry.worker === args.worker))
+    .map(([task, entry]) => ({ task, ...entry }));
+  if ((requestedTasks || args.worker) && !selected.length) die('no detached tasks match the selection');
+  if (!selected.length) return;
+
+  const client = await connectSupervisor(STATE_ROOT);
+  const deadline = Date.now() + args.timeout * 1000;
+  let completed = [];
+  if (args.any) {
+    const after = new Map(selected.map(entry => [entry.request_id, 0]));
+    while (Date.now() < deadline && !completed.length) {
+      const replies = await Promise.all(selected.map(async entry => {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return { entry, snapshot: null };
+        const reply = await client.wait(entry.request_id, after.get(entry.request_id), Math.min(1_000, remaining));
+        for (const event of reply.events) {
+          after.set(entry.request_id, Math.max(after.get(entry.request_id), event.seq));
+          await client.ack(entry.request_id, event.seq);
+        }
+        return {
+          entry,
+          snapshot: ['succeeded', 'failed', 'blocked', 'unknown'].includes(reply.task?.state) ? reply.task : null,
+        };
+      }));
+      completed = replies.filter(result => result.snapshot).slice(0, 1);
+    }
+  } else {
+    completed = (await Promise.all(selected.map(async entry => ({
+      entry,
+      snapshot: await waitForTaskUntil(client, entry.request_id, deadline),
+    })))).filter(result => result.snapshot);
+  }
+  await syncStatus(teamDir, client, data.id);
+  const outputs = completed.map(({ entry, snapshot }) => ({
+    ...taskOutput(snapshot, { team: data.id, worker: entry.worker, task: entry.task, kind: entry.kind, log: entry.log }),
+    finished: now(),
+  }));
+  for (const output of outputs) {
+    if (output.status !== 'unknown') await writeResult(teamDir, output);
+  }
+  await withLock(teamDir, async () => {
+    const latest = await load(teamDir);
+    const mappings = { ...(latest.detached || {}) };
+    for (const output of outputs) {
+      if (mappings[output.task]?.request_id === output.request_id) delete mappings[output.task];
+    }
+    latest.detached = mappings;
+    await save(teamDir, latest);
+  });
+  for (const output of outputs) console.log(JSON.stringify(output));
+  if (!outputs.length || outputs.some(output => output.status !== 'succeeded') || (!args.any && outputs.length !== selected.length)) {
+    process.exitCode = 1;
+  }
 }
 
 async function approve(args) {
@@ -1021,7 +1137,7 @@ async function clear(args) {
 }
 
 function usage() {
-  console.log(`usage: node src/main.mjs {init,member,status,assign,approve,stop,clear} [options]
+  console.log(`usage: node src/main.mjs {init,member,status,assign,wait,approve,stop,clear} [options]
 
 team-building helper: persistent harness-neutral workers driven by one manager session.
 
@@ -1030,7 +1146,8 @@ Commands:
   member N [--model MODEL] [--harness omp|claude|codex] [--allow-bypass]
   dismiss --worker wN[,wM...]
   status
-  assign [--worker wN] [--approval tNNN] [--model MODEL] [--difficulty simple|moderate|complex|extreme] [PROMPT]
+  assign [--detach] [--worker wN] [--approval tNNN] [--model MODEL] [--difficulty simple|moderate|complex|extreme] [PROMPT]
+  wait [--task tNNN[,tMMM]] [--worker wN] [--all|--any]
   approve --worker wN --task tNNN -- COMMAND...
   stop --worker wN
   clear [--fast]
@@ -1102,6 +1219,14 @@ export function parseArgs(argv) {
       args.clearPrevious = true;
     } else if (option === '--keep-previous') {
       args.keepPrevious = true;
+    } else if (option === '--detach') {
+      args.detach = true;
+    } else if (option === '--all') {
+      if (args.any) die('--all and --any cannot be combined');
+      args.all = true;
+    } else if (option === '--any') {
+      if (args.all) die('--all and --any cannot be combined');
+      args.any = true;
     } else if (option === '--request-id') {
       args.request_id = take(index, '--request-id');
       index++;
@@ -1159,7 +1284,7 @@ async function main() {
   }
 
   await mkdir(STATE_ROOT, { recursive: true });
-  const action = { init, member, dismiss, status, assign, approve, stop, clear }[args.cmd];
+  const action = { init, member, dismiss, status, assign, wait, approve, stop, clear }[args.cmd];
   if (!action) {
     usage();
     die(`invalid command ${args.cmd}`);

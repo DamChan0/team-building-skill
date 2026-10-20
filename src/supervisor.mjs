@@ -8,6 +8,9 @@ import net from 'node:net';
 const root = dirname(fileURLToPath(import.meta.url));
 export const supervisorBinary = join(root, '..', 'supervisor', 'target', 'release', 'team-supervisor');
 const MAX_FRAME = 1024 * 1024;
+// Bump when a submit payload change makes a daemon incompatible with its CLI.
+export const supervisorCompatibility = 2;
+
 const starters = new Map();
 
 export function supervisorPaths(stateRoot) {
@@ -18,6 +21,17 @@ export function supervisorPaths(stateRoot) {
 
 const available = path => access(path).then(() => true, () => false);
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+function staleSupervisorError() {
+  const error = new Error('supervisor is stale or incompatible with this CLI; let tasks finish, then locate and stop the daemon only while it is idle, and retry');
+  error.code = 'stale_supervisor';
+  return error;
+}
+
+function compatible(health) {
+  return health.compatibility === supervisorCompatibility;
+}
+
 
 export class Supervisor {
   constructor(paths) { this.paths = paths; }
@@ -64,7 +78,10 @@ export class Supervisor {
   }
 
   health() { return this.request('health'); }
-  submit(spec, requestId) { return this.request('submit', spec, requestId, 15_000); }
+  async submit(spec, requestId) {
+    if (!compatible(await this.health())) throw staleSupervisorError();
+    return this.request('submit', spec, requestId, 15_000);
+  }
   get(request_id) { return this.request('get', { request_id }); }
   wait(request_id, after_seq, timeout_ms) { return this.request('wait', { request_id, after_seq, timeout_ms }, randomUUID(), timeout_ms + 10_000); }
   ack(request_id, seq) { return this.request('ack', { request_id, seq }); }
@@ -83,7 +100,12 @@ async function buildSupervisor() {
 }
 
 async function start(paths, client) {
-  try { await client.health(); return; } catch {}
+  try {
+    if (compatible(await client.health())) return;
+    throw staleSupervisorError();
+  } catch (error) {
+    if (error.code === 'stale_supervisor') throw error;
+  }
   await buildSupervisor();
   await new Promise((resolve, reject) => {
     const daemonEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('HERDR_')));
@@ -116,14 +138,19 @@ async function start(paths, client) {
     });
     child.stderr.resume();
   }).catch(async error => {
-    // A competing manager may own the exclusive Rust lock; its healthy daemon is authoritative.
+    // A competing manager may own the exclusive Rust lock; only a compatible daemon is usable.
     for (let retry = 0; retry < 8; retry++) {
+      try {
+        if (compatible(await client.health())) return;
+        throw staleSupervisorError();
+      } catch (retryError) {
+        if (retryError.code === 'stale_supervisor') throw retryError;
+      }
       await sleep(250);
-      try { await client.health(); return; } catch {}
     }
     throw error;
   });
-  await client.health();
+  if (!compatible(await client.health())) throw staleSupervisorError();
 }
 
 export async function connectSupervisor(stateRoot) {

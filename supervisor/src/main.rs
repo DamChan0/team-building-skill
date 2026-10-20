@@ -25,6 +25,8 @@ use store::{Completion, Store, TaskSnapshot};
 const MAX_CONNECTIONS: usize = 32;
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
+// Bump when a submit payload change makes a daemon incompatible with its CLI.
+const COMPATIBILITY_MARKER: u8 = 2;
 
 #[derive(Parser)]
 struct Cli {
@@ -320,7 +322,10 @@ async fn dispatch(
     daemon: &Arc<Daemon>,
 ) -> Value {
     match command {
-        "health" if payload.is_empty() => response(id, json!({"ok":true,"healthy":true})),
+        "health" if payload.is_empty() => response(
+            id,
+            json!({"ok":true,"healthy":true,"compatibility":COMPATIBILITY_MARKER}),
+        ),
         "submit" => match serde_json::from_value::<TaskSpec>(Value::Object(payload)) {
             Ok(spec) if serde_json::to_vec(&spec).is_ok_and(|bytes| bytes.len() > 512 * 1024) => {
                 error_response(id, "payload_too_large")

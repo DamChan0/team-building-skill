@@ -35,9 +35,9 @@ Judge from the task, not its length. No classifier call needed for tier 0/1.
 | `init [gpt\|claude] [--member N] [--model M] [--harness omp\|claude\|codex] [--allow-bypass] [--isolate] [--clear-previous\|--keep-previous]` | Defaults: 3 OMP workers, GPT routing. Adopts this path's team. Exit 3 = teams at other paths: ask user, rerun with `--clear-previous` or `--keep-previous`. Pass `--member` explicitly; do not accept the default 3 for tier 2. |
 | `member N` / `dismiss --worker wN[,wM]` | Resize / retire idle workers; `member` restores missing tabs. |
 | `status [--team ID]` | Workers, state, queue. Run first in a new manager session, then `init` to adopt. |
-| `assign [--worker wN] [--difficulty TIER] [--model M] [--approval tNNN] PROMPT` | Blocks until structured result; busy worker queues. |
+| `assign [--detach] [--worker wN] [--difficulty TIER] [--model M] [--approval tNNN] PROMPT` | Blocks until a structured result by default; `--detach` submits durable work and prints only its task ID. |
 | `approve --worker wN --task tNNN -- COMMAND...` | Record a user-approved gated command. |
-| `stop --worker wN` | Recover an `unknown` worker, then resubmit. |
+| `wait [--task tNNN[,tMMM]] [--worker wN] [--all\|--any] [--timeout S]` | Wait for detached work (all by default) and print one compact JSON result per completed task. |
 | `clear [--team ID] [--fast]` | Wrap up and remove the team; `--fast` uses each worker's latest recorded task result instead of a model wrap-up turn. |
 
 Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|codex` needs `--allow-bypass`. Workers live in Orca tabs, or herdr tabs when the manager runs inside a herdr pane (`HERDR_ENV=1`); a team stays bound to its creating backend (other backend: exit 4; `status`/`init` list only this backend's teams). An OMP worker's tab is the worker itself (live interactive session); closing it ends the worker, and `member <current N>` or the next `assign` reopens it with the same session. Claude/Codex tabs are read-only observers; closing one does not stop the worker.
@@ -46,8 +46,9 @@ Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|code
 
 1. Split into independent slices with non-overlapping files; indivisible = one worker. Follow-ups go to the same worker (`--worker wN`) to keep its session.
 2. Brief = `# Context / # Goal / # Files / # Constraints / # Verify / # Report`. Tier 1 may shrink to Goal + Files + Verify. The worker reads files itself.
-3. Run each `assign` as a background job (bash `async: true`); wait for notifications. No sleep/poll loops; no final reply while an assignment is pending.
-4. Review each result (`status`, `summary`, `files_changed`, `verification`, `blockers`, `approval_requests`) against its acceptance check before reporting.
+3. When the manager can use background bash jobs, run each blocking `assign` as one and wait for notifications. In blocking-only bash, use `assign --detach` once per slice, record each printed task ID, then run one `wait --all`; never add sleep/poll loops.
+4. `wait` defaults to all selected detached tasks; select with `--task` and/or `--worker`, or use `--any` to return after the first completion (its status controls the exit code). It exits nonzero for failed, blocked, unknown, or timed-out work; unfinished task IDs remain available for a later `wait`.
+5. Review each result (`status`, `summary`, `files_changed`, `verification`, `blockers`, `approval_requests`) against its acceptance check before reporting.
 
 ## Safety
 
