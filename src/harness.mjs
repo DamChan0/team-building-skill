@@ -141,8 +141,16 @@ export async function writeShims(dir, data) {
   await mkdir(shim, { recursive: true });
   const script = `#!/usr/bin/env node
 import { readFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+if (process.env.TEAM_BUILDING_SHIM_ACTIVE === '1') {
+  console.error('team-building shim: recursion detected, aborting');
+  process.exit(127);
+}
+const shimDir = dirname(fileURLToPath(import.meta.url));
+const teamBuildingDir = resolve(shimDir, '..', '..');
 
 const [team, wid] = (process.env.TEAM_BUILDING_WORKER || '/').split('/');
 const root = join(process.env.HOME, '.local/state/team-building', team);
@@ -175,8 +183,15 @@ if ((name !== 'git' || git) && (name !== 'docker' || docker) && !approved.some(c
   console.error('BLOCKED: needs approval — return blocked with approval_requests');
   process.exit(126);
 }
-const path = process.env.PATH.split(':').filter(entry => entry !== join(root, 'shim')).join(':');
-const result = spawnSync(name, process.argv.slice(2), { stdio: 'inherit', env: { ...process.env, PATH: path } });
+const path = process.env.PATH.split(':').filter(entry => {
+  const resolved = resolve(entry);
+  return resolved !== shimDir &&
+    !(basename(resolved) === 'shim' && dirname(dirname(resolved)) === teamBuildingDir);
+}).join(':');
+const result = spawnSync(name, process.argv.slice(2), {
+  stdio: 'inherit',
+  env: { ...process.env, PATH: path, TEAM_BUILDING_SHIM_ACTIVE: '1' },
+});
 process.exit(result.status ?? 127);
 `;
   await writeFile(join(shim, 'run.mjs'), script);

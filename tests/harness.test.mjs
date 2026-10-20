@@ -1,10 +1,28 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { isDockerPush, isGitPush, nativeTask, ompTabCommand, writeShims } from '../src/harness.mjs';
+
+function runBounded(program, args, env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(program, args, { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '', timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+    }, 1_000);
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.once('error', error => { clearTimeout(timer); reject(error); });
+    child.once('close', (status, signal) => {
+      clearTimeout(timer);
+      resolve({ status, signal, stdout, stderr, timedOut });
+    });
+  });
+}
 
 test('gates publish commands only', () => {
   assert.equal(isGitPush(['push', 'origin', 'main']), true);
@@ -76,6 +94,37 @@ test('a worker can run a gated command only through its bound approval', async (
     env.TEAM_BUILDING_APPROVAL_TASK = 't001';
     assert.equal(spawnSync(join(root, 'shim', 'git'), ['push'], { env }).status, 0);
     assert.equal(await readFile(marker, 'utf8'), 'ran\n');
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('shim resolves real command without worker identity and rejects recursion', { skip: process.platform === 'win32' }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'team-building-shim-'));
+  const team = 'shim-team';
+  const root = join(home, '.local', 'state', 'team-building', team);
+  const bin = join(home, 'bin');
+  const marker = join(home, 'ran');
+  try {
+    await mkdir(bin, { recursive: true });
+    await writeFile(join(bin, 'git'), '#!/bin/sh\nprintf "%s\\n" "$*" > "$MARKER"\nprintf "fake git\\n"\n');
+    await chmod(join(bin, 'git'), 0o755);
+    await writeShims(root, {});
+    const env = { ...process.env, HOME: home, MARKER: marker, PATH: `${join(root, 'shim')}/:${bin}:${process.env.PATH || ''}` };
+    delete env.TEAM_BUILDING_WORKER;
+    delete env.TEAM_BUILDING_SHIM_ACTIVE;
+    delete env.TEAM_BUILDING_COMMAND;
+
+    const result = await runBounded(join(root, 'shim', 'git'), ['--version'], env);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'fake git\n');
+    assert.equal(await readFile(marker, 'utf8'), '--version\n');
+
+    const guarded = await runBounded(join(root, 'shim', 'git'), ['--version'], { ...env, TEAM_BUILDING_SHIM_ACTIVE: '1' });
+    assert.equal(guarded.timedOut, false);
+    assert.equal(guarded.status, 127);
+    assert.equal(guarded.stderr, 'team-building shim: recursion detected, aborting\n');
   } finally {
     await rm(home, { recursive: true, force: true });
   }
