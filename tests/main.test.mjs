@@ -240,7 +240,7 @@ test('keeps one team per path and creates observers for new workers', async () =
     cwd,
     encoding: 'utf8',
     timeout: 10_000,
-    env: { ...process.env, HERDR_ENV: '', HOME: home, ORCA_CLI_COMMAND: orca, ORCA_TEST_CALLS: calls, ORCA_TEST_TERMINALS: terminals },
+    env: { ...process.env, HERDR_ENV: '', HOME: home, OMP_SESSION_ID: '', PI_SESSION_ID: 'pi-session-fixture', ORCA_CLI_COMMAND: orca, ORCA_TEST_CALLS: calls, ORCA_TEST_TERMINALS: terminals },
   });
   const paths = supervisorPaths(stateRoot);
   const client = new Supervisor(paths);
@@ -290,6 +290,7 @@ console.log(JSON.stringify({ ok: true, result }));
     assert.equal(created.status, 0, created.stderr);
     const [firstTeam] = await teamIds();
     assert.equal(JSON.parse(await readFile(join(stateRoot, firstTeam, 'team.json'), 'utf8')).cwd, first);
+    assert.equal(JSON.parse(await readFile(join(stateRoot, firstTeam, 'team.json'), 'utf8')).manager_session, 'pi-session-fixture');
 
     const adopted = run(first, 'init', '--harness', 'claude', '--allow-bypass');
     assert.equal(adopted.status, 0, adopted.stderr);

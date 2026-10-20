@@ -8,7 +8,9 @@ const skillRoot = dirname(fileURLToPath(import.meta.url));
 const COMMAND_NAME = "team-building.md";
 const COMMAND_MARKER = "<!-- team-building native command -->";
 const EXTENSION_NAME = "team-role.ts";
+const PI_EXTENSION_NAME = "team-role.js";
 const EXTENSION_MARKER = "// team-building managed omp extension";
+const PI_EXTENSION_MARKER = "// team-building managed pi extension";
 
 function ompAgentDir() {
   const requestedProfile = process.env.OMP_PROFILE ?? process.env.PI_PROFILE;
@@ -22,6 +24,20 @@ function nativeCommandsDir() {
 
 function extensionsDir() {
   return join(ompAgentDir(), "extensions");
+}
+
+function piAgentDir() {
+  const configured = process.env.PI_CODING_AGENT_DIR;
+  if (!configured) return join(homedir(), ".pi", "agent");
+  if (configured === "~") return homedir();
+  if (configured.startsWith("~/") || (process.platform === "win32" && configured.startsWith("~\\"))) {
+    return join(homedir(), configured.slice(2));
+  }
+  return configured;
+}
+
+function piExtensionsDir() {
+  return join(piAgentDir(), "extensions");
 }
 
 function nativeCommand() {
@@ -74,6 +90,28 @@ async function installRoleExtension() {
   );
 }
 
+async function installPiRoleExtension() {
+  const target = join(piExtensionsDir(), PI_EXTENSION_NAME);
+  const content = await readFile(join(skillRoot, "pi", PI_EXTENSION_NAME), "utf8");
+  await installManagedFile(
+    target,
+    content,
+    PI_EXTENSION_MARKER,
+    `team-building: leaving user-owned Pi role extension at ${target}`,
+    `team-building: installed Pi role extension at ${target}`,
+  );
+}
+
+async function installPiRoleExtensionWhenAvailable() {
+  let pi;
+  try {
+    pi = await run("pi", ["--version"], { stdio: "ignore" });
+  } catch {
+    return;
+  }
+  if (pi.code === 0) await installPiRoleExtension();
+}
+
 function run(command, args, options) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, options);
@@ -103,6 +141,7 @@ async function main() {
   }
   await installNativeCommand();
   await installRoleExtension();
+  await installPiRoleExtensionWhenAvailable();
 
   try {
     const omp = await run("omp", ["--version"], { stdio: "ignore" });

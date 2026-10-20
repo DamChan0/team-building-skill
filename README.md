@@ -2,8 +2,8 @@
 
 - **Release:** [v0.5.1](https://github.com/DamChan0/team-building-skill/releases/tag/v0.5.1)
 - Persistent AI-worker teams managed from one session.
-- **Manager hosts:** OMP, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
-- **OMP is not needed when Claude Code or Codex is the manager and you select native workers.** OMP remains the default worker backend.
+- **Manager hosts:** OMP, Pi, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
+- **OMP is not needed when Pi, Claude Code, or Codex is the manager and you select native workers.** OMP remains the default worker backend.
 - **A terminal multiplexer is required in every mode:** Orca (app and CLI with the active worktree registered) or herdr (manager running inside a herdr pane).
 
 ![team-building concept: the manager splits a user command into briefs, native worker sessions execute them, Orca observer terminals show typed UI messages, and the manager reviews results](concept.webp)
@@ -90,6 +90,7 @@ sequenceDiagram
   - There is no Node transport fallback.
 - OMP is not a hard install requirement. If it is missing, setup still installs the skill and prints the OMP install suggestion.
   - Setup also writes an OMP-specific `/team-building` command alias; Claude Code and Codex use the installed `SKILL.md` instead.
+- When `pi` is on `PATH`, setup also installs a separate manager-role widget in `$PI_CODING_AGENT_DIR/extensions` (default `~/.pi/agent/extensions`). Pi is not an OMP worker-tab backend.
 - **OMP backend only:** install OMP and set `tools.approvalMode=yolo`; workers cannot answer approval prompts.
 
   ```sh

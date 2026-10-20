@@ -582,10 +582,10 @@ async function init(args) {
     const adoptMismatch = backendMismatchError(existing.data);
     if (adoptMismatch) die(adoptMismatch, 4);
     console.log(`adopted existing team ${basename(teamDir)} for cwd ${cwd}`);
-    // The adopting session becomes the manager; the OMP role badge keys on this id.
+    // The adopting session becomes the manager; role widgets key on this id.
     await withLock(teamDir, async () => {
       const data = await load(teamDir);
-      data.manager_session = process.env.OMP_SESSION_ID || null;
+      data.manager_session = process.env.OMP_SESSION_ID || process.env.PI_SESSION_ID || null;
       await save(teamDir, data);
     });
     const current = existing.data;
@@ -677,7 +677,7 @@ async function init(args) {
     id,
     created: now(),
     cwd,
-    manager_session: process.env.OMP_SESSION_ID || null,
+    manager_session: process.env.OMP_SESSION_ID || process.env.PI_SESSION_ID || null,
     backend: muxName,
     worktree,
     ...home,
