@@ -48,7 +48,7 @@ Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|code
 2. Brief = `# Context / # Goal / # Files / # Constraints / # Verify / # Report`. Tier 1 may shrink to Goal + Files + Verify. The worker reads files itself.
 3. When the manager can use background bash jobs, run each blocking `assign` as one and wait for notifications. In blocking-only bash, use `assign --detach` once per slice, record each printed task ID, then run one `wait --all`; never add sleep/poll loops.
 4. `wait` defaults to all selected detached tasks; select with `--task` and/or `--worker`, or use `--any` to return after the first completion (its status controls the exit code). It exits nonzero for failed, blocked, unknown, or timed-out work; unfinished task IDs remain available for a later `wait`.
-5. Review each result (`status`, `summary`, `files_changed`, `verification`, `blockers`, `approval_requests`) against its acceptance check before reporting.
+5. Review each result (`status`, `summary`, `files_changed`, `verification`, `blockers`, `approval_requests`, `tool_session_cleanup_errors`) against its acceptance check. Cleanup errors mean helper tabs remain open; detached mappings stay retryable.
 
 ## Safety
 

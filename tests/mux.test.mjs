@@ -13,6 +13,7 @@ appendFileSync(process.env.HERDR_TEST_CALLS, JSON.stringify({ socket: process.en
 const ok = result => console.log(JSON.stringify({ id: 'x', result }));
 const [group, action, target] = args;
 if (group === 'tab' && action === 'create') ok({ tab: { tab_id: 'w1:t2' }, root_pane: { pane_id: 'w1:p9' } });
+else if (group === 'tab' && action === 'list') ok({ tabs: [{ tab_id: 'w1:t2' }] });
 else if (group === 'pane' && action === 'run') {} // herdr prints nothing on success
 else if (group === 'tab' && target !== 'w1:t2') {
   console.error(JSON.stringify({ error: { code: 'tab_not_found', message: 'tab ' + target + ' not found' } }));
@@ -43,6 +44,9 @@ test('herdr backend launches workers through a script and pins the recorded serv
 
     assert.deepEqual(await mux.inspect(data, 'w1:t2'), { orphaned: false, title: null });
     assert.equal(await mux.inspect(data, 'w1:t1'), null);
+    assert.equal(await mux.ownsToolTab(data, 'w1:t2', '/repo'), true);
+    assert.deepEqual(await mux.listToolTabs(data, '/repo'), ['w1:t2']);
+    assert.equal(await mux.ownsToolTab(data, 'w1:t1', '/repo'), false);
     assert.equal(await mux.close(data, 'w1:t1'), true, 'a vanished tab is already closed');
     assert.equal(await mux.close(data, 'w1:t2'), true);
   } finally {

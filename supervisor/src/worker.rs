@@ -16,7 +16,10 @@ use tokio::{
 
 use crate::{
     process::{capture, group_gone, terminate, ProcessIdentity},
-    protocol::{TaskResult, TaskSpec, WorkerEvent, WorkerOutcome, MAX_FRAME, MAX_TEXT},
+    protocol::{
+        TaskResult, TaskSpec, WorkerEvent, WorkerOutcome, MAX_FRAME, MAX_TEXT, MAX_TOOL_SESSIONS,
+        MAX_TOOL_SESSION_ID,
+    },
 };
 
 const LOG_LIMIT: u64 = 8 * 1024 * 1024;
@@ -123,7 +126,11 @@ fn spawn(spec: &TaskSpec) -> Result<Child> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .envs(&spec.env)
+        .envs(
+            spec.env
+                .iter()
+                .filter(|(key, _)| key.as_str() != "TEAM_BUILDING_TOOL_TABS_BEFORE"),
+        )
         .env("PWD", &spec.cwd);
     if spec.harness == "omp" {
         // OMP otherwise relocates launches from the home directory to /tmp.
@@ -236,10 +243,18 @@ async fn omp_tab(
     let env: serde_json::Map<String, Value> = spec
         .env
         .iter()
-        .filter(|(key, _)| key.starts_with("TEAM_BUILDING_") && *key != "TEAM_BUILDING_WORKER")
+        .filter(|(key, _)| {
+            key.starts_with("TEAM_BUILDING_")
+                && *key != "TEAM_BUILDING_WORKER"
+                && *key != "TEAM_BUILDING_TOOL_TABS_BEFORE"
+        })
         .map(|(key, value)| (key.clone(), json!(value)))
         .collect();
-    let task = json!({"request_id":request_id,"prompt":spec.prompt,"model":spec.model,"thinking":spec.thinking,"env":env});
+    let prompt = format!(
+        "{}\n\nFor this assignment, your result must include `tool_sessions`: an array of `{{\"kind\":\"tab\",\"id\":\"<exact handle>\"}}` entries for temporary MCP/tool tabs you created in the team's managed workspace; use [] if none. Never report pre-existing tabs or any worker/manager tab. Close non-tab helper sessions through their owning tools before returning.",
+        spec.prompt
+    );
+    let task = json!({"request_id":request_id,"prompt":prompt,"model":spec.model,"thinking":spec.thinking,"env":env});
     if let Err(error) = write_object(&dir.join("task.json"), &task) {
         return failed(
             format!("could not hand the task to the worker tab: {error}"),
@@ -638,7 +653,40 @@ fn parse_result_value(value: &Value) -> Result<TaskResult> {
         .ok_or_else(|| anyhow!("invalid task result"))
 }
 fn result_schema() -> Value {
-    json!({"type":"object","additionalProperties":false,"required":["status","summary","verification"],"properties":{"status":{"enum":["succeeded","failed","blocked"]},"summary":{"type":"string","maxLength":262144},"verification":{"type":"string","maxLength":262144},"files_changed":{"type":"array","items":{"type":"string"}},"files_deleted":{"type":"array","items":{"type":"string"}},"blockers":{"type":"array","items":{"type":"string"}},"approval_requests":{"type":"array"},"branch":{"type":"string"},"commit":{"type":"string"}}})
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "summary", "verification", "tool_sessions"],
+        "properties": {
+            "status": {"enum": ["succeeded", "failed", "blocked"]},
+            "summary": {"type": "string", "maxLength": 262144},
+            "verification": {"type": "string", "maxLength": 262144},
+            "files_changed": {"type": "array", "items": {"type": "string"}},
+            "files_deleted": {"type": "array", "items": {"type": "string"}},
+            "blockers": {"type": "array", "items": {"type": "string"}},
+            "approval_requests": {"type": "array"},
+            "tool_sessions": {
+                "type": "array",
+                "maxItems": MAX_TOOL_SESSIONS,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["kind", "id"],
+                    "properties": {
+                        "kind": {"enum": ["tab"]},
+                        "id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_TOOL_SESSION_ID,
+                            "pattern": "^[A-Za-z0-9._:-]+$",
+                        },
+                    },
+                },
+            },
+            "branch": {"type": "string"},
+            "commit": {"type": "string"},
+        },
+    })
 }
 fn assistant_text(value: &Value) -> Option<&str> {
     value
@@ -801,8 +849,10 @@ mod writeln {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_frame, parse_result, spawn, tab_outcome, TaskSpec, RAW_OUTPUT_EXCERPT_LIMIT,
+        parse_frame, parse_result, result_schema, spawn, tab_outcome, TaskSpec,
+        RAW_OUTPUT_EXCERPT_LIMIT,
     };
+    use serde_json::json;
     use std::collections::BTreeMap;
 
     #[tokio::test]
@@ -845,6 +895,16 @@ mod tests {
     fn accepts_only_complete_typed_result() {
         assert!(
             parse_result(r#"{"status":"succeeded","summary":"ok","verification":"done"}"#).is_ok()
+        );
+    }
+    #[test]
+    fn result_schema_requires_valid_tool_session_handles() {
+        let schema = result_schema();
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("tool_sessions")));
+        assert_eq!(
+            schema["properties"]["tool_sessions"]["items"]["properties"]["kind"]["enum"][0],
+            "tab"
         );
     }
 

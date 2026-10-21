@@ -8,8 +8,8 @@ import net from 'node:net';
 const root = dirname(fileURLToPath(import.meta.url));
 export const supervisorBinary = join(root, '..', 'supervisor', 'target', 'release', 'team-supervisor');
 const MAX_FRAME = 1024 * 1024;
-// Bump when a submit payload change makes a daemon incompatible with its CLI.
-export const supervisorCompatibility = 2;
+// Bump when the manager/supervisor worker-result or submit contract changes incompatibly.
+export const supervisorCompatibility = 3;
 
 const starters = new Map();
 

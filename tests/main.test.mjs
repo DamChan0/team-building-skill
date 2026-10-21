@@ -44,6 +44,8 @@ test('detached CLI work prints only its task id and wait consumes completed mapp
   const orca = join(bin, 'orca-ide');
   const omp = join(bin, 'omp');
   const tab = join(teamDir, 'tabs', 'w1');
+  const terminalState = join(home, 'orca-terminals.json');
+  const orcaCalls = join(home, 'orca-calls.jsonl');
   const paths = supervisorPaths(stateRoot);
   const client = new Supervisor(paths);
   let daemon;
@@ -52,16 +54,32 @@ test('detached CLI work prints only its task id and wait consumes completed mapp
     ...process.env,
     HOME: home,
     ORCA_CLI_COMMAND: orca,
+    ORCA_TEST_CALLS: orcaCalls,
+    ORCA_TEST_TERMINALS: terminalState,
     PATH: `${bin}:${process.env.PATH}`,
     XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || '/tmp',
   };
   try {
+    await writeFile(terminalState, JSON.stringify([
+      { handle: 'fixture-tab', connected: true, orphaned: false },
+      { handle: 'manager-tab', connected: true, orphaned: false },
+    ]));
     await Promise.all([mkdir(root, { recursive: true }), mkdir(bin, { recursive: true }), mkdir(tab, { recursive: true }), mkdir(join(teamDir, 'results'), { recursive: true }), mkdir(paths.stateDir, { recursive: true })]);
     await writeFile(orca, `#!/usr/bin/env node
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 const args = process.argv.slice(2, -1);
+appendFileSync(process.env.ORCA_TEST_CALLS, JSON.stringify(args) + '\\n');
 let result = { app: { running: true }, runtime: { reachable: true } };
 if (args[0] === 'worktree') result = { worktree: { path: ${JSON.stringify(root)} } };
-if (args[0] === 'terminal' && args[1] === 'list') result = { terminals: [{ handle: 'fixture-tab', connected: true, orphaned: false }] };
+if (args[0] === 'terminal' && args[1] === 'list') {
+  result = { terminals: JSON.parse(readFileSync(process.env.ORCA_TEST_TERMINALS, 'utf8')) };
+}
+if (args[0] === 'terminal' && args[1] === 'close') {
+  const handle = args[args.indexOf('--terminal') + 1];
+  const terminals = JSON.parse(readFileSync(process.env.ORCA_TEST_TERMINALS, 'utf8'));
+  writeFileSync(process.env.ORCA_TEST_TERMINALS, JSON.stringify(terminals.filter(item => item.handle !== handle)));
+  result = { closed: true };
+}
 console.log(JSON.stringify({ ok: true, result }));
 `);
     await writeFile(omp, '#!/bin/sh\necho medium\n');
@@ -86,11 +104,17 @@ writeFileSync(${JSON.stringify(join(home, 'fixture.session'))}, JSON.stringify({
 writeFileSync(dir + '/ready.json', JSON.stringify({ pid: process.pid, session_id: 'fixture-session', session_file: ${JSON.stringify(join(home, 'fixture.session'))} }));
 let count = 0;
 let pendingTask = null;
-function complete(task, status, summary) {
-  const result = { status, summary, files_changed: [], files_deleted: [], verification: 'fixture', blockers: [], approval_requests: [], branch: '', commit: '' };
+function complete(task, status, summary, toolTab = null) {
+  const toolSessions = (Array.isArray(toolTab) ? toolTab : toolTab ? [toolTab] : []).map(id => ({ kind: 'tab', id }));
+  const result = { status, summary, files_changed: [], files_deleted: [], verification: 'fixture', blockers: [], approval_requests: [], tool_sessions: toolSessions, branch: '', commit: '' };
   const outcome = { request_id: task.request_id, text: JSON.stringify(result) };
   writeFileSync(dir + '/outcome.json.tmp', JSON.stringify(outcome));
   renameSync(dir + '/outcome.json.tmp', dir + '/outcome.json');
+}
+function addToolTab(id) {
+  const terminals = JSON.parse(readFileSync(process.env.ORCA_TEST_TERMINALS, 'utf8'));
+  terminals.push({ handle: id, connected: true, orphaned: false });
+  writeFileSync(process.env.ORCA_TEST_TERMINALS, JSON.stringify(terminals));
 }
 setInterval(() => {
   writeFileSync(dir + '/beat', String(Date.now()));
@@ -100,11 +124,17 @@ setInterval(() => {
   }
   let task; try { task = JSON.parse(readFileSync(dir + '/task.json', 'utf8')); } catch { return; }
   rmSync(dir + '/task.json');
-  if (++count === 1) complete(task, 'succeeded', 'fixture complete');
-  else pendingTask = task;
+  const current = ++count;
+  if (current === 1) {
+    addToolTab('tool-tab-1');
+    complete(task, 'succeeded', 'fixture complete', 'tool-tab-1');
+  } else if (current === 3) {
+    addToolTab('tool-tab-2');
+    complete(task, 'succeeded', 'blocking complete', ['tool-tab-2', 'fixture-tab', 'manager-tab']);
+  } else pendingTask = task;
 }, 20);
 `);
-    worker = spawn(process.execPath, [join(home, 'tab.mjs')], { stdio: 'ignore' });
+    worker = spawn(process.execPath, [join(home, 'tab.mjs')], { stdio: 'ignore', env: environment });
     await delay(100);
     daemon = spawn(supervisorBinary, ['serve', '--state-dir', paths.stateDir, '--socket', paths.socket], { stdio: ['ignore', 'pipe', 'inherit'] });
     const readiness = createInterface({ input: daemon.stdout });
@@ -125,6 +155,10 @@ setInterval(() => {
     assert.equal(waited.status, 0, waited.stderr);
     assert.equal(waited.stdout.trim().split('\n').length, 1);
     assert.equal(JSON.parse(waited.stdout).status, 'succeeded');
+    const waitedOutput = JSON.parse(waited.stdout);
+    assert.equal(waitedOutput.tool_sessions_cleaned, 1);
+    assert.deepEqual(waitedOutput.tool_session_cleanup_errors, []);
+    assert.deepEqual(JSON.parse(await readFile(terminalState, 'utf8')).map(item => item.handle), ['fixture-tab', 'manager-tab']);
     assert.deepEqual(JSON.parse(await readFile(join(teamDir, 'team.json'), 'utf8')).detached, {});
 
     const pending = spawnSync(process.execPath, [main, 'assign', '--detach', '--team', team, '--worker', 'w1', 'second slice'], {
@@ -144,6 +178,23 @@ setInterval(() => {
     assert.equal(failed.status, 1, failed.stderr);
     assert.equal(JSON.parse(failed.stdout).status, 'failed');
     assert.deepEqual(JSON.parse(await readFile(join(teamDir, 'team.json'), 'utf8')).detached, {});
+    const blocking = spawnSync(process.execPath, [main, 'assign', '--team', team, '--worker', 'w1', 'blocking slice'], {
+      cwd: root, encoding: 'utf8', timeout: 10_000, env: environment,
+    });
+    assert.equal(blocking.status, 1, blocking.stderr);
+    const blockingOutput = JSON.parse(blocking.stdout.slice(blocking.stdout.indexOf('\n') + 1));
+    assert.equal(blockingOutput.status, 'succeeded');
+    assert.equal(blockingOutput.tool_sessions_cleaned, 1);
+    assert.deepEqual(blockingOutput.tool_session_cleanup_errors, [
+      'refused to close a team worker tab',
+      'refused to close a tab that existed before this assignment',
+    ]);
+    assert.deepEqual(JSON.parse(await readFile(terminalState, 'utf8')).map(item => item.handle), ['fixture-tab', 'manager-tab']);
+    const closed = (await readFile(orcaCalls, 'utf8')).trim().split('\n')
+      .map(line => JSON.parse(line))
+      .filter(args => args[0] === 'terminal' && args[1] === 'close')
+      .map(args => args[args.indexOf('--terminal') + 1]);
+    assert.deepEqual(closed, ['tool-tab-1', 'tool-tab-2']);
   } finally {
     if (worker?.pid && worker.exitCode === null && worker.signalCode === null) {
       const exited = once(worker, 'exit');

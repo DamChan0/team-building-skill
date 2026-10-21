@@ -148,6 +148,74 @@ function taskOutput(snapshot, fallback = {}) {
   };
 }
 
+async function cleanupToolSessions(teamDir, snapshot) {
+  const sessions = snapshot.result?.tool_sessions || [];
+  if (!sessions.length) return { cleaned: 0, errors: [] };
+  let baseline;
+  try {
+    const handles = JSON.parse(snapshot.spec?.env?.TEAM_BUILDING_TOOL_TABS_BEFORE);
+    if (!Array.isArray(handles) || handles.length > 2048 || handles.some(handle => typeof handle !== 'string' || !handle)) throw new Error('invalid tab census');
+    baseline = new Set(handles);
+  } catch {
+    return { cleaned: 0, errors: ['could not verify which tabs existed before assignment; reported tabs left untouched'] };
+  }
+  let data;
+  try {
+    data = await load(teamDir);
+  } catch (error) {
+    return { cleaned: 0, errors: [`could not load team state for tool-tab cleanup: ${error.message}`] };
+  }
+  const worker = data.workers[snapshot.spec?.worker];
+  const worktree = data.isolate ? worker?.worktree : data.worktree;
+  const protectedTabs = new Set(Object.values(data.workers).map(item => item.observer).filter(Boolean));
+  const mux = muxOf(data);
+  const seen = new Set();
+  const errors = [];
+  let cleaned = 0;
+  for (const session of sessions) {
+    const { kind, id } = session || {};
+    if (kind !== 'tab' || typeof id !== 'string' || !/^[A-Za-z0-9._:-]{1,256}$/.test(id)) {
+      errors.push('invalid tool-tab handle; left untouched');
+      continue;
+    }
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (protectedTabs.has(id)) {
+      errors.push('refused to close a team worker tab');
+      continue;
+    }
+    if (baseline.has(id)) {
+      errors.push('refused to close a tab that existed before this assignment');
+      continue;
+    }
+    if (!worktree) {
+      errors.push('team worker worktree unavailable; left tool tab untouched');
+      continue;
+    }
+    try {
+      if (!(await mux.ownsToolTab(data, id, worktree))) continue;
+      if (!(await mux.close(data, id))) {
+        errors.push('multiplexer did not confirm tool-tab closure');
+        continue;
+      }
+      cleaned++;
+    } catch (error) {
+      errors.push(`could not close tool tab: ${error.message}`);
+    }
+  }
+  return { cleaned, errors };
+}
+
+async function taskOutputWithCleanup(teamDir, snapshot, fallback) {
+  const output = taskOutput(snapshot, fallback);
+  if (snapshot.result?.tool_sessions?.length) {
+    const cleanup = await cleanupToolSessions(teamDir, snapshot);
+    output.tool_sessions_cleaned = cleanup.cleaned;
+    output.tool_session_cleanup_errors = cleanup.errors;
+  }
+  return output;
+}
+
 async function syncStatus(teamDir, client, team) {
   const workers = [];
   let queued = 0;
@@ -261,7 +329,7 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
     }
     const snapshot = await waitForTask(client, requestId, timeout);
     await syncStatus(teamDir, client, team);
-    return taskOutput(snapshot, fallback);
+    return taskOutputWithCleanup(teamDir, snapshot, fallback);
   }
 
   let data; let worker; let task;
@@ -308,6 +376,8 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
     await save(teamDir, data);
   });
   await ensureObserver(teamDir, data, worker);
+  const toolTabsBefore = await muxOf(data).listToolTabs(data, data.isolate ? worker.worktree : data.worktree);
+  if (toolTabsBefore.length > 2048) throw new Error('team workspace contains too many tabs to verify temporary-tab ownership safely');
   const cwd = worker.cwd || data.cwd;
   const native = await nativeTask(team, worker, { prompt, teamDir, cwd });
   const spec = {
@@ -318,6 +388,7 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
       TEAM_BUILDING_WORKER: `${team}/${worker.id}`,
       TEAM_BUILDING_APPROVAL_TASK: approval || '',
       TEAM_BUILDING_DIFFICULTY: assignment.difficulty || '',
+      TEAM_BUILDING_TOOL_TABS_BEFORE: JSON.stringify(toolTabsBefore),
       TEAM_BUILDING_INTENT: assignment.intent || '',
       TEAM_BUILDING_ROUTER_MODEL: assignment.router_model || '',
       PATH: `${join(teamDir, 'shim')}:${process.env.PATH || ''}`,
@@ -336,7 +407,7 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
   await syncStatus(teamDir, client, team);
   const snapshot = await waitForTask(client, accepted.request_id, timeout);
   await syncStatus(teamDir, client, team);
-  const output = { ...taskOutput(snapshot, fallback), finished: now() };
+  const output = { ...(await taskOutputWithCleanup(teamDir, snapshot, fallback)), finished: now() };
   if (output.status !== 'unknown') await writeResult(teamDir, output);
   return output;
 }
@@ -857,7 +928,10 @@ async function assign(args) {
       if (args.model !== undefined) retry.model = args.model;
       const output = await runAssignment(teamDir, args.worker, prompt, args.timeout, args.max, 'task', args.approval, retry, args.detach);
       if (args.detach) console.log(output.task);
-      else printResult(output);
+      else {
+        printResult(output);
+        if (output.tool_session_cleanup_errors?.length) process.exitCode = 1;
+      }
       return;
     }
   }
@@ -931,7 +1005,10 @@ async function assign(args) {
   if (interrupted()) throw interrupted();
   const output = await runAssignment(teamDir, args.worker, prompt, args.timeout, args.max, 'task', args.approval, assignment, args.detach);
   if (args.detach) console.log(output.task);
-  else printResult(output);
+  else {
+    printResult(output);
+    if (output.tool_session_cleanup_errors?.length) process.exitCode = 1;
+  }
 }
 
 async function wait(args) {
@@ -979,10 +1056,11 @@ async function wait(args) {
     })))).filter(result => result.snapshot);
   }
   await syncStatus(teamDir, client, data.id);
-  const outputs = completed.map(({ entry, snapshot }) => ({
-    ...taskOutput(snapshot, { team: data.id, worker: entry.worker, task: entry.task, kind: entry.kind, log: entry.log }),
-    finished: now(),
-  }));
+  const outputs = [];
+  for (const { entry, snapshot } of completed) {
+    const fallback = { team: data.id, worker: entry.worker, task: entry.task, kind: entry.kind, log: entry.log };
+    outputs.push({ ...(await taskOutputWithCleanup(teamDir, snapshot, fallback)), finished: now() });
+  }
   for (const output of outputs) {
     if (output.status !== 'unknown') await writeResult(teamDir, output);
   }
@@ -990,13 +1068,13 @@ async function wait(args) {
     const latest = await load(teamDir);
     const mappings = { ...(latest.detached || {}) };
     for (const output of outputs) {
-      if (mappings[output.task]?.request_id === output.request_id) delete mappings[output.task];
+      if (mappings[output.task]?.request_id === output.request_id && !output.tool_session_cleanup_errors?.length) delete mappings[output.task];
     }
     latest.detached = mappings;
     await save(teamDir, latest);
   });
   for (const output of outputs) console.log(JSON.stringify(output));
-  if (!outputs.length || outputs.some(output => output.status !== 'succeeded') || (!args.any && outputs.length !== selected.length)) {
+  if (!outputs.length || outputs.some(output => output.status !== 'succeeded' || output.tool_session_cleanup_errors?.length) || (!args.any && outputs.length !== selected.length)) {
     process.exitCode = 1;
   }
 }

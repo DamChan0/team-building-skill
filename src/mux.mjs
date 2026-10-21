@@ -20,6 +20,12 @@ async function orca(...args) {
   }
 }
 
+async function orcaTerminals(worktree) {
+  const listing = await orca('terminal', 'list', '--worktree', `path:${worktree}`);
+  if (!Array.isArray(listing.terminals)) throw new OrcaError('terminal census returned no terminals');
+  return listing.terminals;
+}
+
 const orcaMux = {
   name: 'orca',
   label: 'Orca',
@@ -58,10 +64,16 @@ const orcaMux = {
   home: async () => ({}),
   // null when the tab is closed or missing.
   async inspect(data, handle, worktree) {
-    const listing = await orca('terminal', 'list', '--worktree', `path:${worktree}`);
-    if (!Array.isArray(listing.terminals)) throw new OrcaError('observer census returned no terminals');
-    const terminal = listing.terminals.find(item => item.handle === handle);
+    const terminal = (await orcaTerminals(worktree)).find(item => item.handle === handle);
     return terminal?.connected && !terminal.exitCause ? { orphaned: !!terminal.orphaned, title: terminal.title } : null;
+  },
+  async listToolTabs(data, worktree) {
+    const terminals = await orcaTerminals(worktree);
+    if (terminals.some(item => typeof item.handle !== 'string' || !item.handle)) throw new OrcaError('terminal census returned a terminal without a handle');
+    return terminals.map(item => item.handle);
+  },
+  async ownsToolTab(data, handle, worktree) {
+    return (await orcaTerminals(worktree)).some(item => item.handle === handle);
   },
   async create(data, { worktree, title, launch }) {
     // Shell preexec hooks overwrite --title; the launch command restores it.
@@ -108,6 +120,23 @@ async function workspaceOf(data, path) {
   const open = worktrees.find(item => item.path === path)?.open_workspace_id;
   return open ?? (await herdr(data.socket, 'worktree', 'open', '--cwd', path, '--path', path, '--no-focus')).workspace.workspace_id;
 }
+async function herdrTabs(data, worktree) {
+  let workspace = data.isolate
+    ? await workspaceOf(data, worktree)
+    : data.workspace || process.env.HERDR_WORKSPACE_ID;
+  if (!workspace) throw new OrcaError('team has no herdr workspace for tool-tab cleanup');
+  let listing;
+  try {
+    listing = await herdr(data.socket, 'tab', 'list', '--workspace', workspace);
+  } catch (error) {
+    if (data.isolate || error.code !== 'workspace_not_found') throw error;
+    workspace = await workspaceOf(data, worktree);
+    listing = await herdr(data.socket, 'tab', 'list', '--workspace', workspace);
+  }
+  if (!Array.isArray(listing.tabs)) throw new OrcaError('herdr tab census returned no tabs');
+  if (listing.tabs.some(tab => typeof tab.tab_id !== 'string' || !tab.tab_id)) throw new OrcaError('herdr tab census returned a tab without an ID');
+  return listing.tabs;
+}
 
 const herdrMux = {
   name: 'herdr',
@@ -136,6 +165,12 @@ const herdrMux = {
       if (/_not_found$/.test(error.code)) return null;
       throw error;
     }
+  },
+  async listToolTabs(data, worktree) {
+    return (await herdrTabs(data, worktree)).map(tab => tab.tab_id);
+  },
+  async ownsToolTab(data, handle, worktree) {
+    return (await herdrTabs(data, worktree)).some(tab => tab.tab_id === handle);
   },
   // herdr cannot start a command in a new tab, so the launch command goes into a script that the
   // tab's shell execs: when the program exits the pane (and its tab) closes with it.

@@ -5,6 +5,8 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 pub(crate) const VERSION: u8 = 1;
+pub(crate) const MAX_TOOL_SESSIONS: usize = 32;
+pub(crate) const MAX_TOOL_SESSION_ID: usize = 256;
 pub(crate) const MAX_FRAME: usize = 1024 * 1024;
 pub(crate) const MAX_TEXT: usize = 256 * 1024;
 
@@ -32,6 +34,13 @@ pub(crate) struct TaskSpec {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ToolSession {
+    pub(crate) kind: String,
+    pub(crate) id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TaskResult {
     pub(crate) status: String,
     pub(crate) summary: String,
@@ -45,6 +54,8 @@ pub(crate) struct TaskResult {
     pub(crate) blockers: Vec<String>,
     #[serde(default)]
     pub(crate) approval_requests: Vec<Value>,
+    #[serde(default)]
+    pub(crate) tool_sessions: Vec<ToolSession>,
     #[serde(default, deserialize_with = "result_string")]
     pub(crate) branch: String,
     #[serde(default, deserialize_with = "result_string")]
@@ -81,6 +92,16 @@ impl TaskResult {
         matches!(self.status.as_str(), "succeeded" | "failed" | "blocked")
             && self.summary.len() <= MAX_TEXT
             && self.verification.len() <= MAX_TEXT
+            && self.tool_sessions.len() <= MAX_TOOL_SESSIONS
+            && self.tool_sessions.iter().all(|session| {
+                session.kind == "tab"
+                    && !session.id.is_empty()
+                    && session.id.len() <= MAX_TOOL_SESSION_ID
+                    && session
+                        .id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+            })
             && serde_json::to_vec(self).is_ok_and(|bytes| bytes.len() <= MAX_TEXT)
     }
 }
@@ -187,5 +208,34 @@ mod tests {
     fn rejects_wrong_envelope_shape() {
         let frame = br#"{"version":1,"id":"00000000-0000-4000-8000-000000000001","type":"command","payload":{},"extra":true}"#;
         assert!(matches!(parse_command(frame), Err("invalid_envelope")));
+    }
+    #[test]
+    fn task_results_accept_only_bounded_tab_handles() {
+        let parse = |tool_sessions| {
+            serde_json::from_value::<TaskResult>(json!({
+                "status": "succeeded",
+                "summary": "ok",
+                "verification": "done",
+                "tool_sessions": tool_sessions,
+            }))
+            .unwrap()
+        };
+        let legacy = serde_json::from_value::<TaskResult>(json!({
+            "status": "succeeded",
+            "summary": "ok",
+            "verification": "done",
+        }))
+        .unwrap();
+        assert!(legacy.valid());
+        assert!(parse(json!([])).valid());
+        assert!(parse(json!([{"kind":"tab","id":"term_123"}])).valid());
+        assert!(!parse(json!([{"kind":"claude","id":"session_123"}])).valid());
+        assert!(!parse(json!([{"kind":"tab","id":"bad/id"}])).valid());
+        assert!(!parse(json!([{"kind":"tab","id":""}])).valid());
+        assert!(!parse(json!(vec![
+            json!({"kind":"tab","id":"term_123"});
+            MAX_TOOL_SESSIONS + 1
+        ]))
+        .valid());
     }
 }

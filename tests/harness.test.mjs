@@ -72,6 +72,10 @@ test('OMP workers launch as interactive tabs; native launches pin only exact Cla
   const resumed = await claude({ session_id: pinned });
   const resumeIndex = resumed.argv.indexOf('--resume');
   assert.deepEqual(resumed.argv.slice(resumeIndex, resumeIndex + 2), ['--resume', pinned]);
+  const schemaIndex = fresh.argv.indexOf('--json-schema');
+  const schema = JSON.parse(fresh.argv[schemaIndex + 1]);
+  assert.ok(schema.required.includes('tool_sessions'));
+  assert.deepEqual(schema.properties.tool_sessions.items.required, ['kind', 'id']);
 });
 
 

@@ -1,6 +1,6 @@
 # team-building
 
-- **Release:** [v0.5.2](https://github.com/DamChan0/team-building-skill/releases/tag/v0.5.2)
+- **Release:** [v0.5.3](https://github.com/DamChan0/team-building-skill/releases/tag/v0.5.3)
 - Persistent AI-worker teams managed from one session.
 - **Manager hosts:** OMP, Pi, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
 - **OMP is not needed when Pi, Claude Code, or Codex is the manager and you select native workers.** OMP remains the default worker backend.
@@ -40,6 +40,7 @@ sequenceDiagram
 - **Worker tabs:** An OMP worker's tab *is* the worker: the full interactive session, resumed from its recorded session file. Claude/Codex tabs are read-only observers showing one typed UI summary line per finished task and never receive native protocol traffic or `TaskResult` JSON.
 - Closing an OMP worker tab ends that worker (a running task becomes `failed: worker tab exited`); the session file survives. The next assignment, `member <current N>`, or `init` re-adoption reopens the tab and resumes the same session. Closing a Claude/Codex observer does not stop its worker. Connected tabs are reused. A live Orca tab without a pane produces a warning instead of launching another; use `orca-ide terminal switch --terminal <handle>` to reveal it.
 - Typing into an OMP worker tab while a task runs is allowed but unsupervised: its output is part of that task's final message. The extension needs `team-role.ts` installed (`node install.mjs`) before the tab starts, and omp tab titles are managed by omp itself (`<team-id> <worker-id> observer` applies only to Claude/Codex).
+- **Temporary tool tabs:** The manager snapshots the team's tabs before each assignment. Workers report only disposable tab IDs they created in `tool_sessions`; after the result, the manager closes only tabs absent from that snapshot and refuses registered worker tabs or tabs outside the team's workspace. Existing manager/user tabs stay open. Workers close non-tab helper sessions through their owning tool. Cleanup failures appear as `tool_session_cleanup_errors`; detached tasks remain available for retry.
 - **Local IPC:** every request uses an object envelope such as `{ "version": 1, "id": "<uuid>", "type": "<command>", "payload": { ... } }`.
   - Envelopes and payloads must be objects; scalar requests are rejected.
   - Responses and events are correlated objects.

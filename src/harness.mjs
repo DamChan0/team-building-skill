@@ -215,9 +215,10 @@ Rules:
 - You are not the lead. The manager triages and reviews your result, so skip lead-only startup: do not read ~/.codex/orchestration.md or output-style skills (caveman), and do not run an independent-review gate.
 - Do not ask the user. If blocked, return status "blocked" and state the exact need.
 - Touch only assigned files. Delete only paths explicitly allowed by the brief or files you created; never delete a directory wholesale or rewrite git history.
+- Keep this worker's persistent session/tab. Extra tabs opened for MCP/tool access are temporary: create them in the team's managed workspace, and include each exact handle in tool_sessions only if it was absent from the manager's pre-assignment tab census. The manager closes listed tabs after receiving your result. Close tabs opened elsewhere and non-tab helper sessions through their owning tool after use. Never list this worker's tab, another worker's tab, the manager's tab, or any tab you did not create.
 - External/gated commands need manager approval. If not approved, do not retry; return a blocked result with approval_requests containing the exact command argv, target, and reason. Local commands need no approval.
 - In an isolated worktree, make a local commit and report its branch and commit. Never push.
-- Return exactly one JSON object, without prose or Markdown, containing status ("succeeded", "failed", or "blocked"), summary, files_changed, files_deleted, verification, blockers, approval_requests, branch, and commit. summary, verification, branch, and commit must be strings; use "\\n" inside verification for multiple checks and "" for unavailable branch/commit, never null. files_changed, files_deleted, and blockers must be arrays of strings; approval_requests must be an array of request objects; use [] when empty. Do not write a result file; the supervisor receives the structured native result.`;
+- Return exactly one JSON object, without prose or Markdown, containing status ("succeeded", "failed", or "blocked"), summary, files_changed, files_deleted, verification, blockers, approval_requests, tool_sessions, branch, and commit. tool_sessions is an array of {"kind":"tab","id":"<opaque handle>"} objects; use [] when none. summary, verification, branch, and commit must be strings; use "\\n" inside verification for multiple checks and "" for unavailable branch/commit, never null. files_changed, files_deleted, and blockers must be arrays of strings; approval_requests must be an array of request objects; use [] when empty. Do not write a result file; the supervisor receives the structured native result.`;
 export function launchConfig(worker) {
   return { model: worker.task_model ?? worker.model ?? null, thinking: worker.task_thinking ?? null };
 }
@@ -241,7 +242,35 @@ export async function nativeTask(team, worker, { prompt, teamDir, cwd }) {
     return { argv: [], env: {}, thinking: configuredThinking ?? await defaultOmpThinking() };
   }
   if (harness === 'claude') {
-    const schema = JSON.stringify({ type: 'object', additionalProperties: false, required: ['status', 'summary', 'files_changed', 'files_deleted', 'verification', 'blockers', 'approval_requests', 'branch', 'commit'], properties: { status: { enum: ['succeeded', 'failed', 'blocked'] }, summary: { type: 'string' }, files_changed: { type: 'array', items: { type: 'string' } }, files_deleted: { type: 'array', items: { type: 'string' } }, verification: { type: 'string' }, blockers: { type: 'array', items: { type: 'string' } }, approval_requests: { type: 'array' }, branch: { type: 'string' }, commit: { type: 'string' } } });
+    const schema = JSON.stringify({
+      type: 'object',
+      additionalProperties: false,
+      required: ['status', 'summary', 'files_changed', 'files_deleted', 'verification', 'blockers', 'approval_requests', 'tool_sessions', 'branch', 'commit'],
+      properties: {
+        status: { enum: ['succeeded', 'failed', 'blocked'] },
+        summary: { type: 'string' },
+        files_changed: { type: 'array', items: { type: 'string' } },
+        files_deleted: { type: 'array', items: { type: 'string' } },
+        verification: { type: 'string' },
+        blockers: { type: 'array', items: { type: 'string' } },
+        approval_requests: { type: 'array' },
+        tool_sessions: {
+          type: 'array',
+          maxItems: 32,
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['kind', 'id'],
+            properties: {
+              kind: { enum: ['tab'] },
+              id: { type: 'string', minLength: 1, maxLength: 256, pattern: '^[A-Za-z0-9._:-]+$' },
+            },
+          },
+        },
+        branch: { type: 'string' },
+        commit: { type: 'string' },
+      },
+    });
     const argv = ['claude', '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--replay-user-messages', '--json-schema', schema, '--append-system-prompt', instruction];
     if (worker.allow_bypass) argv.push(HARNESSES.claude.bypass);
     argv.push(...(worker.session_id ? ['--resume', worker.session_id] : ['--session-id', randomUUID()]));

@@ -25,8 +25,8 @@ use store::{Completion, Store, TaskSnapshot};
 const MAX_CONNECTIONS: usize = 32;
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
-// Bump when a submit payload change makes a daemon incompatible with its CLI.
-const COMPATIBILITY_MARKER: u8 = 2;
+// Bump when the manager/supervisor worker-result or submit contract changes incompatibly.
+const COMPATIBILITY_MARKER: u8 = 3;
 
 #[derive(Parser)]
 struct Cli {
