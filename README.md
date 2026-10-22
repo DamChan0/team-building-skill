@@ -1,6 +1,6 @@
 # team-building
 
-- **Release:** [v0.5.3](https://github.com/DamChan0/team-building-skill/releases/tag/v0.5.3)
+- **Release:** [v0.5.4](https://github.com/DamChan0/team-building-skill/releases/tag/v0.5.4)
 - Persistent AI-worker teams managed from one session.
 - **Manager hosts:** OMP, Pi, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
 - **OMP is not needed when Pi, Claude Code, or Codex is the manager and you select native workers.** OMP remains the default worker backend.
@@ -162,19 +162,22 @@ node ~/.agents/skills/team-building/src/main.mjs init --harness codex --allow-by
 ## Commands and recovery
 
 ```sh
-node ~/.agents/skills/team-building/src/main.mjs init [gpt|claude] [--member N] [--model M] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
+node ~/.agents/skills/team-building/src/main.mjs init [gpt|claude] [--name NAME] [--team ID|NAME] [--member N] [--model M] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
 node ~/.agents/skills/team-building/src/main.mjs member N [--model M] [--harness H] [--allow-bypass]
 node ~/.agents/skills/team-building/src/main.mjs dismiss --worker wN[,wM...]
-node ~/.agents/skills/team-building/src/main.mjs status [--team ID]
-node ~/.agents/skills/team-building/src/main.mjs assign [--detach] [--worker wN] [--approval tNNN] [--request-id UUID] [--model M] [--difficulty TIER] PROMPT
+node ~/.agents/skills/team-building/src/main.mjs status [--team ID|NAME]
+node ~/.agents/skills/team-building/src/main.mjs assign [--team ID|NAME] [--detach] [--worker wN] [--approval tNNN] [--request-id UUID] [--model M] [--difficulty TIER] PROMPT
 node ~/.agents/skills/team-building/src/main.mjs wait [--task tNNN[,tMMM]] [--worker wN] [--all|--any] [--timeout S]
 node ~/.agents/skills/team-building/src/main.mjs approve --worker wN --task tNNN -- COMMAND...
-node ~/.agents/skills/team-building/src/main.mjs stop --worker wN [--team ID]
-node ~/.agents/skills/team-building/src/main.mjs clear [--team ID] [--fast]
+node ~/.agents/skills/team-building/src/main.mjs stop --worker wN [--team ID|NAME]
+node ~/.agents/skills/team-building/src/main.mjs clear [--team ID|NAME] [--fast]
 ```
 
-- One team per absolute manager path. `init` adopts the current path's team; teams only at other paths make `init` exit 3 until rerun with `--clear-previous` or `--keep-previous`.
-- Without `--team`, commands select the current path's team.
+- Same-path teams: `init --name team1` and `init --name team2` create independent teams; repeat a name to adopt that team. Run `assign --team team1 "..."` or `assign --team team2 "..."` to choose one explicitly.
+- Names are lowercase slugs (`a-z`, digits, `_`, `-`), unique among active teams on the current backend; values matching generated team IDs are reserved. Without `--team`, a command uses the current path only when exactly one team matches; otherwise it asks for a selector.
+- Teams at other paths still require `--clear-previous` or `--keep-previous` before creating a new team.
+
+- `--team` accepts the generated team ID or a name.
 - `--timeout` is the idle timeout (default 1200 seconds); `--max` is the absolute cap (default 14400 seconds).
 - A 60-second supervisor wait checkpoint is not a worker failure.
 - Workers receive `PWD` matching their configured cwd; OMP also receives `--cwd` so launches from the home directory do not relocate to `/tmp`.

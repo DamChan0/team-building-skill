@@ -5,7 +5,7 @@ description: >
   that fits: do it inline, one-shot subagent, small team, or parallel team. Use for team init/status/
   clear/member, explicit worker assignments such as “w1에게 …”, Korean requests containing 팀, 작업자,
   워커, or wN, or any task where weight vs. cost needs a decision. Workers may use OMP, Claude Code, or Codex.
-argument-hint: <task> | init claude --member 3 | member 4 | status | clear | assign --worker w1 <task>
+argument-hint: <task> | init claude --member 3 | member 4 | status | clear | assign --team NAME --worker w1 <task>
 ---
 
 # team-building
@@ -24,6 +24,7 @@ Judge from the task, not its length. No classifier call needed for tier 0/1.
 | **3 heavy** | Security, concurrency, architecture, root cause, or ≥3 independent slices | `init --member N` (N = independent slices, ≤4) → parallel `assign --worker wK` | yes, N workers |
 
 - Team exists already (`status`) → reuse it for tier 2/3; never `init` for tier 0/1.
+- Multiple same-path teams: run `status --team NAME` and pass the same `--team NAME` to `assign`; never rely on implicit selection.
 - Measured cost (OMP workers): `init` ≈1.3s warm / 3.8s cold model catalog; idle team ≈10MB; each *running* worker ≈500MB RSS and ≥6s per task; `clear --fast` ≈1s vs ≈9s with model wrap-up. Pass `--fast` unless final summaries are needed.
 - **Escalate, don't over-provision.** Start at the lowest plausible tier; if the result is `blocked`, fails its Verify, or shows unexpected scope, re-route one tier up (tier 1 → tier 2; same worker `--difficulty complex|extreme` for model strength). **De-escalate** when a team sits idle: `dismiss` surplus workers, `clear` when done.
 - Model strength is separate from team size: `--difficulty simple|moderate|complex|extreme` picks the model tier (routed OMP teams only; native Claude/Codex teams ignore routing); omit it and Jev (~0.2s, needs `TYPESAFE_API_KEY`) or the OMP classifier (~5s) decides. Jev sends the brief text to api.typesafe.ai: with sensitive briefs pass `--difficulty` or set `TYPESAFE_API_KEY=` empty. GPT: Luna Max / Terra / Sol / Astra; Claude: Sonnet / Sonnet / Opus / Opus xhigh.
@@ -32,13 +33,15 @@ Judge from the task, not its length. No classifier call needed for tier 0/1.
 
 | Request | Command |
 |---|---|
-| `init [gpt\|claude] [--member N] [--model M] [--harness omp\|claude\|codex] [--allow-bypass] [--isolate] [--clear-previous\|--keep-previous]` | Defaults: 3 OMP workers, GPT routing. Adopts this path's team. Exit 3 = teams at other paths: ask user, rerun with `--clear-previous` or `--keep-previous`. Pass `--member` explicitly; do not accept the default 3 for tier 2. |
-| `member N` / `dismiss --worker wN[,wM]` | Resize / retire idle workers; `member` restores missing tabs. |
-| `status [--team ID]` | Workers, state, queue. Run first in a new manager session, then `init` to adopt. |
-| `assign [--detach] [--worker wN] [--difficulty TIER] [--model M] [--approval tNNN] PROMPT` | Blocks until a structured result by default; `--detach` submits durable work and prints only its task ID. |
+| `init [gpt\|claude] [--name NAME] [--team ID\|NAME] [--member N] [--model M] [--harness omp\|claude\|codex] [--allow-bypass] [--isolate] [--clear-previous\|--keep-previous]` | Creates another team with `--name` even at this path; repeating a name adopts it. Without a selector, adopts the only team at this path. Teams at other paths still require `--clear-previous` or `--keep-previous`. |
+| `member N` / `dismiss --worker wN[,wM...]` | Resize / retire idle workers; `member` restores missing tabs. |
+| `status [--team ID\|NAME]` | Workers, state, queue. Run first in a new manager session, then `init` to adopt. |
+| `assign [--team ID\|NAME] [--detach] [--worker wN] [--difficulty TIER] [--model M] [--approval tNNN] PROMPT` | Blocks until a structured result by default; `--detach` submits durable work and prints only its task ID. |
 | `approve --worker wN --task tNNN -- COMMAND...` | Record a user-approved gated command. |
 | `wait [--task tNNN[,tMMM]] [--worker wN] [--all\|--any] [--timeout S]` | Wait for detached work (all by default) and print one compact JSON result per completed task. |
-| `clear [--team ID] [--fast]` | Wrap up and remove the team; `--fast` uses each worker's latest recorded task result instead of a model wrap-up turn. |
+| `clear [--team ID\|NAME] [--fast]` | Wrap up and remove the team; `--fast` uses each worker's latest recorded task result instead of a model wrap-up turn. |
+
+Team names are lowercase slugs (`a-z`, digits, `_`, `-`), unique among active teams on the current backend; values matching generated team IDs are reserved. All team-scoped commands accept `--team ID|NAME`; without it, the current path must have exactly one team.
 
 Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|codex` needs `--allow-bypass`. Workers live in Orca tabs, or herdr tabs when the manager runs inside a herdr pane (`HERDR_ENV=1`); a team stays bound to its creating backend (other backend: exit 4; `status`/`init` list only this backend's teams). An OMP worker's tab is the worker itself (live interactive session); closing it ends the worker, and `member <current N>` or the next `assign` reopens it with the same session. Claude/Codex tabs are read-only observers; closing one does not stop the worker.
 

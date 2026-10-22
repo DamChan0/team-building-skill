@@ -10,6 +10,8 @@ export const POINTERS = join(homedir(), '.omp/agent/custom-session-files');
 export const DEFAULT_TIMEOUT = 1200;
 export const DEFAULT_MAX = 14400;
 export const WORKER_ENV = 'TEAM_BUILDING_WORKER';
+export const TEAM_ID_PATTERN = /^tb-\d{4}-\d{6}(?:-\d+)?$/;
+export const TEAM_NAME_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 export const GATED = ['git', 'ssh', 'scp', 'rsync', 'sftp', 'gh', 'docker'];
 export const backendName = () => (process.env.HERDR_ENV === '1' ? 'herdr' : 'orca');
 
@@ -56,34 +58,35 @@ export async function activeTeams() {
 }
 
 export async function resolveTeam(id, die, cwd) {
-  if (id) {
-    if (!/^tb-\d{4}-\d{6}$/.test(id)) {
-      die(`bad team id ${JSON.stringify(id)} (expected tb-MMDD-HHMMSS)`);
-    }
+  if (id && TEAM_ID_PATTERN.test(id)) {
     const dir = join(STATE_ROOT, id);
-    if (!(await exists(join(dir, 'team.json')))) {
-      die(`no team ${JSON.stringify(id)} under ${STATE_ROOT}`);
-    }
+    if (!(await exists(join(dir, 'team.json')))) die(`no team ${JSON.stringify(id)} under ${STATE_ROOT}`);
     return dir;
   }
 
-  const teams = await activeTeams();
-  if (!teams.length) die('no active team; run `team-building init` first');
+  const active = await Promise.all((await activeTeams()).map(async dir => ({ dir, data: await load(dir) })));
+  const label = ({ data }) => data.name ? `${data.name} (${data.id})` : data.id;
+  if (id) {
+    const matches = active.filter(team => team.data.name === id);
+    if (matches.length === 1) return matches[0].dir;
+    if (matches.length > 1) die(`team name ${JSON.stringify(id)} is ambiguous; select a team ID`);
+    die(`no team ${JSON.stringify(id)} under ${STATE_ROOT}; active teams: ${active.map(label).join(', ') || '(none)'}`);
+  }
+
+  if (!active.length) die('no active team; run `team-building init` first');
   const path = cwd && await realpath(cwd);
   if (path) {
-    for (const team of teams) {
-      if ((await load(team)).cwd === path) return team;
+    const matches = active.filter(team => team.data.cwd === path);
+    if (matches.length === 1) return matches[0].dir;
+    if (matches.length > 1) {
+      die(`multiple teams for cwd ${path}; pass --team <id|name>: ${matches.map(label).join(', ')}`);
     }
-    const active = await Promise.all(teams.map(async team => {
-      const data = await load(team);
-      return `${data.id} (${data.cwd || 'legacy: no cwd'})`;
-    }));
-    die(`no active team for cwd ${path}; active teams: ${active.join(', ')}; run \`team-building init\` or pass --team <id>`);
+    die(`no active team for cwd ${path}; active teams: ${active.map(team => `${label(team)} (${team.data.cwd || 'legacy: no cwd'})`).join(', ')}; run \`team-building init\` or pass --team <id|name>`);
   }
-  if (teams.length > 1) {
-    die(`several teams active, pass --team: ${teams.map(team => team.split('/').pop()).join(', ')}`);
+  if (active.length > 1) {
+    die(`several teams active, pass --team: ${active.map(label).join(', ')}`);
   }
-  return teams[0];
+  return active[0].dir;
 }
 
 export function failed(summary, blockers = []) {

@@ -278,10 +278,11 @@ console.log(JSON.stringify({ ok: true, result }));
   }
 });
 
-test('keeps one team per path and creates observers for new workers', async () => {
+test('supports named teams at the same path and creates observers for new workers', async () => {
   const home = await mkdtemp(join(tmpdir(), 'team-building-paths-'));
   const root = join(home, 'worktree');
   const first = join(root, 'first');
+  const bin = join(home, 'bin');
   const second = join(root, 'second');
   const stateRoot = join(home, '.local', 'state', 'team-building');
   const calls = join(home, 'orca-calls.jsonl');
@@ -291,7 +292,7 @@ test('keeps one team per path and creates observers for new workers', async () =
     cwd,
     encoding: 'utf8',
     timeout: 10_000,
-    env: { ...process.env, HERDR_ENV: '', HOME: home, OMP_SESSION_ID: '', PI_SESSION_ID: 'pi-session-fixture', ORCA_CLI_COMMAND: orca, ORCA_TEST_CALLS: calls, ORCA_TEST_TERMINALS: terminals },
+    env: { ...process.env, HERDR_ENV: '', HOME: home, OMP_SESSION_ID: '', PI_SESSION_ID: 'pi-session-fixture', ORCA_CLI_COMMAND: orca, ORCA_TEST_CALLS: calls, ORCA_TEST_TERMINALS: terminals, PATH: `${bin}:${process.env.PATH || ''}` },
   });
   const paths = supervisorPaths(stateRoot);
   const client = new Supervisor(paths);
@@ -313,9 +314,7 @@ test('keeps one team per path and creates observers for new workers', async () =
       readiness.close();
       daemon.stdout.destroy();
     }
-    await mkdir(first, { recursive: true });
-    await mkdir(second, { recursive: true });
-    await mkdir(join(root, 'missing'));
+    await Promise.all([mkdir(bin, { recursive: true }), mkdir(first, { recursive: true }), mkdir(second, { recursive: true }), mkdir(join(root, 'missing'), { recursive: true })]);
     await writeFile(orca, `#!/usr/bin/env node
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 const args = process.argv.slice(2, -1);
@@ -326,63 +325,123 @@ let result;
 if (args[0] === 'worktree') result = { worktree: { path: ${JSON.stringify(root)} } };
 else if (args[0] === 'terminal' && args[1] === 'list') result = { terminals };
 else if (args[0] === 'terminal' && args[1] === 'create') {
-  const terminal = { handle: 'observer-' + Date.now(), connected: true, orphaned: false };
+  const terminal = { handle: 'observer-' + process.pid + '-' + Date.now(), connected: true, orphaned: false };
   terminals.push(terminal);
   writeFileSync(state, JSON.stringify(terminals));
   result = { terminal };
 } else result = { app: { running: true }, runtime: { reachable: true } };
 console.log(JSON.stringify({ ok: true, result }));
 `);
-    await chmod(orca, 0o755);
-    const teamIds = async () => (await readdir(stateRoot)).filter(team => /^tb-/.test(team));
-
-
-    const created = run(first, 'init', '--harness', 'claude', '--allow-bypass', '--member', '1');
+    const claude = join(bin, 'claude');
+    await writeFile(claude, `#!/usr/bin/env node
+import { createInterface } from 'node:readline';
+const input = createInterface({ input: process.stdin });
+input.once('line', line => {
+  const request = JSON.parse(line);
+  console.log(JSON.stringify({ type: 'user', uuid: request.uuid }));
+  console.log(JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    session_id: 'fixture-session',
+    structured_output: {
+      status: 'succeeded',
+      summary: process.env.TEAM_BUILDING_WORKER,
+      verification: 'fixture',
+      tool_sessions: [],
+    },
+  }));
+});
+`);
+    await Promise.all([chmod(orca, 0o755), chmod(claude, 0o755)]);
+    const teamIds = async () => (await readdir(stateRoot)).filter(team => /^tb-/.test(team)).sort();
+    const created = run(first, 'init', '--name', 'team1', '--harness', 'claude', '--allow-bypass', '--member', '1');
     assert.equal(created.status, 0, created.stderr);
     const [firstTeam] = await teamIds();
-    assert.equal(JSON.parse(await readFile(join(stateRoot, firstTeam, 'team.json'), 'utf8')).cwd, first);
-    assert.equal(JSON.parse(await readFile(join(stateRoot, firstTeam, 'team.json'), 'utf8')).manager_session, 'pi-session-fixture');
+    const firstData = JSON.parse(await readFile(join(stateRoot, firstTeam, 'team.json'), 'utf8'));
+    assert.equal(firstData.cwd, first);
+    assert.equal(firstData.name, 'team1');
+    assert.equal(firstData.manager_session, 'pi-session-fixture');
+    for (const name of ['Team 1', 'tb-0101-000000']) {
+      const invalidName = run(first, 'init', '--name', name, '--harness', 'claude', '--allow-bypass');
+      assert.equal(invalidName.status, 2);
+      assert.match(invalidName.stderr, /--name must/);
+    }
+    assert.deepEqual(await teamIds(), [firstTeam]);
 
-    const adopted = run(first, 'init', '--harness', 'claude', '--allow-bypass');
+    const adopted = run(first, 'init', '--name', 'team1', '--harness', 'claude', '--allow-bypass');
     assert.equal(adopted.status, 0, adopted.stderr);
     assert.deepEqual(await teamIds(), [firstTeam]);
     const firstPath = join(stateRoot, firstTeam, 'team.json');
     const originalWorker = JSON.parse(await readFile(firstPath, 'utf8')).workers.w1;
-    const sameSize = run(first, 'member', '1', '--allow-bypass');
+    const sameSize = run(first, 'member', '1', '--allow-bypass', '--team', 'team1');
     assert.equal(sameSize.status, 0, sameSize.stderr);
     assert.equal(JSON.parse(await readFile(firstPath, 'utf8')).workers.w1.observer, originalWorker.observer);
     await writeFile(terminals, '[]');
-    const reopened = run(first, 'member', '1', '--allow-bypass');
+    const reopened = run(first, 'member', '1', '--allow-bypass', '--team', 'team1');
     assert.equal(reopened.status, 0, reopened.stderr);
     assert.match(reopened.stderr, /warning:.*w1.*observer.*recreat/i);
     const repairedWorker = JSON.parse(await readFile(firstPath, 'utf8')).workers.w1;
     assert.notEqual(repairedWorker.observer, originalWorker.observer);
     assert.deepEqual({ ...repairedWorker, observer: originalWorker.observer }, originalWorker);
     await writeFile(terminals, '[]');
-    const readopted = run(first, 'init', '--harness', 'claude', '--allow-bypass');
+    const readopted = run(first, 'init', '--team', 'team1', '--harness', 'claude', '--allow-bypass');
     assert.equal(readopted.status, 0, readopted.stderr);
     assert.notEqual(JSON.parse(await readFile(firstPath, 'utf8')).workers.w1.observer, repairedWorker.observer);
+
+    const createdSecond = run(first, 'init', '--name', 'team2', '--harness', 'claude', '--allow-bypass', '--member', '1');
+    assert.equal(createdSecond.status, 0, createdSecond.stderr);
+    const samePathTeams = await teamIds();
+    assert.equal(samePathTeams.length, 2);
+    const secondTeam = samePathTeams.find(team => team !== firstTeam);
+    const secondData = JSON.parse(await readFile(join(stateRoot, secondTeam, 'team.json'), 'utf8'));
+    assert.equal(secondData.name, 'team2');
+    assert.equal(secondData.cwd, first);
+    const adoptedSecond = run(first, 'init', '--name', 'team2', '--harness', 'claude', '--allow-bypass');
+    assert.equal(adoptedSecond.status, 0, adoptedSecond.stderr);
+    assert.deepEqual(await teamIds(), samePathTeams);
+
+    const selectedStatus = run(first, 'status', '--team', 'team2');
+    assert.equal(selectedStatus.status, 0, selectedStatus.stderr);
+    assert.ok(selectedStatus.stdout.includes(`team team2 (${secondTeam})`));
+    const ambiguous = run(first, 'status');
+    assert.equal(ambiguous.status, 2);
+    assert.match(ambiguous.stderr, /multiple teams.*--team <id\|name>.*team1.*team2/);
+    const resized = run(first, 'member', '2', '--allow-bypass', '--team', 'team2');
+    assert.equal(resized.status, 0, resized.stderr);
+    assert.equal(Object.keys(JSON.parse(await readFile(join(stateRoot, secondTeam, 'team.json'), 'utf8')).workers).length, 2);
+
+    for (const [name, id] of [['team1', firstTeam], ['team2', secondTeam]]) {
+      const assigned = run(first, 'assign', '--team', name, '--worker', 'w1', `verify ${name} selection`);
+      assert.equal(assigned.status, 0, assigned.stderr);
+      const result = JSON.parse(assigned.stdout.slice(assigned.stdout.indexOf('\n') + 1));
+      assert.equal(result.team, id);
+      assert.equal(result.summary, `${id}/w1`);
+    }
 
     const refused = run(second, 'init', '--harness', 'claude', '--allow-bypass');
     assert.equal(refused.status, 3);
     assert.match(refused.stderr, new RegExp(`${firstTeam}.*${first}`));
     assert.match(refused.stderr, /--clear-previous.*--keep-previous/);
-    assert.deepEqual(await teamIds(), [firstTeam]);
+    const duplicateName = run(second, 'init', '--name', 'team1', '--harness', 'claude', '--allow-bypass');
+    assert.equal(duplicateName.status, 2);
+    assert.match(duplicateName.stderr, /team name "team1" is already used/);
+    assert.equal((await teamIds()).length, 2);
 
     const kept = run(second, 'init', '--harness', 'claude', '--allow-bypass', '--keep-previous', '--member', '1');
     assert.equal(kept.status, 0, kept.stderr);
     const teams = await teamIds();
-    assert.equal(teams.length, 2);
-    const secondTeam = teams.find(team => team !== firstTeam);
-    assert.equal(JSON.parse(await readFile(join(stateRoot, secondTeam, 'team.json'), 'utf8')).cwd, second);
+    assert.equal(teams.length, 3);
+    const secondPathTeam = teams.find(team => team !== firstTeam && team !== secondTeam);
+    assert.ok(secondPathTeam);
+    assert.equal(JSON.parse(await readFile(join(stateRoot, secondPathTeam, 'team.json'), 'utf8')).cwd, second);
 
     const selected = run(second, 'member', '2', '--allow-bypass');
     assert.equal(selected.status, 0, selected.stderr);
-    assert.equal(Object.keys(JSON.parse(await readFile(join(stateRoot, secondTeam, 'team.json'), 'utf8')).workers).length, 2);
+    assert.equal(Object.keys(JSON.parse(await readFile(join(stateRoot, secondPathTeam, 'team.json'), 'utf8')).workers).length, 2);
 
     const missing = run(join(root, 'missing'), 'status');
     assert.equal(missing.status, 2);
-    assert.match(missing.stderr, /run `team-building init` or pass --team <id>/);
+    assert.match(missing.stderr, /run `team-building init` or pass --team <id\|name>/);
     assert.match(await readFile(calls, 'utf8'), /"terminal","create"/);
   } finally {
     try {

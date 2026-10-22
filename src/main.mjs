@@ -24,6 +24,8 @@ import {
   resolveTeam,
   save,
   STATE_ROOT,
+  TEAM_ID_PATTERN,
+  TEAM_NAME_PATTERN,
   withLock,
   backendName,
   WORKER_ENV,
@@ -64,6 +66,10 @@ function backendMismatchError(data) {
   const recorded = data.backend || 'orca';
   if (recorded === backendName()) return null;
   return `team ${data.id} was created under ${recorded}; run it from ${recorded === 'herdr' ? 'a herdr pane' : 'Orca (not inside a herdr pane)'}`;
+}
+
+function teamLabel(data) {
+  return data.name ? `${data.name} (${data.id})` : data.id;
 }
 
 function workerIndex(id) {
@@ -493,7 +499,7 @@ export async function show(teamDir) {
   const client = await connectSupervisor(STATE_ROOT);
   const status = await syncStatus(teamDir, client, team);
   const data = await load(teamDir);
-  console.log(`team ${data.id}  cwd=${data.cwd}  model=${data.model || 'routed/default'}  router=${data.router?.enabled ? data.router.family : 'off'}  state=${teamDir}`);
+  console.log(`team ${teamLabel(data)}  cwd=${data.cwd}  model=${data.model || 'routed/default'}  router=${data.router?.enabled ? data.router.family : 'off'}  state=${teamDir}`);
   if (data.router?.enabled) {
     console.log(`  classifier=${data.router.classifier} checked=${data.router.checked_at} simple=${data.router.models.simple.model} moderate=${data.router.models.moderate.model} complex=${data.router.models.complex.model} extreme=${data.router.models.extreme?.model || 'init required'}`);
   }
@@ -640,9 +646,30 @@ async function init(args) {
 
   const cwd = realpathSync(process.cwd());
   const muxName = backendName();
+  if (args.name !== undefined && args.team) die('init accepts either --name or --team, not both');
+  if (args.name !== undefined && (!TEAM_NAME_PATTERN.test(args.name) || TEAM_ID_PATTERN.test(args.name))) {
+    die('--name must be 1-32 lowercase letters, numbers, underscores, or hyphens; it cannot look like a team ID');
+  }
   const teams = await activeTeams();
   const active = await Promise.all(teams.map(async teamDir => ({ teamDir, data: await load(teamDir) })));
-  const existing = active.find(team => team.data.cwd === cwd);
+  let existing;
+  if (args.team) {
+    const matches = active.filter(team => team.data.id === args.team || team.data.name === args.team);
+    if (matches.length !== 1) die(`init --team must select one existing team; no unique team ${JSON.stringify(args.team)} found`);
+    existing = matches[0];
+    if (existing.data.cwd !== cwd) die(`team ${teamLabel(existing.data)} belongs to cwd ${existing.data.cwd}; run init from that path`);
+  } else if (args.name) {
+    const matches = active.filter(team => team.data.name === args.name);
+    if (matches.length > 1) die(`team name ${JSON.stringify(args.name)} is already ambiguous; select a team ID`);
+    if (matches.length === 1) {
+      existing = matches[0];
+      if (existing.data.cwd !== cwd) die(`team name ${JSON.stringify(args.name)} is already used at ${existing.data.cwd}; choose another name`);
+    }
+  } else {
+    const samePath = active.filter(team => team.data.cwd === cwd);
+    if (samePath.length > 1) die(`multiple teams for cwd ${cwd}; pass --team <id|name> to adopt one`);
+    existing = samePath[0];
+  }
   let approvalMode;
   if (existing) {
     approvalMode = await approvalModePromise;
@@ -652,7 +679,7 @@ async function init(args) {
     const teamDir = existing.teamDir;
     const adoptMismatch = backendMismatchError(existing.data);
     if (adoptMismatch) die(adoptMismatch, 4);
-    console.log(`adopted existing team ${basename(teamDir)} for cwd ${cwd}`);
+    console.log(`adopted existing team ${teamLabel(existing.data)} for cwd ${cwd}`);
     // The adopting session becomes the manager; role widgets key on this id.
     await withLock(teamDir, async () => {
       const data = await load(teamDir);
@@ -702,10 +729,11 @@ async function init(args) {
     die(`tools.approvalMode is ${JSON.stringify(approvalMode)}; omp workers need yolo because nobody can answer their prompts.`, 3);
   }
 
-  if (active.length && !args.clearPrevious && !args.keepPrevious) {
-    const previous = active.map(({ data }) => {
+  const otherPaths = active.filter(({ data }) => data.cwd !== cwd);
+  if (otherPaths.length && !args.clearPrevious && !args.keepPrevious) {
+    const previous = otherPaths.map(({ data }) => {
       const busy = Object.values(data.workers || {}).filter(worker => worker.state === 'busy').length;
-      return `${data.id} cwd=${data.cwd || 'legacy: no cwd'} busy=${busy}`;
+      return `${teamLabel(data)} cwd=${data.cwd || 'legacy: no cwd'} busy=${busy}`;
     });
     die(`active teams at other paths:\n${previous.join('\n')}\nAsk whether to delete the previous manager, then rerun with --clear-previous or --keep-previous.`, 3);
   }
@@ -746,6 +774,7 @@ async function init(args) {
 
   const data = {
     id,
+    name: args.name || null,
     created: now(),
     cwd,
     manager_session: process.env.OMP_SESSION_ID || process.env.PI_SESSION_ID || null,
@@ -783,7 +812,7 @@ async function init(args) {
     die(`${mux.name}: ${error.message.split('\n')[0]}`, 4);
   }
 
-  console.log(`team ${id} ready: ${args.member || 3} workers, harness=${harness}, model=${fixedModel || 'automatic'}, router=${router?.family || 'off'}, cwd=${data.cwd}`);
+  console.log(`team ${teamLabel(data)} ready: ${args.member || 3} workers, harness=${harness}, model=${fixedModel || 'automatic'}, router=${router?.family || 'off'}, cwd=${data.cwd}`);
   await show(teamDir);
 
 }
@@ -1157,7 +1186,7 @@ async function clear(args) {
   }
 
   const lines = [
-    `# team-building ${data.id} — final summary`,
+    `# team-building ${teamLabel(data)} — final summary`,
     '',
     `- created: ${data.created}  cleared: ${now()}`,
     `- cwd: \`${data.cwd}\``,
@@ -1211,7 +1240,7 @@ async function clear(args) {
   for (const [id, result] of Object.entries(finals).sort(([left], [right]) => workerIndex(left) - workerIndex(right))) {
     console.log(`  ${id} final ${result.status}: ${result.summary.slice(0, 200)}`);
   }
-  console.log(`team ${data.id} cleared; state removed (${teamDir}); summary: ${report}`);
+  console.log(`team ${teamLabel(data)} cleared; state removed (${teamDir}); summary: ${report}`);
 }
 
 function usage() {
@@ -1220,7 +1249,7 @@ function usage() {
 team-building helper: persistent harness-neutral workers driven by one manager session.
 
 Commands:
-  init [gpt|claude] [--model gpt|claude|MODEL] [--member N] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
+  init [gpt|claude] [--name NAME|--team ID|NAME] [--model gpt|claude|MODEL] [--member N] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
   member N [--model MODEL] [--harness omp|claude|codex] [--allow-bypass]
   dismiss --worker wN[,wM...]
   status
@@ -1230,7 +1259,7 @@ Commands:
   stop --worker wN
   clear [--fast]
 
-Common options: --team ID --timeout SECONDS --max SECONDS`);
+Common options: --team ID|NAME --timeout SECONDS --max SECONDS`);
 }
 
 export function parseArgs(argv) {
@@ -1266,6 +1295,10 @@ export function parseArgs(argv) {
     const option = argv[index];
     if (option === '--team') {
       args.team = take(index, '--team');
+      index++;
+    } else if (option === '--name') {
+      if (args.cmd !== 'init') die('--name is only valid with init');
+      args.name = take(index, '--name');
       index++;
     } else if (option === '--timeout') {
       args.timeout = Number(take(index, '--timeout'));
