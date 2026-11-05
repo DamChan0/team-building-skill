@@ -1,6 +1,6 @@
 # team-building
 
-- **Release:** [v0.5.6](https://github.com/DamChan0/team-building-skill/releases/tag/v0.5.6)
+- **Release:** [v0.6.0](https://github.com/DamChan0/team-building-skill/releases/tag/v0.6.0)
 - Persistent AI-worker teams managed from one session.
 - **Manager hosts:** OMP, Pi, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
 - **OMP is not needed when Pi, Claude Code, or Codex is the manager and you select native workers.** OMP remains the default worker backend.
@@ -38,7 +38,8 @@ sequenceDiagram
   - `codex` launches the native Codex CLI through `app-server` JSON-RPC.
 - **Terminal/worktree backend:** Orca by default, herdr TUI when `HERDR_ENV=1`, or herdr-app (`hc`) when `HC_TERMINAL_ID`/`HC_TERMINAL_SOCKET` are set. Teams bind to their creating backend (`team.json` `backend`; legacy teams default to Orca); commands from other backends exit 4, and `status`/`init` list only current-backend teams. herdr TUI workers are tabs in the manager workspace; herdr-app workers are labeled child terminals created with `hc run --bg`, stored by terminal address, and pinned to the socket recorded at init (`HC_SOCKET`). The detached supervisor strips `HERDR_*` and `HC_*` environment variables. herdr-app uses shared worktrees; `--isolate` is unsupported.
 - **Worker tabs:** An OMP worker's tab *is* the worker: the full interactive session, resumed from its recorded session file. Claude/Codex tabs are read-only observers showing one typed UI summary line per finished task and never receive native protocol traffic or `TaskResult` JSON.
-- Closing an OMP worker tab ends that worker (a running task becomes `failed: worker tab exited`); the session file survives. The next assignment, `member <current N>`, or `init` re-adoption reopens the tab and resumes the same session. Closing a Claude/Codex observer does not stop its worker. Connected tabs are reused. A live Orca tab without a pane produces a warning instead of launching another; use `orca-ide terminal switch --terminal <handle>` to reveal it.
+- Closing an OMP worker tab ends that worker (a running task becomes `failed: worker tab exited`); the session file survives. `assign` resumes it on demand; `member <current N>` starts stopped workers eagerly. `init` re-adoption leaves idle OMP workers stopped. Closing a Claude/Codex observer does not stop its worker. Connected tabs are reused. A live Orca tab without a pane produces a warning instead of launching another; use `orca-ide terminal switch --terminal <handle>` to reveal it.
+- OMP worker sessions stop after 15 minutes idle by default. `init --idle-stop Nm` sets the timeout; `0` disables it. Idle age follows the last task result, not terminal activity; explicit `member N` startup gives restarted workers a fresh interval. `status` shows stopped workers and idle age; only OMP sessions are stopped.
 - Typing into an OMP worker tab while a task runs is allowed but unsupervised: its output is part of that task's final message. The extension needs `team-role.ts` installed (`node install.mjs`) before the tab starts, and omp tab titles are managed by omp itself (`<team-id> <worker-id> observer` applies only to Claude/Codex).
 - **Temporary tool tabs:** The manager snapshots the team's tabs before each assignment. Workers report only disposable tab IDs they created in `tool_sessions`; after the result, the manager closes only tabs absent from that snapshot and refuses registered worker tabs or tabs outside the team's workspace. Existing manager/user tabs stay open. Workers close non-tab helper sessions through their owning tool. Cleanup failures appear as `tool_session_cleanup_errors`; detached tasks remain available for retry.
 - **Local IPC:** every request uses an object envelope such as `{ "version": 1, "id": "<uuid>", "type": "<command>", "payload": { ... } }`.
@@ -163,7 +164,7 @@ node ~/.agents/skills/team-building/src/main.mjs init --harness codex --allow-by
 ## Commands and recovery
 
 ```sh
-node ~/.agents/skills/team-building/src/main.mjs init [gpt|claude] [--name NAME] [--team ID|NAME] [--member N] [--model M] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
+node ~/.agents/skills/team-building/src/main.mjs init [gpt|claude] [--name NAME] [--team ID|NAME] [--member N] [--idle-stop 15m|0] [--model M] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
 node ~/.agents/skills/team-building/src/main.mjs member N [--model M] [--harness H] [--allow-bypass]
 node ~/.agents/skills/team-building/src/main.mjs dismiss --worker wN[,wM...]
 node ~/.agents/skills/team-building/src/main.mjs status [--team ID|NAME]
@@ -180,6 +181,7 @@ node ~/.agents/skills/team-building/src/main.mjs clear [--team ID|NAME] [--fast]
 
 - `--team` accepts the generated team ID or a name.
 - `--timeout` is the idle timeout (default 1200 seconds); `--max` is the absolute cap (default 14400 seconds).
+- `--idle-stop` is init-only; default `15m`, `0` disables it. OMP idle age starts at the last task result, not terminal activity.
 - A 60-second supervisor wait checkpoint is not a worker failure.
 - Workers receive `PWD` matching their configured cwd; OMP also receives `--cwd` so launches from the home directory do not relocate to `/tmp`.
 - Retry an interrupted submission with the same `--request-id` and identical assignment.

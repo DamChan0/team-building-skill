@@ -9,11 +9,12 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
-import { chooseWorker, parseArgs, routedAssignment } from '../src/main.mjs';
+import { checkIdleWorkers, chooseWorker, parseArgs, routedAssignment } from '../src/main.mjs';
 import { Supervisor, supervisorBinary, supervisorPaths } from '../src/supervisor.mjs';
 
 const main = fileURLToPath(new URL('../src/main.mjs', import.meta.url));
 const router = { enabled: true, models: { simple: { model: 'openai-codex/gpt-5.6-luna', thinking: 'max' } } };
+process.env.TEAM_BUILDING_DISABLE_IDLE_WATCHER = '1';
 
 test('selects a compatible durable queue worker without requiring idle metadata', () => {
   const data = { model: null, harness: 'omp', router, queue: [{ task: 't001', worker: 'w1', kind: 'task', difficulty: 'simple' }], workers: { w1: { id: 'w1', harness: 'omp', state: 'busy', retiring: false, assignments: 2 } } };
@@ -31,6 +32,8 @@ test('parses assignment sentinels and exact approval argv', () => {
   assert.equal(assignment.request_id, requestId);
   assert.equal(assignment.approval, 't001');
   assert.equal(assignment.difficulty, 'complex');
+  assert.equal(parseArgs(['init', '--idle-stop', '15m']).idleStopMs, 15 * 60 * 1000);
+  assert.equal(parseArgs(['init', '--idle-stop', '0']).idleStopMs, 0);
 
 });
 
@@ -207,6 +210,332 @@ setInterval(() => {
       const exited = once(daemon, 'exit');
       await client.request('shutdown', {}, undefined, 1_000).catch(() => daemon.kill('SIGTERM'));
       await exited;
+    }
+    await rm(home, { recursive: true, force: true });
+  }
+});
+test('idle OMP workers stay stopped on adoption and resume their exact session on assign', { skip: !existsSync(supervisorBinary) }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'team-building-idle-'));
+  const root = join(home, 'worktree');
+  const bin = join(home, 'bin');
+  const stateRoot = join(home, '.local', 'state', 'team-building');
+  const team = 'tb-0101-000004';
+  const teamDir = join(stateRoot, team);
+  const paths = supervisorPaths(stateRoot);
+  const client = new Supervisor(paths);
+  const orca = join(bin, 'orca-ide');
+  const omp = join(bin, 'omp');
+  const workerScript = join(home, 'worker.mjs');
+  const sessionFile = join(home, 'saved-session.jsonl');
+  const terminalState = join(home, 'terminals.json');
+  const orcaCalls = join(home, 'orca-calls.jsonl');
+  const ompCalls = join(home, 'omp-calls.txt');
+  const terminalPids = join(home, 'terminal-pids.txt');
+  const environment = {
+    ...process.env,
+    HOME: home,
+    ORCA_WORKTREE_ID: '',
+    ORCA_TERMINAL_HANDLE: '',
+    ORCA_CLI_COMMAND: orca,
+    ORCA_TEST_CALLS: orcaCalls,
+    ORCA_TEST_TERMINALS: terminalState,
+    ORCA_TEST_PIDS: terminalPids,
+    OMP_TEST_CALLS: ompCalls,
+    OMP_TEST_WORKER: workerScript,
+    OMP_TEST_SESSION_FILE: sessionFile,
+    TEAM_BUILDING_DISABLE_IDLE_WATCHER: '',
+    PATH: `${bin}:${process.env.PATH}`,
+    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || '/tmp',
+  };
+  let daemon;
+  const workerData = async () => JSON.parse(await readFile(join(teamDir, 'team.json'), 'utf8'));
+  const waitForStopped = async () => {
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const data = await workerData();
+      if (data.workers.w1.run_state === 'stopped') return data;
+      if (Date.now() >= deadline) assert.fail('idle watcher did not stop the worker');
+      await delay(20);
+    }
+  };
+  const waitForProcessExit = async pid => {
+    const deadline = Date.now() + 3_000;
+    for (;;) {
+      try {
+        process.kill(pid, 0);
+        if (Date.now() >= deadline) assert.fail('idle OMP worker process did not stop');
+        await delay(20);
+      } catch (error) {
+        if (error.code === 'ESRCH') return;
+        throw error;
+      }
+    }
+  };
+  try {
+    await Promise.all([
+      mkdir(root, { recursive: true }),
+      mkdir(bin, { recursive: true }),
+      mkdir(join(teamDir, 'sessions', 'w1'), { recursive: true }),
+      mkdir(join(teamDir, 'results'), { recursive: true }),
+      mkdir(paths.stateDir, { recursive: true }),
+    ]);
+    await writeFile(terminalState, '[]');
+    await writeFile(sessionFile, JSON.stringify({ type: 'session', id: 'saved-session', cwd: root }) + '\n');
+    await writeFile(join(teamDir, 'team.json'), JSON.stringify({
+      id: team,
+      cwd: root,
+      worktree: root,
+      backend: 'orca',
+      model: 'fixture-model',
+      harness: 'omp',
+      approval_mode: 'yolo',
+      allow_bypass: false,
+      next_task: 1,
+      next_worker: 2,
+      closing: false,
+      idle_stop_ms: 1,
+      workers: {
+        w1: {
+          id: 'w1',
+          model: 'fixture-model',
+          state: 'idle',
+          run_state: 'stopped',
+          idle_since_ms: Date.now() - 60_000,
+          task: null,
+          task_prompt: null,
+          retiring: false,
+          assignments: 0,
+          harness: 'omp',
+          observer: null,
+          observer_kind: null,
+          session_id: 'saved-session',
+          session_file: sessionFile,
+          session_dir: join(teamDir, 'sessions', 'w1'),
+          cwd: root,
+          worktree: null,
+          log: join(teamDir, 'logs', 'w1.log'),
+        },
+      },
+      queue: [],
+      detached: {},
+      isolate: false,
+    }));
+    await writeFile(orca, `#!/usr/bin/env node
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+const args = process.argv.slice(2, -1);
+appendFileSync(process.env.ORCA_TEST_CALLS, JSON.stringify(args) + '\\n');
+const statePath = process.env.ORCA_TEST_TERMINALS;
+let terminals = JSON.parse(readFileSync(statePath, 'utf8'));
+let result = { app: { running: true }, runtime: { reachable: true } };
+if (args[0] === 'worktree') result = { worktree: { path: ${JSON.stringify(root)} } };
+if (args[0] === 'terminal' && args[1] === 'list') result = { terminals };
+if (args[0] === 'terminal' && args[1] === 'create') {
+  const handle = 'worker-tab-' + (terminals.length + 1);
+  const launch = args[args.indexOf('--command') + 1];
+  const child = spawn('/bin/sh', ['-c', launch], { cwd: ${JSON.stringify(root)}, detached: true, stdio: 'ignore', env: process.env });
+  appendFileSync(process.env.ORCA_TEST_PIDS, String(child.pid) + '\\n');
+  child.unref();
+  terminals.push({ handle, pid: child.pid, connected: true, orphaned: false });
+  writeFileSync(statePath, JSON.stringify(terminals));
+  result = { terminal: { handle, connected: true } };
+}
+if (args[0] === 'terminal' && args[1] === 'close') {
+  const handle = args[args.indexOf('--terminal') + 1];
+  const terminal = terminals.find(item => item.handle === handle);
+  if (terminal?.pid) { try { process.kill(-terminal.pid, 'SIGTERM'); } catch {} }
+  terminals = terminals.filter(item => item.handle !== handle);
+  writeFileSync(statePath, JSON.stringify(terminals));
+  result = { closed: true };
+}
+console.log(JSON.stringify({ ok: true, result }));
+`);
+    await writeFile(omp, `#!/bin/sh
+if [ "$1" = "config" ]; then printf 'yolo\\n'; exit 0; fi
+printf '%s\\n' "$@" >> "$OMP_TEST_CALLS"
+exec node "$OMP_TEST_WORKER"
+`);
+    await writeFile(workerScript, `import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+const dir = process.env.TEAM_BUILDING_TAB_DIR;
+mkdirSync(dir, { recursive: true });
+writeFileSync(dir + '/ready.json', JSON.stringify({
+  pid: process.pid,
+  session_id: 'saved-session',
+  session_file: process.env.OMP_TEST_SESSION_FILE,
+}));
+setInterval(() => {
+  writeFileSync(dir + '/beat', String(Date.now()));
+  let task;
+  try { task = JSON.parse(readFileSync(dir + '/task.json', 'utf8')); } catch { return; }
+  rmSync(dir + '/task.json');
+  const result = { status: 'succeeded', summary: 'resumed saved session', files_changed: [], files_deleted: [], verification: 'fixture', blockers: [], approval_requests: [], tool_sessions: [], branch: '', commit: '' };
+  const outcome = { request_id: task.request_id, text: JSON.stringify(result) };
+  writeFileSync(dir + '/outcome.json.tmp', JSON.stringify(outcome));
+  renameSync(dir + '/outcome.json.tmp', dir + '/outcome.json');
+}, 20);
+`);
+    await Promise.all([chmod(orca, 0o755), chmod(omp, 0o755)]);
+    daemon = spawn(supervisorBinary, ['serve', '--state-dir', paths.stateDir, '--socket', paths.socket], { stdio: ['ignore', 'pipe', 'inherit'] });
+    const readiness = createInterface({ input: daemon.stdout });
+    const [line] = await once(readiness, 'line', { signal: AbortSignal.timeout(5_000) });
+    readiness.close();
+    daemon.stdout.destroy();
+    assert.equal(JSON.parse(line).payload?.ready, true);
+
+    const adopted = spawnSync(process.execPath, [main, 'init', '--team', team], {
+      cwd: root, encoding: 'utf8', timeout: 10_000, env: environment,
+    });
+    assert.equal(adopted.status, 0, adopted.stderr);
+    assert.match(adopted.stdout, /w1\s+stopped idle=/);
+    assert.deepEqual(JSON.parse(await readFile(terminalState, 'utf8')), []);
+    assert.equal((await readFile(orcaCalls, 'utf8')).includes('terminal","create'), false);
+
+    const assigned = spawnSync(process.execPath, [main, 'assign', '--team', team, '--worker', 'w1', 'resume saved session'], {
+      cwd: root, encoding: 'utf8', timeout: 15_000, env: environment,
+    });
+    assert.equal(assigned.status, 0, assigned.stderr);
+    const ompArgs = (await readFile(ompCalls, 'utf8')).trim().split('\n');
+    const resumeIndex = ompArgs.indexOf('--resume');
+    assert.notEqual(resumeIndex, -1);
+    assert.equal(ompArgs[resumeIndex + 1], sessionFile);
+    let data = await waitForStopped();
+    assert.equal(data.workers.w1.state, 'idle');
+    assert.equal(data.workers.w1.observer, null);
+    assert.equal(data.workers.w1.session_id, 'saved-session');
+    assert.equal(data.workers.w1.session_file, sessionFile);
+    assert.deepEqual(JSON.parse(await readFile(terminalState, 'utf8')), []);
+    const workerPids = (await readFile(terminalPids, 'utf8')).trim().split('\n').map(Number);
+    assert.equal(workerPids.length, 1);
+    await waitForProcessExit(workerPids[0]);
+    const status = spawnSync(process.execPath, [main, 'status', '--team', team], {
+      cwd: root, encoding: 'utf8', timeout: 10_000, env: environment,
+    });
+    assert.equal(status.status, 0, status.stderr);
+    assert.match(status.stdout, /w1\s+stopped idle=/);
+    assert.equal(JSON.parse(await readFile(join(teamDir, 'team.json'), 'utf8')).workers.w1.run_state, 'stopped');
+
+    const eager = spawnSync(process.execPath, [main, 'member', '1', '--team', team], {
+      cwd: root, encoding: 'utf8', timeout: 10_000, env: environment,
+    });
+    assert.equal(eager.status, 0, eager.stderr);
+    const resumeDeadline = Date.now() + 3_000;
+    let allArgs = [];
+    for (;;) {
+      allArgs = (await readFile(ompCalls, 'utf8')).trim().split('\n');
+      if (allArgs.filter(argument => argument === '--resume').length === 2) break;
+      if (Date.now() >= resumeDeadline) assert.fail('member did not resume the saved OMP session');
+      await delay(20);
+    }
+    data = await waitForStopped();
+    assert.equal(data.workers.w1.state, 'idle');
+    assert.equal(data.workers.w1.observer, null);
+    assert.equal(data.workers.w1.session_id, 'saved-session');
+    assert.equal(data.workers.w1.session_file, sessionFile);
+    assert.deepEqual(JSON.parse(await readFile(terminalState, 'utf8')), []);
+    const allPids = (await readFile(terminalPids, 'utf8')).trim().split('\n').map(Number);
+    assert.equal(allPids.length, 2);
+    await waitForProcessExit(allPids[1]);
+  } finally {
+    const terminals = JSON.parse(await readFile(terminalState, 'utf8').catch(() => '[]'));
+    for (const terminal of terminals) {
+      if (terminal.pid) { try { process.kill(-terminal.pid, 'SIGKILL'); } catch {} }
+    }
+    if (daemon?.pid && daemon.exitCode === null) {
+      const exited = once(daemon, 'exit');
+      await client.request('shutdown', {}, undefined, 1_000).catch(() => daemon.kill('SIGTERM'));
+      await exited;
+    }
+    await rm(home, { recursive: true, force: true });
+  }
+});
+test('idle OMP timeout closes herdr-app terminals through the HC backend', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'team-building-idle-hc-'));
+  const stateRoot = join(home, '.local', 'state', 'team-building');
+  const team = 'tb-0101-000005';
+  const teamDir = join(stateRoot, team);
+  const bin = join(home, 'bin');
+  const hc = join(bin, 'hc');
+  const calls = join(home, 'hc-calls.jsonl');
+  const previous = {
+    HC_CLI_COMMAND: process.env.HC_CLI_COMMAND,
+    HC_TEST_CALLS: process.env.HC_TEST_CALLS,
+  };
+  let taskState = 'running';
+  const client = {
+    async status() {
+      return {
+        workers: [{ worker: 'w1', request_id: 'request-1', state: taskState, assignments: 1 }],
+        queued: 0,
+        has_more: false,
+      };
+    },
+    async get() {
+      return {
+        task: {
+          spec: { task: 't001', prompt: 'done', model: 'fixture-model' },
+          session_id: 'saved-session',
+          session_file: '/saved/session.jsonl',
+          model: 'fixture-model',
+          updated_ms: Date.now() - 60_000,
+        },
+      };
+    },
+  };
+  try {
+    await mkdir(teamDir, { recursive: true });
+    await mkdir(bin, { recursive: true });
+    await writeFile(join(teamDir, 'team.json'), JSON.stringify({
+      id: team,
+      backend: 'hc',
+      socket: '/run/herdr-core/test.sock',
+      cwd: '/workspace',
+      closing: false,
+      idle_stop_ms: 50,
+      harness: 'omp',
+      workers: {
+        w1: {
+          id: 'w1',
+          harness: 'omp',
+          state: 'idle',
+          run_state: 'running',
+          idle_since_ms: Date.now() - 60_000,
+          observer: 't-worker',
+          observer_kind: 'tab',
+          session_id: 'saved-session',
+          session_file: '/saved/session.jsonl',
+          assignments: 0,
+        },
+      },
+    }));
+    await writeFile(hc, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+appendFileSync(process.env.HC_TEST_CALLS, JSON.stringify({ args, socket: process.env.HC_SOCKET }) + '\\n');
+const result = args[1] === 'get' ? { address: args[2], state: 'live' } : {};
+console.log(JSON.stringify(result));
+`);
+    await chmod(hc, 0o755);
+    process.env.HC_CLI_COMMAND = hc;
+    process.env.HC_TEST_CALLS = calls;
+    assert.equal(await checkIdleWorkers(stateRoot, client), true);
+    assert.equal(existsSync(calls), false);
+    taskState = 'succeeded';
+    assert.equal(await checkIdleWorkers(stateRoot, client), false);
+    const data = JSON.parse(await readFile(join(teamDir, 'team.json'), 'utf8'));
+    assert.equal(data.workers.w1.run_state, 'stopped');
+    assert.equal(data.workers.w1.observer, null);
+    assert.equal(data.workers.w1.session_id, 'saved-session');
+    assert.equal(data.workers.w1.session_file, '/saved/session.jsonl');
+    const operations = (await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(operations.map(call => [call.args[1], call.args[2], call.socket]), [
+      ['get', 't-worker', '/run/herdr-core/test.sock'],
+      ['kill', 't-worker', '/run/herdr-core/test.sock'],
+      ['rm', 't-worker', '/run/herdr-core/test.sock'],
+    ]);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
     }
     await rm(home, { recursive: true, force: true });
   }
@@ -517,7 +846,12 @@ input.once('line', line => {
     assert.match(reopened.stderr, /warning:.*w1.*observer.*recreat/i);
     const repairedWorker = JSON.parse(await readFile(firstPath, 'utf8')).workers.w1;
     assert.notEqual(repairedWorker.observer, originalWorker.observer);
-    assert.deepEqual({ ...repairedWorker, observer: originalWorker.observer }, originalWorker);
+    const originalWithoutIdle = { ...originalWorker };
+    const repairedWithoutIdle = { ...repairedWorker, observer: originalWorker.observer };
+    delete originalWithoutIdle.idle_since_ms;
+    delete repairedWithoutIdle.idle_since_ms;
+    assert.deepEqual(repairedWithoutIdle, originalWithoutIdle);
+    assert.ok(repairedWorker.idle_since_ms >= originalWorker.idle_since_ms);
     await writeFile(terminals, '[]');
     const readopted = run(first, 'init', '--team', 'team1', '--harness', 'claude', '--allow-bypass');
     assert.equal(readopted.status, 0, readopted.stderr);

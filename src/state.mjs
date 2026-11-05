@@ -51,6 +51,24 @@ export async function withLock(dir, fn) {
     await release().catch(() => {});
   }
 }
+export async function tryWithLock(dir, name, fn) {
+  await mkdir(dir, { recursive: true });
+  const path = join(dir, name);
+  await writeFile(path, '', { flag: 'a' });
+  let release;
+  try {
+    release = await lockfile.lock(path, { retries: 0, stale: 30000 });
+  } catch (error) {
+    if (error.code === 'ELOCKED') return false;
+    throw error;
+  }
+  try {
+    await fn();
+    return true;
+  } finally {
+    await release().catch(() => {});
+  }
+}
 
 export async function activeTeams() {
   if (!(await exists(STATE_ROOT))) return [];

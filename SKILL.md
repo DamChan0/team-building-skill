@@ -33,8 +33,8 @@ Judge from the task, not its length. No classifier call needed for tier 0/1.
 
 | Request | Command |
 |---|---|
-| `init [gpt\|claude] [--name NAME] [--team ID\|NAME] [--member N] [--model M] [--harness omp\|claude\|codex] [--allow-bypass] [--isolate] [--clear-previous\|--keep-previous]` | Creates another team with `--name` even at this path; repeating a name adopts it. Without a selector, adopts the only team at this path. Teams at other paths still require `--clear-previous` or `--keep-previous`. |
-| `member N` / `dismiss --worker wN[,wM...]` | Resize / retire idle workers; `member` restores missing tabs. |
+| `init [gpt|claude] [--name NAME] [--team ID|NAME] [--member N] [--idle-stop 15m|0] [--model M] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]` | Creates another team with `--name` even at this path; repeating a name adopts it. Without a selector, adopts the only team at this path. Teams at other paths still require `--clear-previous` or `--keep-previous`. |
+| `member N` / `dismiss --worker wN[,wM...]` | Resize / retire idle workers; `member` restores missing tabs and eagerly starts stopped workers. |
 | `status [--team ID\|NAME]` | Workers, state, queue. Run first in a new manager session, then `init` to adopt. |
 | `assign [--team ID\|NAME] [--detach] [--worker wN] [--difficulty TIER] [--model M] [--approval tNNN] PROMPT` | Blocks until a structured result by default; `--detach` submits durable work and prints only its task ID. |
 | `approve --worker wN --task tNNN -- COMMAND...` | Record a user-approved gated command. |
@@ -43,7 +43,8 @@ Judge from the task, not its length. No classifier call needed for tier 0/1.
 
 Team names are lowercase slugs (`a-z`, digits, `_`, `-`), unique among active teams on the current backend; values matching generated team IDs are reserved. All team-scoped commands accept `--team ID|NAME`; without it, the current path must have exactly one team.
 
-Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|codex` needs `--allow-bypass`. Workers live in Orca tabs, herdr TUI tabs (`HERDR_ENV=1`), or labeled herdr-app (`hc`) child terminals (`HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET`); teams stay bound to their creating backend (other backend: exit 4; `status`/`init` list only current-backend teams). OMP tabs are live sessions; closing one ends the worker, and `member <current N>` or the next `assign` reopens it. Claude/Codex observers are read-only; closing one does not stop the worker.
+Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|codex` needs `--allow-bypass`. Workers live in Orca tabs, herdr TUI tabs (`HERDR_ENV=1`), or labeled herdr-app (`hc`) child terminals (`HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET`); teams stay bound to their creating backend (other backend: exit 4; `status`/`init` list only current-backend teams). OMP tabs are live sessions; closing one ends the worker, and `member <current N>` eagerly restarts stopped workers while `assign` resumes them on demand. `init` adoption leaves idle OMP workers stopped. Claude/Codex observers are read-only; closing one does not stop the worker.
+Idle OMP sessions stop after 15 minutes without a task result by default; `init --idle-stop Nm` configures the timeout and `0` disables it. Idle age is based on the last task result, not terminal activity; `member N` gives restarted workers a fresh interval. `status` shows stopped workers and their idle age.
 
 - In Orca, `init` binds to the manager terminal's `ORCA_WORKTREE_ID`; it exits 4 if `cwd` is outside that worktree or its git top-level differs. Register sibling git worktrees with Orca or run `init` from the manager's worktree.
 

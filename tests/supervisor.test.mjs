@@ -13,6 +13,7 @@ const result = JSON.stringify({ status: 'succeeded', summary: 'fixture completed
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const uuid = index => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
 const cli = fileURLToPath(new URL('../src/main.mjs', import.meta.url));
+process.env.TEAM_BUILDING_DISABLE_IDLE_WATCHER = '1';
 
 test('detached supervisor drops HERDR and hc terminal identity variables', () => {
   assert.deepEqual(supervisorEnv({

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawn } from 'node:child_process';
 import {
   mkdir,
   readFile,
@@ -26,6 +27,7 @@ import {
   STATE_ROOT,
   TEAM_ID_PATTERN,
   TEAM_NAME_PATTERN,
+  tryWithLock,
   withLock,
   backendName,
   WORKER_ENV,
@@ -38,6 +40,7 @@ import {
   OrcaError,
   requireOmp,
   shellQuote,
+  sleep,
   writeShims,
   nativeTask,
   ompTabCommand,
@@ -49,6 +52,8 @@ import { classifyRequest, configureRouter, DIFFICULTIES } from './router.mjs';
 
 const MAX_WORKERS = 8;
 const WARN_WORKERS = 4;
+const DEFAULT_IDLE_STOP_MS = 15 * 60 * 1000;
+const IDLE_CHECK_INTERVAL_MS = 60_000;
 let interruption = null;
 
 export function requiresBypass(harness) {
@@ -75,6 +80,38 @@ function backendMismatchError(data) {
 
 function teamLabel(data) {
   return data.name ? `${data.name} (${data.id})` : data.id;
+}
+function parseIdleStop(value) {
+  if (value === '0') return 0;
+  const match = /^([1-9]\d*)m$/.exec(value);
+  const milliseconds = match ? Number(match[1]) * 60_000 : NaN;
+  if (!Number.isSafeInteger(milliseconds)) die('--idle-stop must be 0 or a positive number of minutes such as 15m');
+  return milliseconds;
+}
+
+function idleStopMs(data) {
+  const value = data.idle_stop_ms ?? DEFAULT_IDLE_STOP_MS;
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error('team idle_stop_ms must be a non-negative safe integer');
+  return value;
+}
+
+function ensureWorkerRuntime(data, worker, initializeIdle = true) {
+  if (!['starting', 'running', 'stopped'].includes(worker.run_state)) {
+    worker.run_state = worker.observer ? 'running' : 'stopped';
+  }
+  if (initializeIdle && (!Number.isSafeInteger(worker.idle_since_ms) || worker.idle_since_ms < 0)) {
+    worker.idle_since_ms = Date.now();
+  }
+  idleStopMs(data);
+}
+
+function idleAge(value) {
+  if (!Number.isSafeInteger(value)) return 'unknown';
+  const minutes = Math.floor(Math.max(0, Date.now() - value) / 60_000);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return remainder ? `${hours}h${remainder}m` : `${hours}h`;
 }
 
 function workerIndex(id) {
@@ -240,6 +277,11 @@ async function syncStatus(teamDir, client, team) {
   }
   await withLock(teamDir, async () => {
     const data = await load(teamDir);
+    data.idle_stop_ms ??= DEFAULT_IDLE_STOP_MS;
+    const reportedWorkers = new Set(workers.map(item => item.worker));
+    for (const worker of Object.values(data.workers)) {
+      ensureWorkerRuntime(data, worker, !reportedWorkers.has(worker.id));
+    }
     for (const item of workers) {
       const worker = data.workers[item.worker];
       if (!worker) continue;
@@ -248,17 +290,44 @@ async function syncStatus(teamDir, client, team) {
       const spec = snapshot.spec || {};
       const active = ['queued', 'running'].includes(item.state);
       const fenced = item.state === 'unknown' && !item.fence_released;
-      worker.state = active ? 'busy' : fenced ? 'unknown' : 'idle';
+      const starting = worker.run_state === 'starting';
+      const currentStart = starting && spec.task === worker.starting_task;
       worker.session_id = snapshot.session_id ?? item.session_id ?? worker.session_id ?? null;
       worker.session_file = snapshot.session_file ?? item.session_file ?? worker.session_file ?? null;
       worker.resolved_model = snapshot.model ?? spec.model ?? worker.resolved_model ?? null;
       worker.last_route = { model: spec.model ?? null, thinking: spec.thinking ?? null };
       if (!Number.isSafeInteger(item.assignments) || item.assignments < 0) throw new Error('supervisor returned an invalid worker assignment count');
       worker.assignments = item.assignments;
+      if (starting && !currentStart) {
+        worker.state = active ? 'busy' : fenced ? 'unknown' : 'idle';
+        if (active || fenced) {
+          worker.task = spec.task || item.task;
+          worker.task_prompt = spec.prompt || worker.task_prompt || null;
+        } else {
+          worker.task = null;
+          worker.task_prompt = null;
+        }
+        continue;
+      }
       if (active || fenced) {
+        worker.state = active ? 'busy' : 'unknown';
+        worker.run_state = 'running';
+        worker.idle_since_ms = null;
+        delete worker.starting_task;
         worker.task = spec.task || item.task;
         worker.task_prompt = spec.prompt || worker.task_prompt || null;
       } else {
+        worker.state = 'idle';
+        if (currentStart) {
+          worker.run_state = worker.observer ? 'running' : 'stopped';
+          delete worker.starting_task;
+        } else if (worker.run_state !== 'stopped') {
+          worker.run_state = worker.observer ? 'running' : 'stopped';
+        }
+        const completedAt = Number.isSafeInteger(snapshot.updated_ms) && snapshot.updated_ms >= 0
+          ? snapshot.updated_ms
+          : Date.now();
+        worker.idle_since_ms = Math.max(Number.isSafeInteger(worker.idle_since_ms) ? worker.idle_since_ms : 0, completedAt);
         worker.task = null;
         worker.task_prompt = null;
       }
@@ -266,6 +335,88 @@ async function syncStatus(teamDir, client, team) {
     await save(teamDir, data);
   });
   return { workers, queued };
+}
+
+async function allTeamDirs(root) {
+  if (!(await exists(root))) return [];
+  const dirs = [];
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const dir = join(root, entry.name);
+    if (await exists(join(dir, 'team.json'))) dirs.push(dir);
+  }
+  return dirs;
+}
+
+function monitorable(data) {
+  return !data.closing && idleStopMs(data) > 0
+    && Object.values(data.workers || {}).some(worker =>
+      !worker.retiring && worker.run_state !== 'stopped' && workerHarness(worker, data) === 'omp');
+}
+
+export async function checkIdleWorkers(stateRoot = STATE_ROOT, client = null) {
+  let broker = client;
+  for (const teamDir of await allTeamDirs(stateRoot)) {
+    const initial = await load(teamDir);
+    if (!monitorable(initial)) continue;
+    broker ||= await connectSupervisor(stateRoot);
+    await syncStatus(teamDir, broker, initial.id);
+    await withLock(teamDir, async () => {
+      const data = await load(teamDir);
+      const timeout = idleStopMs(data);
+      const checkedAt = Date.now();
+      if (!data.closing && timeout > 0) {
+        for (const worker of Object.values(data.workers)) {
+          if (worker.retiring || workerHarness(worker, data) !== 'omp'
+            || worker.run_state !== 'running' || (worker.state || 'idle') !== 'idle'
+            || !Number.isSafeInteger(worker.idle_since_ms)
+            || checkedAt - worker.idle_since_ms < timeout) continue;
+          try {
+            if (!worker.observer) throw new Error('worker terminal handle is missing');
+            if (!(await muxOf(data).close(data, worker.observer))) {
+              throw new Error('multiplexer did not confirm terminal closure');
+            }
+            worker.observer = null;
+            worker.observer_kind = null;
+            worker.run_state = 'stopped';
+            delete worker.idle_stop_error;
+          } catch (error) {
+            worker.idle_stop_error = String(error.message || error).replaceAll('\n', ' ').slice(0, 300);
+          }
+        }
+      }
+      await save(teamDir, data);
+    });
+  }
+  for (const teamDir of await allTeamDirs(stateRoot)) {
+    if (monitorable(await load(teamDir))) return true;
+  }
+  return false;
+}
+
+async function startIdleWatcher() {
+  if (process.env.TEAM_BUILDING_DISABLE_IDLE_WATCHER === '1') return;
+  for (const teamDir of await allTeamDirs(STATE_ROOT)) {
+    if (!monitorable(await load(teamDir))) continue;
+    const child = spawn(process.execPath, [modulePath, 'idle-watch'], { detached: true, stdio: 'ignore' });
+    child.once('error', error => console.error(`team-building: idle watcher could not start: ${error.message}`));
+    child.unref();
+    return;
+  }
+}
+
+async function idleWatch() {
+  await tryWithLock(STATE_ROOT, 'idle-watcher', async () => {
+    for (;;) {
+      if (interruption) return;
+      try {
+        if (!(await checkIdleWorkers(STATE_ROOT))) return;
+      } catch (error) {
+        console.error(`team-building: idle watcher: ${error.message}`);
+      }
+      await sleep(IDLE_CHECK_INTERVAL_MS);
+    }
+  });
 }
 
 async function ensureObserver(teamDir, data, worker) {
@@ -317,6 +468,26 @@ async function ensureObservers(teamDir, data, workers) {
   const failed = (await Promise.allSettled(workers.map(worker => ensureObserver(teamDir, data, worker)))).find(result => result.status === 'rejected');
   if (failed) throw failed.reason;
 }
+async function settleWorkerRuntime(teamDir, workerIds) {
+  await withLock(teamDir, async () => {
+    const data = await load(teamDir);
+    for (const id of workerIds) {
+      const worker = data.workers[id];
+      if (!worker) continue;
+      worker.run_state = worker.observer ? 'running' : 'stopped';
+      if (worker.run_state === 'running' && (worker.state || 'idle') === 'idle') {
+        worker.idle_since_ms = Date.now();
+      } else if (worker.state === 'busy' || worker.state === 'unknown') {
+        worker.idle_since_ms = null;
+      } else if (!Number.isSafeInteger(worker.idle_since_ms)) {
+        worker.idle_since_ms = Date.now();
+      }
+      delete worker.starting_task;
+      delete worker.idle_stop_error;
+    }
+    await save(teamDir, data);
+  });
+}
 
 export async function runAssignment(teamDir, preferredWorker, prompt, timeout, maximum, kind = 'task', approval = null, assignment = {}, detach = false) {
   const team = basename(teamDir);
@@ -343,9 +514,10 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
     return taskOutputWithCleanup(teamDir, snapshot, fallback);
   }
 
-  let data; let worker; let task;
+  let data; let worker; let task; let previousRuntime;
   await withLock(teamDir, async () => {
     data = await load(teamDir);
+    data.idle_stop_ms ??= DEFAULT_IDLE_STOP_MS;
     if (assignment.difficulty) {
       const selected = data.router?.models?.[assignment.difficulty];
       if (assignment.router_family && data.router?.family !== assignment.router_family) {
@@ -374,53 +546,94 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
       const approved = JSON.parse(await readFile(join(teamDir, 'approvals', `${approval}.json`), 'utf8'));
       if (approved.task !== approval || approved.worker !== worker.id) throw new Error(`approval ${approval} is not bound to ${worker.id}`);
     }
+    previousRuntime = {
+      run_state: worker.run_state || (worker.observer ? 'running' : 'stopped'),
+      state: worker.state,
+      task: worker.task,
+      task_prompt: worker.task_prompt,
+      idle_since_ms: worker.idle_since_ms,
+    };
     const route = kind === 'final' ? worker.last_route || {} : assignment;
+    task = `t${String(data.next_task++).padStart(3, '0')}`;
     worker = {
       ...worker,
       task_model: route.model ?? worker.model ?? null,
       task_thinking: route.thinking ?? null,
       approval_task: approval,
       allow_bypass: !!data.allow_bypass,
+      run_state: 'starting',
+      starting_task: task,
+      idle_since_ms: null,
     };
-    task = `t${String(data.next_task++).padStart(3, '0')}`;
+    delete worker.idle_stop_error;
+    data.workers[worker.id] = worker;
     await writeShims(teamDir, data);
     await save(teamDir, data);
   });
-  await ensureObserver(teamDir, data, worker);
-  const toolTabsBefore = await muxOf(data).listToolTabs(data, data.isolate ? worker.worktree : data.worktree);
-  if (toolTabsBefore.length > 2048) throw new Error('team workspace contains too many tabs to verify temporary-tab ownership safely');
-  const cwd = worker.cwd || data.cwd;
-  const native = await nativeTask(team, worker, { prompt, teamDir, cwd });
-  const spec = {
-    team_dir: teamDir, team, worker: worker.id, task, kind, cwd,
-    harness: worker.harness || data.harness || 'omp', argv: native.argv,
-    env: {
-      ...native.env,
-      TEAM_BUILDING_WORKER: `${team}/${worker.id}`,
-      TEAM_BUILDING_APPROVAL_TASK: approval || '',
-      TEAM_BUILDING_DIFFICULTY: assignment.difficulty || '',
-      TEAM_BUILDING_TOOL_TABS_BEFORE: JSON.stringify(toolTabsBefore),
-      TEAM_BUILDING_INTENT: assignment.intent || '',
-      TEAM_BUILDING_ROUTER_MODEL: assignment.router_model || '',
-      PATH: `${join(teamDir, 'shim')}:${process.env.PATH || ''}`,
-    },
-    prompt, model: worker.task_model, thinking: native.thinking,
-    session_id: worker.session_id ?? null, session_file: worker.session_file ?? null,
-    log: worker.log, idle_timeout_ms: Math.max(1_000, timeout * 1000), max_timeout_ms: Math.max(1_000, maximum * 1000),
-  };
-  const accepted = await client.submit(spec, requestId);
-  const fallback = { team, worker: worker.id, task, kind, log: worker.log };
-  if (detach) {
-    await rememberDetached(teamDir, { ...fallback, request_id: accepted.request_id });
+
+  let submitted = false;
+  try {
+    await ensureObserver(teamDir, data, worker);
+    const toolTabsBefore = await muxOf(data).listToolTabs(data, data.isolate ? worker.worktree : data.worktree);
+    if (toolTabsBefore.length > 2048) throw new Error('team workspace contains too many tabs to verify temporary-tab ownership safely');
+    const cwd = worker.cwd || data.cwd;
+    const native = await nativeTask(team, worker, { prompt, teamDir, cwd });
+    const spec = {
+      team_dir: teamDir, team, worker: worker.id, task, kind, cwd,
+      harness: worker.harness || data.harness || 'omp', argv: native.argv,
+      env: {
+        ...native.env,
+        TEAM_BUILDING_WORKER: `${team}/${worker.id}`,
+        TEAM_BUILDING_APPROVAL_TASK: approval || '',
+        TEAM_BUILDING_DIFFICULTY: assignment.difficulty || '',
+        TEAM_BUILDING_TOOL_TABS_BEFORE: JSON.stringify(toolTabsBefore),
+        TEAM_BUILDING_INTENT: assignment.intent || '',
+        TEAM_BUILDING_ROUTER_MODEL: assignment.router_model || '',
+        PATH: `${join(teamDir, 'shim')}:${process.env.PATH || ''}`,
+      },
+      prompt, model: worker.task_model, thinking: native.thinking,
+      session_id: worker.session_id ?? null, session_file: worker.session_file ?? null,
+      log: worker.log, idle_timeout_ms: Math.max(1_000, timeout * 1000), max_timeout_ms: Math.max(1_000, maximum * 1000),
+    };
+    const accepted = await client.submit(spec, requestId);
+    submitted = true;
+    const fallback = { team, worker: worker.id, task, kind, log: worker.log };
+    if (detach) {
+      await rememberDetached(teamDir, { ...fallback, request_id: accepted.request_id });
+      await syncStatus(teamDir, client, team);
+      return fallback;
+    }
     await syncStatus(teamDir, client, team);
-    return fallback;
+    const snapshot = await waitForTask(client, accepted.request_id, timeout);
+    await syncStatus(teamDir, client, team);
+    const output = { ...(await taskOutputWithCleanup(teamDir, snapshot, fallback)), finished: now() };
+    if (output.status !== 'unknown') await writeResult(teamDir, output);
+    return output;
+  } catch (error) {
+    await withLock(teamDir, async () => {
+      const latest = await load(teamDir);
+      const current = latest.workers[worker.id];
+      if (!current || current.starting_task !== task) return;
+      if (submitted) {
+        current.run_state = 'running';
+        current.state = 'busy';
+        current.task = task;
+        current.task_prompt = prompt;
+        current.idle_since_ms = null;
+      } else {
+        current.run_state = current.observer ? 'running' : previousRuntime.run_state;
+        current.state = previousRuntime.state;
+        current.task = previousRuntime.task;
+        current.task_prompt = previousRuntime.task_prompt;
+        current.idle_since_ms = ['busy', 'unknown'].includes(previousRuntime.state)
+          ? null
+          : current.observer ? Date.now() : previousRuntime.idle_since_ms;
+      }
+      delete current.starting_task;
+      await save(teamDir, latest);
+    });
+    throw error;
   }
-  await syncStatus(teamDir, client, team);
-  const snapshot = await waitForTask(client, accepted.request_id, timeout);
-  await syncStatus(teamDir, client, team);
-  const output = { ...(await taskOutputWithCleanup(teamDir, snapshot, fallback)), finished: now() };
-  if (output.status !== 'unknown') await writeResult(teamDir, output);
-  return output;
 }
 
 async function rememberDetached(teamDir, task) {
@@ -479,6 +692,8 @@ function newWorker(teamDir, data, harness, cwd) {
     model: data.model || data.router?.worker_model || null,
     resolved_model: null,
     state: 'idle',
+    run_state: 'starting',
+    idle_since_ms: Date.now(),
     task: null,
     task_prompt: null,
     pid: null,
@@ -504,13 +719,17 @@ export async function show(teamDir) {
   const client = await connectSupervisor(STATE_ROOT);
   const status = await syncStatus(teamDir, client, team);
   const data = await load(teamDir);
-  console.log(`team ${teamLabel(data)}  cwd=${data.cwd}  model=${data.model || 'routed/default'}  router=${data.router?.enabled ? data.router.family : 'off'}  state=${teamDir}`);
+  console.log(`team ${teamLabel(data)}  cwd=${data.cwd}  model=${data.model || 'routed/default'}  router=${data.router?.enabled ? data.router.family : 'off'}  idle-stop=${idleStopMs(data) ? `${idleStopMs(data) / 60000}m` : 'off'}  state=${teamDir}`);
   if (data.router?.enabled) {
     console.log(`  classifier=${data.router.classifier} checked=${data.router.checked_at} simple=${data.router.models.simple.model} moderate=${data.router.models.moderate.model} complex=${data.router.models.complex.model} extreme=${data.router.models.extreme?.model || 'init required'}`);
   }
   for (const worker of Object.values(data.workers).sort((left, right) => workerIndex(left.id) - workerIndex(right.id))) {
     const model = worker.resolved_model || worker.model || 'default';
-    console.log(`  ${worker.id.padEnd(4)} ${String(worker.state || 'idle').padEnd(14)} harness=${worker.harness || data.harness} model=${model} session=${worker.session_id || 'pending'} assignments=${worker.assignments} task=${worker.task || '-'} log=${worker.log}`);
+    const runtime = worker.run_state === 'stopped'
+      ? `stopped idle=${idleAge(worker.idle_since_ms)}`
+      : worker.run_state === 'starting' ? 'starting' : worker.state || 'idle';
+    const error = worker.idle_stop_error ? ` idle-stop-error=${worker.idle_stop_error}` : '';
+    console.log(`  ${worker.id.padEnd(4)} ${String(runtime).padEnd(18)} harness=${worker.harness || data.harness} model=${model} session=${worker.session_id || 'pending'} assignments=${worker.assignments} task=${worker.task || '-'} log=${worker.log}${error}`);
   }
   if (status.queued) console.log(`  queued=${status.queued}`);
 }
@@ -696,9 +915,13 @@ async function init(args) {
     await withLock(teamDir, async () => {
       const data = await load(teamDir);
       data.manager_session = process.env.OMP_SESSION_ID || process.env.PI_SESSION_ID || null;
+      data.idle_stop_ms = args.idleStopMs ?? data.idle_stop_ms ?? DEFAULT_IDLE_STOP_MS;
+      idleStopMs(data);
       await save(teamDir, data);
     });
-    const current = existing.data;
+    const client = await connectSupervisor(STATE_ROOT);
+    await syncStatus(teamDir, client, existing.data.id);
+    let current = await load(teamDir);
     const ompOnly = Object.values(current.workers).filter(worker => !worker.retiring).every(worker => workerHarness(worker, current) === 'omp');
     if (familySelected && !ompOnly) die('family routing requires OMP workers; cannot change the harness of existing sessions');
     if (!fixedModel && ompOnly && (familySelected || !current.model)) {
@@ -722,10 +945,12 @@ async function init(args) {
         await save(teamDir, data);
       });
     }
+    current = await load(teamDir);
     if (args.member || fixedModel) {
       return member({ ...args, model: fixedModel, n: args.member || Object.keys(current.workers).length, team: basename(teamDir) });
     }
-    await ensureObservers(teamDir, current, Object.values(current.workers).filter(worker => !worker.retiring));
+    await ensureObservers(teamDir, current, Object.values(current.workers).filter(worker =>
+      !worker.retiring && (workerHarness(worker, current) !== 'omp' || worker.state !== 'idle')));
     return show(teamDir);
   }
   if (args.isolate && muxName === 'hc') die('herdr-app (hc) does not support --isolate; omit --isolate', 2);
@@ -812,6 +1037,7 @@ async function init(args) {
     queue: [],
     detached: {},
     isolate: !!args.isolate,
+    idle_stop_ms: args.idleStopMs ?? DEFAULT_IDLE_STOP_MS,
   };
   await writeShims(teamDir, data);
   try {
@@ -823,6 +1049,7 @@ async function init(args) {
     }
     await save(teamDir, data);
     await ensureObservers(teamDir, data, Object.values(data.workers));
+    await settleWorkerRuntime(teamDir, Object.keys(data.workers));
   } catch (error) {
     const latest = await load(teamDir).catch(() => data);
     await Promise.all(Object.values(latest.workers).map(worker => worker.observer && mux.close(data, worker.observer)));
@@ -886,10 +1113,19 @@ async function member(args) {
         if (!retirees.includes(worker.id)) worker.model = args.model;
       }
     }
+    for (const worker of Object.values(data.workers)) {
+      if (worker.retiring || retirees.includes(worker.id)) continue;
+      worker.run_state = 'starting';
+      worker.idle_since_ms = null;
+      delete worker.starting_task;
+      delete worker.idle_stop_error;
+    }
     await save(teamDir, data);
   });
   try {
-    await ensureObservers(teamDir, data, Object.values(data.workers).filter(worker => !worker.retiring && !retirees.includes(worker.id)));
+    const starting = Object.values(data.workers).filter(worker => !worker.retiring && !retirees.includes(worker.id));
+    await ensureObservers(teamDir, data, starting);
+    await settleWorkerRuntime(teamDir, starting.map(worker => worker.id));
   } catch (error) {
     await Promise.all(added.map(worker => worker.observer && muxOf(data).close(data, worker.observer)));
     await rollbackIsolated({ ...data, workers: Object.fromEntries(added.map(worker => [worker.id, worker])) });
@@ -898,6 +1134,7 @@ async function member(args) {
       for (const worker of added) delete latest.workers[worker.id];
       await save(teamDir, latest);
     });
+    await settleWorkerRuntime(teamDir, Object.keys(data.workers).filter(id => !added.some(worker => worker.id === id)));
     die(`${muxOf(data).name}: ${error.message.split('\n')[0]}`, 4);
   }
 
@@ -1267,7 +1504,7 @@ function usage() {
 team-building helper: persistent harness-neutral workers driven by one manager session.
 
 Commands:
-  init [gpt|claude] [--name NAME|--team ID|NAME] [--model gpt|claude|MODEL] [--member N] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
+  init [gpt|claude] [--name NAME|--team ID|NAME] [--model gpt|claude|MODEL] [--member N] [--idle-stop 15m|0] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
   member N [--model MODEL] [--harness omp|claude|codex] [--allow-bypass]
   dismiss --worker wN[,wM...]
   status
@@ -1329,6 +1566,10 @@ export function parseArgs(argv) {
       index++;
     } else if (option === '--member') {
       args.member = Number(take(index, '--member'));
+      index++;
+    } else if (option === '--idle-stop') {
+      if (args.cmd !== 'init') die('--idle-stop is only valid with init');
+      args.idleStopMs = parseIdleStop(take(index, '--idle-stop'));
       index++;
     } else if (option === '--difficulty') {
       args.difficulty = take(index, '--difficulty');
@@ -1413,12 +1654,17 @@ async function main() {
   }
 
   await mkdir(STATE_ROOT, { recursive: true });
+  if (args.cmd === 'idle-watch') {
+    await idleWatch();
+    return;
+  }
   const action = { init, member, dismiss, status, assign, wait, approve, stop, clear }[args.cmd];
   if (!action) {
     usage();
     die(`invalid command ${args.cmd}`);
   }
   await action(args);
+  await startIdleWatcher();
 }
 
 const modulePath = realpathSync(fileURLToPath(import.meta.url));
