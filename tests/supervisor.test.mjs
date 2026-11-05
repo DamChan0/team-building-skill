@@ -7,12 +7,26 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test, { afterEach } from 'node:test';
-import { Supervisor, supervisorBinary, supervisorCompatibility, supervisorPaths } from '../src/supervisor.mjs';
+import { Supervisor, supervisorBinary, supervisorCompatibility, supervisorEnv, supervisorPaths } from '../src/supervisor.mjs';
 
 const result = JSON.stringify({ status: 'succeeded', summary: 'fixture completed', verification: 'fixture' });
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const uuid = index => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
 const cli = fileURLToPath(new URL('../src/main.mjs', import.meta.url));
+
+test('detached supervisor drops HERDR and hc terminal identity variables', () => {
+  assert.deepEqual(supervisorEnv({
+    HOME: '/home/test',
+    HERDR_ENV: '1',
+    HERDR_SOCKET_PATH: '/run/herdr.sock',
+    HC_TERMINAL_ID: 't2',
+    HC_TERMINAL_SOCKET: '/run/hc.sock',
+    HC_SCOPE: 'scope',
+    HC_SESSION: 'manager',
+    HC_SOCKET: '/run/hc.sock',
+    TERM: 'xterm-256color',
+  }), { HOME: '/home/test', TERM: 'xterm-256color' });
+});
 
 // Codex worker fixture: a native child process speaking JSON-RPC on stdio.
 const fixture = `

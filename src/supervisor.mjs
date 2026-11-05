@@ -89,6 +89,10 @@ export class Supervisor {
   stop(team, worker) { return this.request('stop', { team, worker }, randomUUID(), 20_000); }
 }
 
+export const supervisorEnv = env => Object.fromEntries(
+  Object.entries(env).filter(([key]) => !key.startsWith('HERDR_') && !key.startsWith('HC_')),
+);
+
 async function buildSupervisor() {
   if (await available(supervisorBinary)) return;
   await new Promise((resolve, reject) => {
@@ -108,7 +112,7 @@ async function start(paths, client) {
   }
   await buildSupervisor();
   await new Promise((resolve, reject) => {
-    const daemonEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('HERDR_')));
+    const daemonEnv = supervisorEnv(process.env);
     const child = spawn(supervisorBinary, ['serve', '--state-dir', paths.stateDir, '--socket', paths.socket], { detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: daemonEnv });
     let output = Buffer.alloc(0);
     let settled = false;

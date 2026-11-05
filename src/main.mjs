@@ -65,7 +65,12 @@ function die(message, code = 2) {
 function backendMismatchError(data) {
   const recorded = data.backend || 'orca';
   if (recorded === backendName()) return null;
-  return `team ${data.id} was created under ${recorded}; run it from ${recorded === 'herdr' ? 'a herdr pane' : 'Orca (not inside a herdr pane)'}`;
+  const location = recorded === 'herdr'
+    ? 'a herdr pane'
+    : recorded === 'hc'
+      ? 'a herdr-app terminal'
+      : 'Orca (not inside a herdr or herdr-app terminal)';
+  return `team ${data.id} was created under ${recorded}; run it from ${location}`;
 }
 
 function teamLabel(data) {
@@ -295,7 +300,7 @@ async function ensureObserver(teamDir, data, worker) {
     // Shell preexec hooks overwrite --title; restore it after the hook runs.
     launch = `printf '\\033]0;%s\\007' ${shellQuote(title)}; exec ${shellQuote(supervisorBinary)} view --log ${shellQuote(worker.log)}`;
   }
-  const handle = await mux.create(data, { worktree, title, launch, cwd: worker.cwd || data.cwd, script: join(tab, 'launch.sh') });
+  const handle = await mux.create(data, { worktree, title, launch, cwd: worker.cwd || data.cwd, script: join(tab, 'launch.sh'), worker: worker.id });
   worker.observer = handle; // rollback reads the in-memory handle
   worker.observer_kind = omp ? 'tab' : 'viewer';
   await withLock(teamDir, async () => {
@@ -723,6 +728,7 @@ async function init(args) {
     await ensureObservers(teamDir, current, Object.values(current.workers).filter(worker => !worker.retiring));
     return show(teamDir);
   }
+  if (args.isolate && muxName === 'hc') die('herdr-app (hc) does not support --isolate; omit --isolate', 2);
 
   const mux = MUXES[muxName];
   const placePromise = Promise.all([mux.current(die), mux.home(die)]).then(([current, home]) => ({ worktree: current.worktree, home }));

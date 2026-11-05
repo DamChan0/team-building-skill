@@ -43,7 +43,7 @@ Judge from the task, not its length. No classifier call needed for tier 0/1.
 
 Team names are lowercase slugs (`a-z`, digits, `_`, `-`), unique among active teams on the current backend; values matching generated team IDs are reserved. All team-scoped commands accept `--team ID|NAME`; without it, the current path must have exactly one team.
 
-Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|codex` needs `--allow-bypass`. Workers live in Orca tabs, or herdr tabs when the manager runs inside a herdr pane (`HERDR_ENV=1`); a team stays bound to its creating backend (other backend: exit 4; `status`/`init` list only this backend's teams). An OMP worker's tab is the worker itself (live interactive session); closing it ends the worker, and `member <current N>` or the next `assign` reopens it with the same session. Claude/Codex tabs are read-only observers; closing one does not stop the worker.
+Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|codex` needs `--allow-bypass`. Workers live in Orca tabs, herdr TUI tabs (`HERDR_ENV=1`), or labeled herdr-app (`hc`) child terminals (`HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET`); teams stay bound to their creating backend (other backend: exit 4; `status`/`init` list only current-backend teams). OMP tabs are live sessions; closing one ends the worker, and `member <current N>` or the next `assign` reopens it. Claude/Codex observers are read-only; closing one does not stop the worker.
 
 - In Orca, `init` binds to the manager terminal's `ORCA_WORKTREE_ID`; it exits 4 if `cwd` is outside that worktree or its git top-level differs. Register sibling git worktrees with Orca or run `init` from the manager's worktree.
 
@@ -59,5 +59,5 @@ Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|code
 
 - Workers touch only assigned files, never push, never ask the user; blocked work returns `blocked` with the exact need.
 - Gated commands: `git push`, `ssh`, `scp`, `rsync`, `sftp`, `gh`, `docker push`. On `approval_requests`, ask the user; after approval run `approve`, then same-worker `assign --approval tNNN`.
-- `--isolate`: one worktree per worker (Orca or herdr, as the team's multiplexer); ask for a local commit, then merge/cherry-pick in the manager worktree.
+- `--isolate`: one worktree per worker (Orca or herdr TUI); herdr-app (`hc`) supports shared worktrees only.
 - `unknown` worker state: do not submit, clear, or clean up until `stop --worker wN` succeeds.

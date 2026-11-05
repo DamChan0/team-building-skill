@@ -13,7 +13,13 @@ export const WORKER_ENV = 'TEAM_BUILDING_WORKER';
 export const TEAM_ID_PATTERN = /^tb-\d{4}-\d{6}(?:-\d+)?$/;
 export const TEAM_NAME_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 export const GATED = ['git', 'ssh', 'scp', 'rsync', 'sftp', 'gh', 'docker'];
-export const backendName = () => (process.env.HERDR_ENV === '1' ? 'herdr' : 'orca');
+export const backendName = () => (
+  process.env.HERDR_ENV === '1'
+    ? 'herdr'
+    : process.env.HC_TERMINAL_ID || process.env.HC_TERMINAL_SOCKET
+      ? 'hc'
+      : 'orca'
+);
 
 export const now = () => new Date().toISOString().replace(/\.\d{3}Z$/, '');
 

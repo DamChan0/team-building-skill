@@ -649,3 +649,103 @@ console.log(JSON.stringify({ id: '1', result: { pane: { pane_id: 'p1', tab_id: '
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test('init and member route herdr-app workers to hc child terminals', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'team-building-herdr-app-'));
+  const cwd = join(home, 'project');
+  const calls = join(home, 'hc-calls.jsonl');
+  const hc = join(home, 'hc');
+  const stateRoot = join(home, '.local', 'state', 'team-building');
+  const socket = '/run/user/1000/herdr-core/default.sock';
+  const env = {
+    ...process.env,
+    HOME: home,
+    HERDR_ENV: '',
+    HC_TERMINAL_ID: 't-manager',
+    HC_TERMINAL_SOCKET: socket,
+    HC_SCOPE: 'manager-scope',
+    HC_SOCKET: '/ambient/other.sock',
+    HC_CLI_COMMAND: hc,
+    HC_TEST_CALLS: calls,
+  };
+  const run = (...args) => spawnSync(process.execPath, [main, ...args], {
+    cwd,
+    encoding: 'utf8',
+    timeout: 10_000,
+    env,
+  });
+  try {
+    await mkdir(cwd, { recursive: true });
+    await writeFile(calls, '');
+    await writeFile(hc, `#!/usr/bin/env node
+import { appendFileSync, readFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+const log = process.env.HC_TEST_CALLS;
+const history = readFileSync(log, 'utf8').trim().split('\\n').filter(Boolean).map(JSON.parse);
+appendFileSync(log, JSON.stringify({ args, socket: process.env.HC_SOCKET, caller: process.env.HC_TERMINAL_ID, terminalSocket: process.env.HC_TERMINAL_SOCKET }) + '\\n');
+if (args[1] === 'run') {
+  const count = history.filter(call => call.args[1] === 'run').length;
+  console.log(JSON.stringify({ address: 't' + (count + 1) }));
+} else if (args[1] === 'get') {
+  console.log(JSON.stringify({ address: args[2], state: 'live' }));
+} else if (args[1] === 'server' && args[2] === 'status') {
+  console.log(JSON.stringify({ core: { id: 'fixture' } }));
+} else {
+  console.error(JSON.stringify({ error: { kind: 'unsupported', message: 'unsupported fixture call' } }));
+  process.exit(1);
+}
+`);
+    await chmod(hc, 0o755);
+
+    const init = run('init', '--harness', 'claude', '--allow-bypass', '--member', '1');
+    assert.equal(init.status, 0, `${init.stderr}${init.stdout}`);
+    const team = (await readdir(stateRoot)).find(name => name.startsWith('tb-'));
+    const teamDir = join(stateRoot, team);
+    let data = JSON.parse(await readFile(join(teamDir, 'team.json'), 'utf8'));
+    assert.equal(data.backend, 'hc');
+    assert.equal(data.socket, socket);
+    assert.equal(data.workers.w1.observer, 't1');
+
+    const member = run('member', '2', '--allow-bypass');
+    assert.equal(member.status, 0, `${member.stderr}${member.stdout}`);
+    data = JSON.parse(await readFile(join(teamDir, 'team.json'), 'utf8'));
+    assert.equal(data.workers.w2.observer, 't2');
+
+    const logged = (await readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    const created = logged.filter(call => call.args[1] === 'run');
+    assert.equal(created.length, 2);
+    for (const [index, call] of created.entries()) {
+      assert.equal(call.socket, socket);
+      assert.equal(call.caller, 't-manager');
+      assert.equal(call.terminalSocket, socket);
+      assert.deepEqual(call.args.slice(0, 3), ['--json', 'run', '--bg']);
+      assert.equal(call.args[call.args.indexOf('--cwd') + 1], cwd);
+      assert.ok(call.args.includes(`team=${team}`));
+      assert.ok(call.args.includes(`worker=w${index + 1}`));
+      assert.equal(call.args.at(-2), 'sh');
+    }
+
+    const isolatedCwd = join(home, 'isolated');
+    await mkdir(isolatedCwd);
+    const isolated = spawnSync(process.execPath, [main, 'init', '--harness', 'claude', '--allow-bypass', '--member', '1', '--isolate'], {
+      cwd: isolatedCwd,
+      encoding: 'utf8',
+      timeout: 10_000,
+      env,
+    });
+    assert.equal(isolated.status, 2, isolated.stderr);
+    assert.match(isolated.stderr, /herdr-app \(hc\) does not support --isolate/);
+    assert.equal((await readdir(stateRoot)).filter(name => name.startsWith('tb-')).length, 1);
+
+    const wrongBackend = spawnSync(process.execPath, [main, 'assign', '--team', team, '--worker', 'w1', 'work'], {
+      cwd,
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: { ...env, HC_TERMINAL_ID: '', HC_TERMINAL_SOCKET: '', HC_SCOPE: '', HC_SOCKET: '' },
+    });
+    assert.equal(wrongBackend.status, 4, wrongBackend.stderr);
+    assert.match(wrongBackend.stderr, /created under hc; run it from a herdr-app terminal/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});

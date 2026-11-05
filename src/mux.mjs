@@ -153,6 +153,11 @@ async function herdrTabs(data, worktree) {
   return listing.tabs;
 }
 
+async function gitWorktree() {
+  const top = await command('git', ['rev-parse', '--show-toplevel']);
+  return { worktree: top.code === 0 && top.out.trim() ? top.out.trim() : realpathSync(process.cwd()) };
+}
+
 const herdrMux = {
   name: 'herdr',
   label: 'herdr',
@@ -163,10 +168,7 @@ const herdrMux = {
       die(`herdr is not reachable (${error.message})`, 4);
     }
   },
-  async current() {
-    const top = await command('git', ['rev-parse', '--show-toplevel']);
-    return { worktree: top.code === 0 && top.out.trim() ? top.out.trim() : realpathSync(process.cwd()) };
-  },
+  current: gitWorktree,
   async home(die) {
     if (process.env.HERDR_ENV !== '1') die('not inside a herdr pane (HERDR_ENV is not 1)', 4);
     return { socket: process.env.HERDR_SOCKET_PATH, workspace: process.env.HERDR_WORKSPACE_ID };
@@ -231,6 +233,104 @@ const herdrMux = {
   },
 };
 
-export const MUXES = { orca: orcaMux, herdr: herdrMux };
+async function hc(data, ...args) {
+  const program = process.env.HC_CLI_COMMAND || 'hc';
+  const result = await command(program, ['--json', ...args], { env: data.socket && { HC_SOCKET: data.socket } })
+    .catch(error => { throw new OrcaError(`hc ${args.slice(0, 2).join(' ')}: ${error.message}`); });
+  const text = (result.code === 0 ? result.out : result.err || result.out).trim();
+  let response;
+  try { response = text ? JSON.parse(text) : null; } catch (error) {
+    if (result.code === 0) throw new OrcaError(`hc ${args.slice(0, 2).join(' ')} returned invalid JSON: ${error.message}`);
+  }
+  if (result.code === 0) return response;
+  const failure = response?.error;
+  throw Object.assign(new OrcaError(`hc ${args.slice(0, 2).join(' ')}: ${failure?.message || text.slice(-300)}`), { code: failure?.kind });
+}
+
+const hcMux = {
+  name: 'hc',
+  label: 'herdr-app',
+  async require(data, die) {
+    try {
+      await hc(data, 'server', 'status');
+    } catch (error) {
+      die(`herdr-app is not reachable (${error.message})`, 4);
+    }
+  },
+  current: gitWorktree,
+  async home(die) {
+    const socket = process.env.HC_TERMINAL_SOCKET;
+    if (!process.env.HC_TERMINAL_ID || !socket) {
+      die('not inside a herdr-app terminal (HC_TERMINAL_ID and HC_TERMINAL_SOCKET are required)', 4);
+    }
+    try {
+      await hc({ socket }, 'server', 'status');
+    } catch (error) {
+      die(`herdr-app is not reachable (${error.message})`, 4);
+    }
+    return { socket };
+  },
+  async inspect(data, handle) {
+    let terminal;
+    try {
+      terminal = await hc(data, 'get', handle);
+    } catch (error) {
+      if (error.code === 'not_found') return null;
+      throw error;
+    }
+    return terminal?.state === 'live' ? { orphaned: false, title: null } : null;
+  },
+  async listToolTabs(data) {
+    const listing = await hc(data, 'ls', '--all');
+    if (!Array.isArray(listing?.terminals)) throw new OrcaError('hc terminal census returned no terminals');
+    if (listing.terminals.some(terminal => typeof terminal.address !== 'string' || !terminal.address)) {
+      throw new OrcaError('hc terminal census returned a terminal without an address');
+    }
+    return listing.terminals.map(terminal => terminal.address);
+  },
+  async ownsToolTab(data, handle) {
+    return (await this.listToolTabs(data)).includes(handle);
+  },
+  async create(data, { title, launch, cwd, script, worker }) {
+    await writeFile(script, `${launch}\n`);
+    const terminal = await hc(
+      data,
+      'run',
+      '--bg',
+      '--cwd',
+      cwd,
+      '--label',
+      `team=${data.id}`,
+      '--label',
+      `worker=${worker}`,
+      '--label',
+      `where=${title}`,
+      'sh',
+      script,
+    );
+    if (typeof terminal?.address !== 'string' || !terminal.address) throw new OrcaError('hc run returned no terminal address');
+    return terminal.address;
+  },
+  async close(data, handle) {
+    try {
+      const terminal = await hc(data, 'get', handle);
+      if (terminal.state === 'live') await hc(data, 'kill', handle);
+      else if (terminal.state !== 'finished') throw new OrcaError('hc get returned a terminal without a state');
+      await hc(data, 'rm', handle);
+      return true;
+    } catch (error) {
+      if (error.code === 'not_found') return true;
+      throw error;
+    }
+  },
+  async addWorktree() {
+    throw new OrcaError('herdr-app (hc) does not support --isolate; use a shared worktree');
+  },
+  async removeWorktree() {
+    throw new OrcaError('herdr-app (hc) does not support isolated worktrees');
+  },
+};
+
+export const MUXES = { orca: orcaMux, herdr: herdrMux, hc: hcMux };
 // Teams created before backend selection have no `backend` field and were Orca teams.
 export const muxOf = data => MUXES[data.backend || 'orca'];

@@ -1,10 +1,10 @@
 # team-building
 
-- **Release:** [v0.5.4](https://github.com/DamChan0/team-building-skill/releases/tag/v0.5.4)
+- **Release:** [v0.5.6](https://github.com/DamChan0/team-building-skill/releases/tag/v0.5.6)
 - Persistent AI-worker teams managed from one session.
 - **Manager hosts:** OMP, Pi, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
 - **OMP is not needed when Pi, Claude Code, or Codex is the manager and you select native workers.** OMP remains the default worker backend.
-- **A terminal multiplexer is required in every mode:** Orca (app and CLI with the active worktree registered) or herdr (manager running inside a herdr pane).
+- **A terminal multiplexer is required in every mode:** Orca (app and CLI with the active worktree registered), herdr TUI, or herdr-app (`hc` with the manager inside a terminal).
 
 ![team-building concept: the manager splits a user command into briefs, native worker sessions execute them, Orca observer terminals show typed UI messages, and the manager reviews results](concept.webp)
 
@@ -36,7 +36,7 @@ sequenceDiagram
   - `omp` (default) runs the worker as a live interactive OMP session in its Orca tab. The `team-role` extension inside that session exchanges task/result files with the supervisor (`<team-dir>/tabs/<worker>/`: `ready.json`, `beat`, `task.json`, `started.json`, `outcome.json`, `abort.json`), so you can watch and type into the worker while the manager's `assign` still blocks for the structured result.
   - `claude` launches the native Claude Code CLI with `stream-json`.
   - `codex` launches the native Codex CLI through `app-server` JSON-RPC.
-- **Terminal/worktree backend:** Orca by default, herdr when the manager runs inside a herdr pane (`HERDR_ENV=1`). A team stays bound to the backend it was created under (`team.json` `backend`; teams without it are Orca teams); commands from the other backend exit 4 and `status`/`init` list only this backend's teams. Under herdr the worker is a tab in the manager's workspace (label `<team-id> <worker-id> session`) whose pane runs the launch command via `<team-dir>/tabs/<worker>/launch.sh`; the tab id is the stored handle, a vanished tab means a closed worker tab, and calls are pinned to the herdr server recorded at init (`HERDR_SOCKET_PATH`). herdr worktrees (`--isolate`) keep their branch after removal.
+- **Terminal/worktree backend:** Orca by default, herdr TUI when `HERDR_ENV=1`, or herdr-app (`hc`) when `HC_TERMINAL_ID`/`HC_TERMINAL_SOCKET` are set. Teams bind to their creating backend (`team.json` `backend`; legacy teams default to Orca); commands from other backends exit 4, and `status`/`init` list only current-backend teams. herdr TUI workers are tabs in the manager workspace; herdr-app workers are labeled child terminals created with `hc run --bg`, stored by terminal address, and pinned to the socket recorded at init (`HC_SOCKET`). The detached supervisor strips `HERDR_*` and `HC_*` environment variables. herdr-app uses shared worktrees; `--isolate` is unsupported.
 - **Worker tabs:** An OMP worker's tab *is* the worker: the full interactive session, resumed from its recorded session file. Claude/Codex tabs are read-only observers showing one typed UI summary line per finished task and never receive native protocol traffic or `TaskResult` JSON.
 - Closing an OMP worker tab ends that worker (a running task becomes `failed: worker tab exited`); the session file survives. The next assignment, `member <current N>`, or `init` re-adoption reopens the tab and resumes the same session. Closing a Claude/Codex observer does not stop its worker. Connected tabs are reused. A live Orca tab without a pane produces a warning instead of launching another; use `orca-ide terminal switch --terminal <handle>` to reveal it.
 - Typing into an OMP worker tab while a task runs is allowed but unsupervised: its output is part of that task's final message. The extension needs `team-role.ts` installed (`node install.mjs`) before the tab starts, and omp tab titles are managed by omp itself (`<team-id> <worker-id> observer` applies only to Claude/Codex).
@@ -64,11 +64,11 @@ sequenceDiagram
 - **Setup prerequisites:** Node.js 20+, npm, Rust/Cargo.
 - **Runtime prerequisites:**
   - Node.js 20+.
-  - A running Orca app and CLI (`orca-ide`) with the current worktree registered, **or** a running herdr with the manager inside a herdr pane (`HERDR_ENV=1`).
+  - A running Orca app and CLI (`orca-ide`) with the current worktree registered, a herdr TUI pane (`HERDR_ENV=1`), **or** a herdr-app terminal with `hc` (`HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET`).
   - In an Orca terminal, `init` uses the manager tab's `ORCA_WORKTREE_ID`. It exits 4 if `cwd` is outside that worktree or its git top-level differs; a terminal without `ORCA_WORKTREE_ID` also fails closed. Register sibling worktrees in Orca or run `init` from the manager's worktree.
   - The selected worker CLI in `PATH` (`omp`, `claude`, or `codex`).
 - On Linux, do not use bare `orca`; it is the GNOME screen reader.
-- Set `ORCA_CLI_COMMAND` if the Orca CLI binary has another name; `HERDR_CLI_COMMAND` likewise for herdr.
+- Set `ORCA_CLI_COMMAND` if the Orca CLI binary has another name; `HERDR_CLI_COMMAND` likewise for herdr; `HC_CLI_COMMAND` for the `hc` binary.
 - **Install the skill for Claude Code and Codex** using the [Skills CLI](https://github.com/vercel-labs/skills):
 
   ```sh
@@ -198,7 +198,7 @@ node ~/.agents/skills/team-building/src/main.mjs clear [--team ID|NAME] [--fast]
 
 - Shared teams bind to the active worktree (herdr: the git root of the manager's cwd).
   - Every assignment checks that the team worktree still matches and the selected worker's cwd stays inside it.
-- `--isolate` creates a separate worktree per worker (Orca worktree or herdr worktree, per the team's multiplexer).
+- `--isolate` creates a separate worktree per worker (Orca or herdr TUI); herdr-app (`hc`) supports shared worktrees only.
   - Uncommitted manager changes are not copied into isolated worktrees.
   - Review isolated commits in the manager worktree and merge or cherry-pick locally.
   - Workers never push.
