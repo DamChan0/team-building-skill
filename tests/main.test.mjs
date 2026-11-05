@@ -53,6 +53,8 @@ test('detached CLI work prints only its task id and wait consumes completed mapp
   const environment = {
     ...process.env,
     HOME: home,
+    ORCA_WORKTREE_ID: '',
+    ORCA_TERMINAL_HANDLE: '',
     ORCA_CLI_COMMAND: orca,
     ORCA_TEST_CALLS: orcaCalls,
     ORCA_TEST_TERMINALS: terminalState,
@@ -263,7 +265,14 @@ console.log(JSON.stringify({ ok: true, result }));
         cwd: home,
         encoding: 'utf8',
         timeout: 10_000,
-        env: { ...process.env, HOME: home, ORCA_CLI_COMMAND: orca, ORCA_TEST_CALLS: calls },
+        env: {
+          ...process.env,
+          HOME: home,
+          ORCA_CLI_COMMAND: orca,
+          ORCA_TERMINAL_HANDLE: '',
+          ORCA_WORKTREE_ID: '',
+          ORCA_TEST_CALLS: calls,
+        },
       });
       assert.equal(result.status, 4, `${result.error?.message || ''}${result.stderr}`);
       assert.match(result.stderr, scenario.match);
@@ -275,6 +284,120 @@ console.log(JSON.stringify({ ok: true, result }));
     } finally {
       await rm(home, { recursive: true, force: true });
     }
+  }
+});
+test('init refuses an Orca ancestor when manager terminal has a different worktree', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'team-building-orca-manager-worktree-'));
+  const managerWorktree = join(home, 'RGBD');
+  const cwd = join(home, 'RGBD-pcd');
+  const calls = join(home, 'orca-calls.jsonl');
+  const orca = join(home, 'orca-ide');
+  const stateRoot = join(home, '.local', 'state', 'team-building');
+  try {
+    await Promise.all([mkdir(managerWorktree), mkdir(cwd)]);
+    await writeFile(calls, '');
+    await writeFile(orca, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+const args = process.argv.slice(2, -1);
+appendFileSync(process.env.ORCA_TEST_CALLS, JSON.stringify(args) + '\\n');
+const result = args[0] === 'worktree'
+  ? { worktree: { path: ${JSON.stringify(home)} } }
+  : args[0] === 'terminal' && args[1] === 'create'
+    ? { terminal: { handle: 'unexpected-parent-tab', connected: true } }
+    : { app: { running: true }, runtime: { reachable: true } };
+console.log(JSON.stringify({ ok: true, result }));
+`);
+    await chmod(orca, 0o755);
+
+    const result = spawnSync(process.execPath, [main, 'init', '--harness', 'claude', '--allow-bypass', '--member', '1'], {
+      cwd,
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        HOME: home,
+        HERDR_ENV: '',
+        ORCA_CLI_COMMAND: orca,
+        ORCA_TERMINAL_HANDLE: 'manager-terminal',
+        ORCA_TEST_CALLS: calls,
+        ORCA_WORKTREE_ID: `manager-id::${managerWorktree}`,
+      },
+    });
+
+    assert.equal(result.status, 4, result.stderr);
+    assert.ok(result.stderr.includes(cwd), result.stderr);
+    assert.ok(result.stderr.includes(managerWorktree));
+    const invoked = (await readFile(calls, 'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
+    assert.deepEqual(invoked, []);
+    assert.deepEqual(await readdir(stateRoot), []);
+    const missingId = spawnSync(process.execPath, [main, 'init', '--harness', 'claude', '--allow-bypass', '--member', '1'], {
+      cwd,
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        HOME: home,
+        HERDR_ENV: '',
+        ORCA_CLI_COMMAND: orca,
+        ORCA_TERMINAL_HANDLE: 'manager-terminal',
+        ORCA_TEST_CALLS: calls,
+        ORCA_WORKTREE_ID: '',
+      },
+    });
+    assert.equal(missingId.status, 4, missingId.stderr);
+    assert.match(missingId.stderr, /no ORCA_WORKTREE_ID/);
+    assert.equal((await readFile(calls, 'utf8')).trim(), '');
+    assert.deepEqual(await readdir(stateRoot), []);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('init rejects an Orca folder context above the cwd git root', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'team-building-orca-git-root-'));
+  const cwd = join(home, 'repo');
+  const calls = join(home, 'orca-calls.jsonl');
+  const orca = join(home, 'orca-ide');
+  const stateRoot = join(home, '.local', 'state', 'team-building');
+  try {
+    await mkdir(cwd);
+    assert.equal(spawnSync('git', ['init', '--quiet', cwd]).status, 0);
+    await writeFile(calls, '');
+    await writeFile(orca, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+const args = process.argv.slice(2, -1);
+appendFileSync(process.env.ORCA_TEST_CALLS, JSON.stringify(args) + '\\n');
+const result = args[0] === 'worktree'
+  ? { worktree: { path: ${JSON.stringify(home)} } }
+  : { app: { running: true }, runtime: { reachable: true } };
+console.log(JSON.stringify({ ok: true, result }));
+`);
+    await chmod(orca, 0o755);
+
+    const result = spawnSync(process.execPath, [main, 'init', '--harness', 'claude', '--allow-bypass', '--member', '1'], {
+      cwd,
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        HOME: home,
+        HERDR_ENV: '',
+        ORCA_CLI_COMMAND: orca,
+        ORCA_TERMINAL_HANDLE: 'manager-terminal',
+        ORCA_TEST_CALLS: calls,
+        ORCA_WORKTREE_ID: `manager-id::${home}`,
+      },
+    });
+
+    assert.equal(result.status, 4, result.stderr);
+    assert.ok(result.stderr.includes(cwd), result.stderr);
+    assert.ok(result.stderr.includes(home), result.stderr);
+    assert.match(result.stderr, /git top-level/);
+    const invoked = (await readFile(calls, 'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
+    assert.deepEqual(invoked, []);
+    assert.deepEqual(await readdir(stateRoot), []);
+  } finally {
+    await rm(home, { recursive: true, force: true });
   }
 });
 
@@ -292,7 +415,19 @@ test('supports named teams at the same path and creates observers for new worker
     cwd,
     encoding: 'utf8',
     timeout: 10_000,
-    env: { ...process.env, HERDR_ENV: '', HOME: home, OMP_SESSION_ID: '', PI_SESSION_ID: 'pi-session-fixture', ORCA_CLI_COMMAND: orca, ORCA_TEST_CALLS: calls, ORCA_TEST_TERMINALS: terminals, PATH: `${bin}:${process.env.PATH || ''}` },
+    env: {
+      ...process.env,
+      HERDR_ENV: '',
+      HOME: home,
+      OMP_SESSION_ID: '',
+      PI_SESSION_ID: 'pi-session-fixture',
+      ORCA_CLI_COMMAND: orca,
+      ORCA_TERMINAL_HANDLE: '',
+      ORCA_WORKTREE_ID: '',
+      ORCA_TEST_CALLS: calls,
+      ORCA_TEST_TERMINALS: terminals,
+      PATH: `${bin}:${process.env.PATH || ''}`,
+    },
   });
   const paths = supervisorPaths(stateRoot);
   const client = new Supervisor(paths);

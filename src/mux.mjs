@@ -1,3 +1,4 @@
+import { isAbsolute } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { command, OrcaError, shellQuote } from './harness.mjs';
@@ -40,6 +41,20 @@ const orcaMux = {
   },
   // The manager's worktree, as the multiplexer sees it.
   async current(die) {
+    const managerWorktreeId = process.env.ORCA_WORKTREE_ID;
+    if (managerWorktreeId) {
+      const separator = managerWorktreeId.indexOf('::');
+      const root = separator > 0 ? managerWorktreeId.slice(separator + 2) : '';
+      if (!isAbsolute(root)) die('Orca manager has an invalid ORCA_WORKTREE_ID; refusing cwd-based worktree lookup.', 4);
+      try {
+        return { worktree: realpathSync(root) };
+      } catch (error) {
+        die(`Orca manager worktree ${root} from ORCA_WORKTREE_ID is unavailable (${error.message}); refusing cwd-based worktree lookup.`, 4);
+      }
+    }
+    if (process.env.ORCA_TERMINAL_HANDLE) {
+      die('Orca manager terminal has no ORCA_WORKTREE_ID; refusing cwd-based worktree lookup because Orca may select an ancestor.', 4);
+    }
     const result = await command(ORCA, ['worktree', 'current', '--json']);
     let response;
     try {

@@ -45,6 +45,8 @@ Team names are lowercase slugs (`a-z`, digits, `_`, `-`), unique among active te
 
 Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|codex` needs `--allow-bypass`. Workers live in Orca tabs, or herdr tabs when the manager runs inside a herdr pane (`HERDR_ENV=1`); a team stays bound to its creating backend (other backend: exit 4; `status`/`init` list only this backend's teams). An OMP worker's tab is the worker itself (live interactive session); closing it ends the worker, and `member <current N>` or the next `assign` reopens it with the same session. Claude/Codex tabs are read-only observers; closing one does not stop the worker.
 
+- In Orca, `init` binds to the manager terminal's `ORCA_WORKTREE_ID`; it exits 4 if `cwd` is outside that worktree or its git top-level differs. Register sibling git worktrees with Orca or run `init` from the manager's worktree.
+
 ## Dispatch
 
 1. Split into independent slices with non-overlapping files; indivisible = one worker. Follow-ups go to the same worker (`--worker wN`) to keep its session.

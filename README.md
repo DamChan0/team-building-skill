@@ -65,6 +65,7 @@ sequenceDiagram
 - **Runtime prerequisites:**
   - Node.js 20+.
   - A running Orca app and CLI (`orca-ide`) with the current worktree registered, **or** a running herdr with the manager inside a herdr pane (`HERDR_ENV=1`).
+  - In an Orca terminal, `init` uses the manager tab's `ORCA_WORKTREE_ID`. It exits 4 if `cwd` is outside that worktree or its git top-level differs; a terminal without `ORCA_WORKTREE_ID` also fails closed. Register sibling worktrees in Orca or run `init` from the manager's worktree.
   - The selected worker CLI in `PATH` (`omp`, `claude`, or `codex`).
 - On Linux, do not use bare `orca`; it is the GNOME screen reader.
 - Set `ORCA_CLI_COMMAND` if the Orca CLI binary has another name; `HERDR_CLI_COMMAND` likewise for herdr.

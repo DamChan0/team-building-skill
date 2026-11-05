@@ -514,6 +514,11 @@ function insideWorktree(worktree, cwd) {
   const path = relative(resolve(worktree), resolve(cwd));
   return path === '' || (path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path));
 }
+function assertTeamWorktree(data, currentWorktree) {
+  if (data.worktree && resolve(data.worktree) !== resolve(currentWorktree)) {
+    die(`team initialized worktree ${data.worktree} does not match active ${muxOf(data).label} worktree ${currentWorktree}; initialize a new team there`, 4);
+  }
+}
 function assignmentWorktreeError(data, worker, currentWorktree) {
   const worktree = data.isolate ? worker.worktree : data.worktree || currentWorktree;
   const cwd = worker.cwd || data.cwd;
@@ -679,6 +684,8 @@ async function init(args) {
     const teamDir = existing.teamDir;
     const adoptMismatch = backendMismatchError(existing.data);
     if (adoptMismatch) die(adoptMismatch, 4);
+    const currentWorktree = (await MUXES[muxName].current(die)).worktree;
+    assertTeamWorktree(existing.data, currentWorktree);
     console.log(`adopted existing team ${teamLabel(existing.data)} for cwd ${cwd}`);
     // The adopting session becomes the manager; role widgets key on this id.
     await withLock(teamDir, async () => {
@@ -742,8 +749,14 @@ async function init(args) {
   }
 
   const { worktree, home } = await placePromise;
-  if (!args.isolate && !insideWorktree(worktree, cwd)) {
-    die(`manager cwd ${cwd} is outside active ${mux.label} worktree ${worktree}; return to that worktree or initialize a new team there`, 4);
+  if (!args.isolate) {
+    const [gitCode, gitRoot] = await gitOutput(['rev-parse', '--show-toplevel'], cwd);
+    const sameWorktree = insideWorktree(worktree, cwd)
+      && (gitCode !== 0 || resolve(gitRoot) === resolve(worktree));
+    if (!sameWorktree) {
+      const gitDetail = gitCode === 0 ? ` (git top-level ${gitRoot})` : '';
+      die(`manager cwd ${cwd}${gitDetail} does not match active ${mux.label} worktree ${worktree}; register the git worktree in Orca or run init from the manager's worktree`, 4);
+    }
   }
   if (args.isolate && (await gitOutput(['rev-parse', '--show-toplevel'], cwd))[0]) {
     die('--isolate requires a git repository cwd', 2);
@@ -832,6 +845,7 @@ async function member(args) {
     if (data.closing) die('team is being cleared');
     const memberMismatch = backendMismatchError(data);
     if (memberMismatch) die(memberMismatch, 4);
+    assertTeamWorktree(data, (await muxOf(data).current(die)).worktree);
 
     const effectiveHarness = args.harness || data.harness || 'omp';
     const liveWorkers = Object.values(data.workers)
@@ -987,9 +1001,7 @@ async function assign(args) {
   placePromise.catch(() => {});
   await muxReady;
   const currentWorktree = (await placePromise).worktree;
-  if (data.worktree && resolve(data.worktree) !== resolve(currentWorktree)) {
-    die(`team initialized worktree ${data.worktree} does not match active ${mux.label} worktree ${currentWorktree}; initialize a new team there`, 4);
-  }
+  assertTeamWorktree(data, currentWorktree);
   const automatic = data.router?.enabled && !data.model && !args.model && !args.difficulty;
   if (automatic || (args.difficulty && !args.model)) {
     const error = routingError(data, args.worker);
