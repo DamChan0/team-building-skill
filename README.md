@@ -10,7 +10,7 @@
 
 ## Weight routing
 
-`SKILL.md` makes the manager pick the lightest executor first: tier 0 inline, tier 1 one-shot host subagent (no team), tier 2 a 1–2 worker team, tier 3 a parallel team sized to the independent slices (≤4). Failed or blocked results escalate one tier; idle workers are dismissed. `--difficulty` chooses model strength independently of team size.
+`SKILL.md` routes short bounded work to tier 1 one-shot subagents; long-running, multi-step, or resumable work uses a persistent team worker (tier 2), even when the code change is simple. Tier 3 uses a parallel team sized to independent slices (≤4). Failed or blocked results escalate one tier; idle workers are dismissed. `--difficulty` chooses model strength independently of team size.
 
 ## Execution model
 

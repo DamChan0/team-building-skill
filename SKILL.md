@@ -12,17 +12,18 @@ argument-hint: <task> | init claude --member 3 | member 4 | status | clear | ass
 
 `TB="node ~/.agents/skills/team-building/src/main.mjs"`. The CLI is the whole interface: run it directly. Do not read `src/`, `supervisor/`, or `README.md`; `$TB --help` prints usage, errors state the fix.
 
-## Route first (pick the lightest tier that holds)
+## Route first (pick the lightest executor that fits)
 
-Judge from the task, not its length. No classifier call needed for tier 0/1.
+Judge scope and execution lifetime separately. Long-running, multi-step, resumable, or explicitly worker-directed work MUST use a persistent team worker even when the code change is otherwise simple. Do not leave it in a one-shot host subagent or an opaque background subagent job. Task complexity still selects model strength; duration selects whether execution needs a persistent worker.
 
 | Tier | Fits | Execute | Team? |
 |---|---|---|---|
 | **0 trivial** | 1–2 line edit, lookup, known file, answer from context | Do it yourself | no |
-| **1 simple** | Bounded edit/review, one concern, clear acceptance, ≤3 files | One host subagent (OMP `task`, Claude Code Agent, Codex subagent), one-shot | no |
-| **2 moderate** | Familiar multi-file integration, needs design judgment, 1–2 slices | `init --member 2` (reuse existing) → `assign` | yes, 1–2 workers |
+| **1 simple** | Short bounded edit/review, one concern, clear acceptance, ≤3 files | One-shot host subagent (OMP `task`, Claude Code Agent, Codex subagent) | no |
+| **2 moderate** | Familiar multi-file integration, design judgment, 1–2 slices; or any long-running/resumable task | `init --member 1` for one slice → `assign` (use `--detach` when continuing without blocking) | yes |
 | **3 heavy** | Security, concurrency, architecture, root cause, or ≥3 independent slices | `init --member N` (N = independent slices, ≤4) → parallel `assign --worker wK` | yes, N workers |
 
+- Long-running means work expected to take multiple phases, require later follow-up/verification, or remain active while the manager handles other work. If uncertain, prefer the persistent worker; do not classify by file count alone.
 - Team exists already (`status`) → reuse it for tier 2/3; never `init` for tier 0/1.
 - Multiple same-path teams: run `status --team NAME` and pass the same `--team NAME` to `assign`; never rely on implicit selection.
 - Measured cost (OMP workers): `init` ≈1.3s warm / 3.8s cold model catalog; idle team ≈10MB; each *running* worker ≈500MB RSS and ≥6s per task; `clear --fast` ≈1s vs ≈9s with model wrap-up. Pass `--fast` unless final summaries are needed.
