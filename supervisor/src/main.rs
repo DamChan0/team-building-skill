@@ -25,8 +25,8 @@ use store::{Completion, Store, TaskSnapshot};
 const MAX_CONNECTIONS: usize = 32;
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
-// Bump when the manager/supervisor worker-result or submit contract changes incompatibly.
-const COMPATIBILITY_MARKER: u8 = 3;
+// Bump when manager/supervisor contracts or required worker behavior change.
+const COMPATIBILITY_MARKER: u8 = 4;
 
 #[derive(Parser)]
 struct Cli {
@@ -695,12 +695,49 @@ fn print_ui(record: &[u8]) {
     };
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
-    for character in text.chars() {
-        if character.is_control() {
-            let _ = write!(output, "\\u{{{:04x}}}", character as u32);
+    let _ = write_ui_text(&mut output, text);
+    let _ = writeln!(output);
+}
+
+fn write_ui_text(mut output: impl Write, text: &str) -> std::io::Result<()> {
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' && characters.peek() == Some(&'\n') {
+            characters.next();
+            output.write_all(b"\n")?;
+        } else if matches!(character, '\n' | '\t') {
+            write!(output, "{character}")?;
+        } else if character.is_control() {
+            write!(output, "\\u{{{:04x}}}", character as u32)?;
         } else {
-            let _ = write!(output, "{character}");
+            write!(output, "{character}")?;
         }
     }
-    let _ = writeln!(output);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_ui_text;
+
+    #[test]
+    fn viewer_preserves_layout_and_normalizes_crlf() {
+        let mut rendered = Vec::new();
+
+        write_ui_text(&mut rendered, "first\r\nsecond\tcolumn\nthird").unwrap();
+
+        assert_eq!(rendered, b"first\nsecond\tcolumn\nthird");
+    }
+
+    #[test]
+    fn viewer_escapes_terminal_control_characters() {
+        let mut rendered = Vec::new();
+
+        write_ui_text(&mut rendered, "\x1b[31mred\x07\x00\x0b\x0c\r\x7f\u{0085}").unwrap();
+
+        assert_eq!(
+            rendered,
+            b"\\u{001b}[31mred\\u{0007}\\u{0000}\\u{000b}\\u{000c}\\u{000d}\\u{007f}\\u{0085}"
+        );
+    }
 }

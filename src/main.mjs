@@ -954,6 +954,9 @@ async function init(args) {
     return show(teamDir);
   }
   if (args.isolate && muxName === 'hc') die('herdr-app (hc) does not support --isolate; omit --isolate', 2);
+  if (harness === 'claude' || harness === 'codex') {
+    console.error(`team-building: --harness ${harness} uses read-only activity observers, not interactive sessions; init claude uses Claude models through interactive OMP workers`);
+  }
 
   const mux = MUXES[muxName];
   const placePromise = Promise.all([mux.current(die), mux.home(die)]).then(([current, home]) => ({ worktree: current.worktree, home }));

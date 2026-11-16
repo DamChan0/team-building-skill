@@ -23,6 +23,9 @@ use crate::{
 };
 
 const LOG_LIMIT: u64 = 8 * 1024 * 1024;
+// JSON can expand every byte into a six-byte escape sequence; stay below the viewer frame limit.
+const UI_TEXT_LIMIT: usize = MAX_FRAME / 6;
+const TRUNCATED_TEXT: &str = "\n… [truncated]";
 const RAW_OUTPUT_EXCERPT_LIMIT: usize = 2 * 1024;
 
 pub(crate) async fn execute(
@@ -94,7 +97,7 @@ pub(crate) async fn execute(
             String::new()
         }
     };
-    match outcome {
+    let outcome = match outcome {
         Ok(outcome) if stopped => outcome,
         Ok(_) => unknown(
             "native process group could not be confirmed stopped".into(),
@@ -109,7 +112,9 @@ pub(crate) async fn execute(
             failed(detail, spec)
         }
         Err(error) => unknown(error.to_string(), spec),
-    }
+    };
+    record_outcome(spec, &outcome);
+    outcome
 }
 
 fn spawn(spec: &TaskSpec) -> Result<Child> {
@@ -389,13 +394,19 @@ async fn claude(
             ensure_session_id(spec, &session.0)?;
             emit_session(events, &session).await?;
         }
+        append_claude_activity(spec, &frame);
         // Final structured output must never be exposed before strict validation.
         if frame.get("type").and_then(Value::as_str) == Some("result") {
             if !accepted {
                 return Err(anyhow!("Claude did not accept prompt"));
             }
             if frame.get("subtype").and_then(Value::as_str) != Some("success") {
-                return Err(anyhow!("Claude provider error"));
+                let detail = frame
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .map(output_excerpt)
+                    .unwrap_or("no provider detail");
+                return Err(anyhow!("Claude provider error: {detail}"));
             }
             if let Some(id) = frame.get("session_id").and_then(Value::as_str) {
                 observed_session = true;
@@ -415,7 +426,6 @@ async fn claude(
                         .ok_or_else(|| anyhow!("Claude result missing"))?,
                 )?
             };
-            append_ui(spec, &result.summary);
             return Ok(success(result, session.0, session.1, spec));
         }
     }
@@ -449,7 +459,12 @@ async fn codex(
         let frame = parse_frame(&next_line(&mut stdout, cancel, idle.min(max)).await?)?;
         idle = Instant::now() + Duration::from_millis(spec.idle_timeout_ms);
         if frame.get("error").is_some() {
-            return Err(anyhow!("Codex JSON-RPC error"));
+            let message = frame
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(output_excerpt)
+                .unwrap_or("no provider detail");
+            return Err(anyhow!("Codex JSON-RPC error: {message}"));
         }
         if frame.get("id").and_then(Value::as_i64) == Some(1) {
             send(
@@ -511,6 +526,7 @@ async fn codex(
                     .or_else(|| frame.pointer("/params/turn/id"))
                     .and_then(Value::as_str)
                     == turn.as_deref();
+            append_codex_activity(spec, method, &frame["params"], matching);
             if method == "item/completed" && matching {
                 if let Some(text) = frame
                     .pointer("/params/item")
@@ -523,16 +539,18 @@ async fn codex(
                     final_text = Some(text.to_owned());
                 }
             } else if method == "turn/completed" && matching {
-                if frame.pointer("/params/turn/status").and_then(Value::as_str) != Some("completed")
-                {
-                    return Err(anyhow!("Codex turn failed"));
+                let status = frame
+                    .pointer("/params/turn/status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                if status != "completed" {
+                    return Err(anyhow!("Codex turn {status}"));
                 }
                 let result = parse_result(
                     final_text
                         .as_deref()
                         .ok_or_else(|| anyhow!("Codex final assistant result missing"))?,
                 )?;
-                append_ui(spec, &result.summary);
                 return Ok(success(result, thread, session_file, spec));
             }
         }
@@ -815,10 +833,92 @@ fn retain(target: &mut String, line: &str) {
         target.push(character);
     }
 }
-fn append_ui(spec: &TaskSpec, text: &str) {
-    if text.is_empty() || text.len() > MAX_TEXT {
+fn record_outcome(spec: &TaskSpec, outcome: &WorkerOutcome) {
+    if let Some(result) = &outcome.result {
+        let mut text = String::new();
+        if result.status != "succeeded" {
+            text.push('[');
+            text.push_str(&result.status);
+            text.push_str("]\n");
+        }
+        text.push_str(&result.summary);
+        if !result.blockers.is_empty() {
+            text.push_str("\n\nBlockers:\n");
+            text.push_str(&result.blockers.join("\n"));
+        }
+        append_ui(spec, &text);
+    } else if let Some(error) = &outcome.error {
+        append_ui(spec, &format!("[{}] {error}", outcome.status));
+    }
+}
+
+fn append_claude_activity(spec: &TaskSpec, frame: &Value) {
+    if frame.get("type").and_then(Value::as_str) != Some("assistant") {
         return;
     }
+    let Some(content) = frame.pointer("/message/content").and_then(Value::as_array) else {
+        return;
+    };
+    for item in content {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    append_ui(spec, text);
+                }
+            }
+            Some("tool_use") => {
+                if let Some(name) = item.get("name").and_then(Value::as_str) {
+                    append_ui(spec, &format!("[tool] {name}"));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn append_codex_activity(spec: &TaskSpec, method: &str, params: &Value, matching: bool) {
+    if !matching {
+        return;
+    }
+    let Some(item) = params.get("item") else {
+        return;
+    };
+    let Some(kind) = item.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    if kind == "agentMessage" {
+        if method == "item/completed"
+            && item.get("phase").and_then(Value::as_str) != Some("final_answer")
+        {
+            if let Some(text) = assistant_text(item) {
+                append_ui(spec, text);
+            }
+        }
+    } else if method == "item/started" {
+        append_ui(spec, &format!("[tool] {kind}"));
+    }
+}
+
+fn truncate_ui_text(text: &str) -> &str {
+    if text.len() <= UI_TEXT_LIMIT {
+        return text;
+    }
+    let mut end = UI_TEXT_LIMIT.saturating_sub(TRUNCATED_TEXT.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn append_ui(spec: &TaskSpec, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let text = if text.len() > UI_TEXT_LIMIT {
+        format!("{}{}", truncate_ui_text(text), TRUNCATED_TEXT)
+    } else {
+        text.to_owned()
+    };
     let record = json!({"version":1,"type":"ui","payload":{"text":text}}).to_string();
     let path = Path::new(&spec.log);
     if !path.parent().is_some_and(Path::is_dir) {
@@ -849,11 +949,50 @@ mod writeln {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_frame, parse_result, result_schema, spawn, tab_outcome, TaskSpec,
-        RAW_OUTPUT_EXCERPT_LIMIT,
+        append_claude_activity, append_codex_activity, append_ui, parse_frame, parse_result,
+        result_schema, spawn, tab_outcome, TaskSpec, RAW_OUTPUT_EXCERPT_LIMIT, TRUNCATED_TEXT,
+        UI_TEXT_LIMIT,
     };
-    use serde_json::json;
-    use std::collections::BTreeMap;
+    use serde_json::{json, Value};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn log_spec(log: String) -> TaskSpec {
+        TaskSpec {
+            team_dir: "/tmp".into(),
+            team: "team".into(),
+            worker: "worker".into(),
+            task: "task".into(),
+            kind: "task".into(),
+            cwd: "/tmp".into(),
+            harness: "codex".into(),
+            argv: vec![],
+            env: BTreeMap::new(),
+            prompt: String::new(),
+            model: None,
+            thinking: None,
+            session_id: None,
+            session_file: None,
+            log,
+            idle_timeout_ms: 1,
+            max_timeout_ms: 1,
+        }
+    }
+
+    fn temporary_log() -> (std::path::PathBuf, TaskSpec) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("team-supervisor-worker-{unique}"));
+        fs::create_dir(&dir).unwrap();
+        let log = dir.join("worker.log");
+        let spec = log_spec(log.to_string_lossy().into_owned());
+        (dir, spec)
+    }
 
     #[tokio::test]
     async fn spawned_worker_pwd_matches_cwd() {
@@ -1022,5 +1161,63 @@ mod tests {
         ] {
             assert!(parse_result(text).is_err(), "{text}");
         }
+    }
+    #[test]
+    fn truncates_oversized_ui_text_without_splitting_utf8() {
+        let (dir, spec) = temporary_log();
+        append_ui(&spec, &"é".repeat(UI_TEXT_LIMIT));
+        let record: Value = serde_json::from_str(&fs::read_to_string(&spec.log).unwrap()).unwrap();
+        let text = record
+            .pointer("/payload/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(text.ends_with(TRUNCATED_TEXT));
+        assert!(text.len() <= UI_TEXT_LIMIT);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claude_activity_logs_text_and_tool_name_only() {
+        let (dir, spec) = temporary_log();
+        append_claude_activity(
+            &spec,
+            &json!({"type":"assistant","message":{"content":[
+                {"type":"text","text":"Inspecting worker.rs"},
+                {"type":"tool_use","name":"Bash","input":{"command":"secret-command"}}
+            ]}}),
+        );
+        let entries: Vec<Value> = fs::read_to_string(&spec.log)
+            .unwrap()
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(entries[0]["payload"]["text"], "Inspecting worker.rs");
+        assert_eq!(entries[1]["payload"]["text"], "[tool] Bash");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_activity_requires_matching_nonfinal_turn_item() {
+        let (dir, spec) = temporary_log();
+        let commentary =
+            json!({"item":{"type":"agentMessage","phase":"commentary","text":"Reading protocol"}});
+        append_codex_activity(&spec, "item/completed", &commentary, true);
+        let final_answer =
+            json!({"item":{"type":"agentMessage","phase":"final_answer","text":"unvalidated"}});
+        append_codex_activity(&spec, "item/completed", &final_answer, true);
+        let tool = json!({"item":{"type":"commandExecution","command":"echo secret"}});
+        append_codex_activity(&spec, "item/started", &tool, false);
+        append_codex_activity(&spec, "item/started", &tool, true);
+        let entries: Vec<Value> = fs::read_to_string(&spec.log)
+            .unwrap()
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["payload"]["text"], "Reading protocol");
+        assert_eq!(entries[1]["payload"]["text"], "[tool] commandExecution");
+        fs::remove_dir_all(dir).unwrap();
     }
 }

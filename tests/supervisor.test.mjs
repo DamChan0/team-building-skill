@@ -72,6 +72,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   } else if (message.id === 3) {
     turn = 'turn-' + session;
     send({ jsonrpc: '2.0', id: 3, result: { turn: { id: turn } } });
+    send({ jsonrpc: '2.0', method: 'item/completed', params: { threadId: thread, turnId: turn, item: { type: 'agentMessage', phase: 'commentary', text: 'Working on the task' } } });
+    send({ jsonrpc: '2.0', method: 'item/started', params: { threadId: thread, turnId: turn, item: { type: 'commandExecution' } } });
     send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: thread, turnId: 'wrong-turn', turn: { status: 'completed' } } });
   }
 });
@@ -392,6 +394,13 @@ test('Codex ignores a wrong-turn completion until its matching result arrives', 
     const control = join(root, 'codex.sock');
     await daemon.client.submit(task(root, request, control, join(root, 'effect'), { harness: 'codex' }), request);
     await running(daemon.client, request);
+    const log = join(root, `${request}.log`);
+    await waitForFile(log, async () => (await daemon.client.get(request)).task);
+    for (let attempt = 0; attempt < 100 && !readFileSync(log, 'utf8').includes('commandExecution'); attempt++) await delay(10);
+    const activity = readFileSync(log, 'utf8');
+    assert.match(activity, /Working on the task/);
+    assert.match(activity, /commandExecution/);
+    assert.equal((await daemon.client.get(request)).task.state, 'running');
     await connectControl(control);
     assert.equal((await terminal(daemon.client, request)).state, 'succeeded');
   } finally {
