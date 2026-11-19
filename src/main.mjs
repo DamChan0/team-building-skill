@@ -14,17 +14,23 @@ import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import {
   activeTeams,
+  assertOwnedChild,
   DEFAULT_MAX,
   DEFAULT_TIMEOUT,
   dropPointers,
   exists,
   failed,
+  isOwnedChild,
   load,
   NOTES_DIR,
   now,
+  ownedChild,
   resolveTeam,
   save,
   STATE_ROOT,
+  subManagerContext,
+  teamMode,
+  teamRecords,
   TEAM_ID_PATTERN,
   TEAM_NAME_PATTERN,
   tryWithLock,
@@ -47,7 +53,7 @@ import {
   tabDir,
 } from './harness.mjs';
 import { MUXES, muxOf } from './mux.mjs';
-import { connectSupervisor, supervisorBinary } from './supervisor.mjs';
+import { connectSupervisor, supervisorBinary, supervisorCompatibility } from './supervisor.mjs';
 import { classifyRequest, configureRouter, DIFFICULTIES } from './router.mjs';
 
 const MAX_WORKERS = 8;
@@ -55,6 +61,14 @@ const WARN_WORKERS = 4;
 const DEFAULT_IDLE_STOP_MS = 15 * 60 * 1000;
 const IDLE_CHECK_INTERVAL_MS = 60_000;
 let interruption = null;
+
+async function requireSubManagerSlots(client) {
+  const { compatibility, sub_managers: subManagers } = await client.health();
+  if (compatibility === supervisorCompatibility && subManagers === true) return;
+  const error = new Error(`multi-team requires supervisor compatibility ${supervisorCompatibility} and health.sub_managers=true (running: compatibility=${compatibility ?? 'missing'}, sub_managers=${subManagers ?? 'missing'}); let active tasks finish, then manually upgrade the idle daemon and retry`);
+  error.code = 'stale_supervisor';
+  throw error;
+}
 
 export function requiresBypass(harness) {
   return harness !== 'omp';
@@ -118,10 +132,31 @@ function workerIndex(id) {
   return Number(id.slice(1));
 }
 
-function forbidWorkerManager() {
-  if (process.env[WORKER_ENV]) {
-    die(`refused: running inside worker ${process.env[WORKER_ENV]}; workers cannot manage teams (no recursion)`);
+function resolveManagedTeam(args) {
+  return resolveTeam(args.team, die, args.context?.cwd || process.cwd(), args.context);
+}
+
+async function withManagedTeam(args, fn) {
+  const teamDir = await resolveManagedTeam(args);
+  return withLock(teamDir, async () => {
+    if (args.context) await checkManager(args.context, await load(teamDir));
+    return fn(teamDir);
+  }, 'lifecycle');
+}
+
+async function checkManager(context, data) {
+  if (!context) return;
+  const current = await subManagerContext();
+  if (current?.team.id !== context.team.id || current?.worker.id !== context.worker.id
+    || current.cwd !== context.cwd
+    || current.worker.stop_generation !== context.worker.stop_generation) {
+    throw new Error('sub-manager context or child ownership changed');
   }
+  if (data) assertOwnedChild(data, current.team, current.worker);
+}
+
+function withParentState(context, fn) {
+  return context ? withLock(join(STATE_ROOT, context.team.id), fn) : fn();
 }
 
 function interrupted() {
@@ -144,6 +179,7 @@ function routingError(data, workerId) {
 
 export function chooseWorker(data, task, kind) {
   const entry = data.queue.find(item => item.task === task);
+  if (data.closing && kind !== 'final') return ['fail', 'team is being cleared'];
   if (!entry) return ['fail', 'task vanished from queue'];
   if (entry.difficulty) {
     const reason = routingError(data, entry.worker);
@@ -152,11 +188,11 @@ export function chooseWorker(data, task, kind) {
   if (entry.worker) {
     const worker = data.workers[entry.worker];
     if (!worker) return ['fail', `worker ${entry.worker} does not exist (retired or never spawned)`];
-    if (worker.retiring && kind !== 'final') return ['fail', `worker ${worker.id} is being retired`];
+    if ((worker.retiring || worker.stopping) && kind !== 'final') return ['fail', `worker ${worker.id} is being retired or stopped`];
     return ['take', worker.id];
   }
   const worker = Object.values(data.workers)
-    .filter(item => (!item.retiring || kind === 'final') && (!entry.difficulty || workerHarness(item, data) === 'omp'))
+    .filter(item => ((!item.retiring && !item.stopping) || kind === 'final') && (!entry.difficulty || workerHarness(item, data) === 'omp'))
     .sort((left, right) => left.assignments - right.assignments || workerIndex(left.id) - workerIndex(right.id))[0];
   return worker ? ['take', worker.id] : ['fail', 'no compatible active workers left (team is closing or shrunk to zero)'];
 }
@@ -215,7 +251,12 @@ async function cleanupToolSessions(teamDir, snapshot) {
   }
   const worker = data.workers[snapshot.spec?.worker];
   const worktree = data.isolate ? worker?.worktree : data.worktree;
-  const protectedTabs = new Set(Object.values(data.workers).map(item => item.observer).filter(Boolean));
+  const teams = await activeTeams().catch(error => error);
+  if (teams instanceof Error) {
+    return { cleaned: 0, errors: [`could not verify protected team tabs: ${teams.message}`] };
+  }
+  const protectedTabs = new Set(teams.flatMap(({ data }) =>
+    Object.values(data.workers).map(item => item.observer).filter(Boolean)));
   const mux = muxOf(data);
   const seen = new Set();
   const errors = [];
@@ -351,7 +392,7 @@ async function allTeamDirs(root) {
 function monitorable(data) {
   return !data.closing && idleStopMs(data) > 0
     && Object.values(data.workers || {}).some(worker =>
-      !worker.retiring && worker.run_state !== 'stopped' && workerHarness(worker, data) === 'omp');
+      !worker.retiring && !worker.stopping && worker.run_state !== 'stopped' && workerHarness(worker, data) === 'omp');
 }
 
 export async function checkIdleWorkers(stateRoot = STATE_ROOT, client = null) {
@@ -367,7 +408,7 @@ export async function checkIdleWorkers(stateRoot = STATE_ROOT, client = null) {
       const checkedAt = Date.now();
       if (!data.closing && timeout > 0) {
         for (const worker of Object.values(data.workers)) {
-          if (worker.retiring || workerHarness(worker, data) !== 'omp'
+          if (worker.retiring || worker.stopping || workerHarness(worker, data) !== 'omp'
             || worker.run_state !== 'running' || (worker.state || 'idle') !== 'idle'
             || !Number.isSafeInteger(worker.idle_since_ms)
             || checkedAt - worker.idle_since_ms < timeout) continue;
@@ -395,10 +436,12 @@ export async function checkIdleWorkers(stateRoot = STATE_ROOT, client = null) {
 }
 
 async function startIdleWatcher() {
-  if (process.env.TEAM_BUILDING_DISABLE_IDLE_WATCHER === '1') return;
+  if (process.env[WORKER_ENV] !== undefined || process.env.TEAM_BUILDING_DISABLE_IDLE_WATCHER === '1') return;
   for (const teamDir of await allTeamDirs(STATE_ROOT)) {
     if (!monitorable(await load(teamDir))) continue;
-    const child = spawn(process.execPath, [modulePath, 'idle-watch'], { detached: true, stdio: 'ignore' });
+    const child = spawn(process.execPath, [modulePath, 'idle-watch'], {
+      env: { ...process.env, [WORKER_ENV]: undefined }, detached: true, stdio: 'ignore',
+    });
     child.once('error', error => console.error(`team-building: idle watcher could not start: ${error.message}`));
     child.unref();
     return;
@@ -489,34 +532,56 @@ async function settleWorkerRuntime(teamDir, workerIds) {
   });
 }
 
-export async function runAssignment(teamDir, preferredWorker, prompt, timeout, maximum, kind = 'task', approval = null, assignment = {}, detach = false) {
+export async function runAssignment(teamDir, preferredWorker, prompt, timeout, maximum, kind = 'task', approval = null, assignment = {}, detach = false, context = null) {
   const team = basename(teamDir);
   const requestId = assignment.request_id || randomUUID();
   const client = await connectSupervisor(STATE_ROOT);
-  const prior = await client.get(requestId);
-  if (prior.task) {
-    const spec = prior.task.spec;
-    if (spec.team !== team || spec.prompt !== prompt || (preferredWorker && spec.worker !== preferredWorker)
+  const prepare = async () => {
+    const prior = assignment.request_id ? (await client.get(requestId)).task : null;
+    if (!prior) {
+      return submitAssignment(teamDir, client, {
+        requestId, preferredWorker, prompt, timeout, maximum, kind, approval, assignment, detach, context,
+      });
+    }
+    const spec = prior.spec;
+    if (spec.team !== team || spec.prompt !== prompt || spec.kind !== kind || (preferredWorker && spec.worker !== preferredWorker)
       || (spec.env?.TEAM_BUILDING_APPROVAL_TASK || '') !== (approval || '')
       || (assignment.difficulty !== undefined && (spec.env?.TEAM_BUILDING_DIFFICULTY || '') !== (assignment.difficulty || ''))
       || (assignment.model !== undefined && spec.model !== assignment.model)
       || (assignment.thinking !== undefined && spec.thinking !== assignment.thinking)) {
       throw new Error(`request ${requestId} conflicts with its durable assignment`);
     }
-    const fallback = { team, worker: spec.worker, task: spec.task, kind: spec.kind, log: spec.log };
-    if (detach) {
-      await rememberDetached(teamDir, { ...fallback, request_id: requestId });
-      await syncStatus(teamDir, client, team);
-      return fallback;
+    const data = await load(teamDir);
+    await checkManager(context, data);
+    const worker = data.workers[spec.worker];
+    if (worker && (spec.env?.TEAM_BUILDING_ROLE ?? 'worker') !== workerRole(worker)) {
+      throw new Error(`request ${requestId} has a different durable worker role; refusing to replay it`);
     }
-    const snapshot = await waitForTask(client, requestId, timeout);
-    await syncStatus(teamDir, client, team);
-    return taskOutputWithCleanup(teamDir, snapshot, fallback);
-  }
+    const fallback = { team, worker: spec.worker, task: spec.task, kind: spec.kind, log: spec.log };
+    if (detach) await rememberDetached(teamDir, { ...fallback, request_id: requestId });
+    return { fallback, accepted: prior, replayed: true };
+  };
+  // Fence durable replay and new submissions against concurrent assign and retirement, not result waits.
+  const { fallback, accepted, replayed } = kind === 'final' ? await prepare() : await withLock(teamDir, prepare, 'lifecycle');
+  if (!replayed) await syncStatus(teamDir, client, team);
+  if (detach) return fallback;
+  const snapshot = await waitForTask(client, accepted.request_id, timeout);
+  await syncStatus(teamDir, client, team);
+  if (replayed) return taskOutputWithCleanup(teamDir, snapshot, fallback);
+  const output = { ...(await taskOutputWithCleanup(teamDir, snapshot, fallback)), finished: now() };
+  if (output.status !== 'unknown') await writeResult(teamDir, output);
+  return output;
+}
+
+async function submitAssignment(teamDir, client, {
+  requestId, preferredWorker, prompt, timeout, maximum, kind, approval, assignment, detach, context,
+}) {
+  const team = basename(teamDir);
 
   let data; let worker; let task; let previousRuntime;
   await withLock(teamDir, async () => {
     data = await load(teamDir);
+    await checkManager(context, data);
     data.idle_stop_ms ??= DEFAULT_IDLE_STOP_MS;
     if (assignment.difficulty) {
       const selected = data.router?.models?.[assignment.difficulty];
@@ -537,6 +602,11 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
     worker = data.workers[selectedWorker];
     const worktreeError = assignmentWorktreeError(data, worker, assignment.current_worktree);
     if (worktreeError) throw new Error(worktreeError);
+    const managing = !data.parent && teamMode(data) === 'multi-team';
+    if ((workerRole(worker) === 'sub-manager') !== managing || (managing && workerHarness(worker, data) !== 'omp')) {
+      throw new Error(`worker ${team}/${worker.id} role or harness does not match its recorded team mode`);
+    }
+    if (managing) await requireSubManagerSlots(client);
     if (!data.isolate && !data.worktree) data.worktree = assignment.current_worktree;
     const legacy = worker.terminal || worker.terminal_started || worker.terminal_stopped;
     if (legacy && (!worker.terminal_stopped || !worker.session_id)) {
@@ -584,6 +654,8 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
       env: {
         ...native.env,
         TEAM_BUILDING_WORKER: `${team}/${worker.id}`,
+        // The broker schedules using this durable spec, not the tab environment.
+        TEAM_BUILDING_ROLE: workerRole(worker),
         TEAM_BUILDING_APPROVAL_TASK: approval || '',
         TEAM_BUILDING_DIFFICULTY: assignment.difficulty || '',
         TEAM_BUILDING_TOOL_TABS_BEFORE: JSON.stringify(toolTabsBefore),
@@ -595,20 +667,14 @@ export async function runAssignment(teamDir, preferredWorker, prompt, timeout, m
       session_id: worker.session_id ?? null, session_file: worker.session_file ?? null,
       log: worker.log, idle_timeout_ms: Math.max(1_000, timeout * 1000), max_timeout_ms: Math.max(1_000, maximum * 1000),
     };
-    const accepted = await client.submit(spec, requestId);
+    const accepted = await withParentState(context, async () => {
+      await checkManager(context, data);
+      return client.submit(spec, requestId);
+    });
     submitted = true;
     const fallback = { team, worker: worker.id, task, kind, log: worker.log };
-    if (detach) {
-      await rememberDetached(teamDir, { ...fallback, request_id: accepted.request_id });
-      await syncStatus(teamDir, client, team);
-      return fallback;
-    }
-    await syncStatus(teamDir, client, team);
-    const snapshot = await waitForTask(client, accepted.request_id, timeout);
-    await syncStatus(teamDir, client, team);
-    const output = { ...(await taskOutputWithCleanup(teamDir, snapshot, fallback)), finished: now() };
-    if (output.status !== 'unknown') await writeResult(teamDir, output);
-    return output;
+    if (detach) await rememberDetached(teamDir, { ...fallback, request_id: accepted.request_id });
+    return { fallback, accepted };
   } catch (error) {
     await withLock(teamDir, async () => {
       const latest = await load(teamDir);
@@ -689,6 +755,7 @@ function newWorker(teamDir, data, harness, cwd) {
   const selectedHarness = harness || data.harness || 'omp';
   data.workers[id] = {
     id,
+    role: teamMode(data) === 'multi-team' ? 'sub-manager' : 'worker',
     model: data.model || data.router?.worker_model || null,
     resolved_model: null,
     state: 'idle',
@@ -715,13 +782,19 @@ function newWorker(teamDir, data, harness, cwd) {
 }
 
 export async function show(teamDir) {
-  const team = basename(teamDir);
   const client = await connectSupervisor(STATE_ROOT);
-  const status = await syncStatus(teamDir, client, team);
+  await showTeam(teamDir, client);
+}
+
+async function showTeam(teamDir, client, indent = '') {
+  const status = await syncStatus(teamDir, client, basename(teamDir));
   const data = await load(teamDir);
-  console.log(`team ${teamLabel(data)}  cwd=${data.cwd}  model=${data.model || 'routed/default'}  router=${data.router?.enabled ? data.router.family : 'off'}  idle-stop=${idleStopMs(data) ? `${idleStopMs(data) / 60000}m` : 'off'}  state=${teamDir}`);
+  const hierarchy = data.parent ? ` parent=${data.parent.team}/${data.parent.worker}`
+    : teamMode(data) === 'multi-team' ? ' mode=multi-team' : '';
+  console.log(`${indent}team ${teamLabel(data)}  cwd=${data.cwd}  model=${data.model || 'routed/default'}  router=${data.router?.enabled ? data.router.family : 'off'}  idle-stop=${idleStopMs(data) ? `${idleStopMs(data) / 60000}m` : 'off'}  state=${teamDir}${hierarchy}${data.closing ? ' closing' : ''}`);
+  const children = !indent && teamMode(data) === 'multi-team' ? await teamRecords() : [];
   if (data.router?.enabled) {
-    console.log(`  classifier=${data.router.classifier} checked=${data.router.checked_at} simple=${data.router.models.simple.model} moderate=${data.router.models.moderate.model} complex=${data.router.models.complex.model} extreme=${data.router.models.extreme?.model || 'init required'}`);
+    console.log(`${indent}  classifier=${data.router.classifier} checked=${data.router.checked_at} simple=${data.router.models.simple.model} moderate=${data.router.models.moderate.model} complex=${data.router.models.complex.model} extreme=${data.router.models.extreme?.model || 'init required'}`);
   }
   for (const worker of Object.values(data.workers).sort((left, right) => workerIndex(left.id) - workerIndex(right.id))) {
     const model = worker.resolved_model || worker.model || 'default';
@@ -729,9 +802,14 @@ export async function show(teamDir) {
       ? `stopped idle=${idleAge(worker.idle_since_ms)}`
       : worker.run_state === 'starting' ? 'starting' : worker.state || 'idle';
     const error = worker.idle_stop_error ? ` idle-stop-error=${worker.idle_stop_error}` : '';
-    console.log(`  ${worker.id.padEnd(4)} ${String(runtime).padEnd(18)} harness=${worker.harness || data.harness} model=${model} session=${worker.session_id || 'pending'} assignments=${worker.assignments} task=${worker.task || '-'} log=${worker.log}${error}`);
+    const role = worker.role === 'sub-manager' ? ' role=sub-manager' : '';
+    const transition = worker.retiring ? ' retiring' : worker.stopping ? ' stopping' : '';
+    console.log(`${indent}  ${worker.id.padEnd(4)} ${String(runtime).padEnd(18)} harness=${worker.harness || data.harness} model=${model} session=${worker.session_id || 'pending'} assignments=${worker.assignments} task=${worker.task || '-'} log=${worker.log}${error}${role}${transition}`);
+    for (const child of children.filter(({ data: child }) => isOwnedChild(child, data.id, worker.id))) {
+      await showTeam(child.teamDir, client, '    ');
+    }
   }
-  if (status.queued) console.log(`  queued=${status.queued}`);
+  if (status.queued) console.log(`${indent}  queued=${status.queued}`);
 }
 
 function insideWorktree(worktree, cwd) {
@@ -797,23 +875,85 @@ async function rollbackIsolated(data) {
   }));
 }
 
-async function retire(teamDir, ids, timeout, maximum, fast = false) {
+async function closeWorkerObservers(data, workers) {
+  const mux = muxOf(data);
+  for (const { id, observer } of workers) {
+    if (observer && !(await mux.close(data, observer))) throw new Error(`observer for ${data.id}/${id} is not proven closed`);
+  }
+}
+
+function assertBrokerOwned(worker) {
+  if (worker.terminal || worker.terminal_started || worker.terminal_stopped) {
+    throw new Error(`legacy terminal for ${worker.id} has no broker-owned process identity; leave it open and recover its native session before migration`);
+  }
+}
+
+async function stopWorkers(teamDir, ids, broker) {
+  const data = await load(teamDir);
+  if (data.id !== basename(teamDir)) throw new Error(`recorded team ID does not match ${teamDir}`);
+  const mismatch = backendMismatchError(data);
+  if (mismatch) die(mismatch, 4);
+  for (const id of ids) assertBrokerOwned(data.workers[id]);
+  for (const id of ids) {
+    try {
+      const result = await broker.stop(data.id, id);
+      if (result.stopped !== true) throw new Error('supervisor did not confirm stop');
+    } catch (error) {
+      throw new Error(`cannot stop ${data.id}/${id}: ${error.message}`, { cause: error });
+    }
+  }
+  await syncStatus(teamDir, broker, data.id);
+  const latest = await load(teamDir);
+  for (const id of ids) {
+    if (latest.workers[id]?.state !== 'idle') throw new Error(`broker has not proven ${id} idle; refusing cleanup`);
+  }
+  return latest;
+}
+
+async function forEachChild(team, workers, fn) {
+  if (!workers.length) return;
+  for (const { teamDir, data } of await teamRecords()) {
+    const owner = workers.find(worker => isOwnedChild(data, team.id, worker.id));
+    if (!owner) continue;
+    await withLock(teamDir, async () => {
+      let current;
+      try {
+        current = await load(teamDir);
+      } catch (error) {
+        if (error.code === 'ENOENT') return; // concurrently cleared by the root manager
+        throw error;
+      }
+      if (current.id !== data.id) throw new Error(`child team identity changed: ${teamDir}`);
+      assertOwnedChild(current, team, owner);
+      await fn(teamDir, current);
+    }, 'lifecycle');
+  }
+}
+
+async function retire(teamDir, ids, timeout, maximum, fast = false, idleOnly = false) {
   const team = basename(teamDir);
   const broker = await connectSupervisor(STATE_ROOT);
   await syncStatus(teamDir, broker, team);
   let workers;
   await withLock(teamDir, async () => {
     const data = await load(teamDir);
-    for (const id of ids) data.workers[id].retiring = true;
+    for (const id of ids) {
+      const worker = data.workers[id];
+      if (!worker) die(`unknown worker ${id}`);
+      if (idleOnly && worker.state === 'busy') die(`${id} is busy; wait for its task first`);
+      assertBrokerOwned(worker);
+      worker.retiring = true;
+    }
     await save(teamDir, data);
     workers = Object.fromEntries(ids.map(id => [id, { ...data.workers[id] }]));
   });
-  for (const worker of Object.values(workers)) {
-    if (worker.state === 'unknown') await broker.stop(team, worker.id);
+  const subManagers = Object.values(workers).filter(worker => worker.role === 'sub-manager');
+  const fence = Object.values(workers).filter(worker => worker.state === 'unknown' || worker.role === 'sub-manager');
+  if (fence.length) {
+    // A retiring sub-manager cannot launch work while its child is being drained.
+    const latest = await stopWorkers(teamDir, fence.map(worker => worker.id), broker);
+    workers = latest.workers;
   }
-  await syncStatus(teamDir, broker, team);
-  const latestData = await load(teamDir);
-  workers = Object.fromEntries(ids.map(id => [id, { ...latestData.workers[id] }]));
   const lastResults = new Map();
   if (fast) {
     await Promise.all((await readdir(join(teamDir, 'results')))
@@ -826,7 +966,7 @@ async function retire(teamDir, ids, timeout, maximum, fast = false) {
       }));
   }
   const finals = {};
-  await Promise.all(ids.map(async id => {
+  const results = await Promise.allSettled(ids.map(async id => {
     const worker = workers[id];
     const lastResult = lastResults.get(id)?.result;
     finals[id] = fast
@@ -838,15 +978,19 @@ async function retire(teamDir, ids, timeout, maximum, fast = false) {
         : { status: 'succeeded', summary: 'no assignments; nothing to summarise', files_changed: [], files_deleted: [], verification: '', blockers: [], team, worker: id, kind: 'final' };
     await writeFile(join(teamDir, 'results', `${id}-final.json`), JSON.stringify(finals[id], null, 2));
   }));
-  for (const id of ids) await broker.stop(team, id);
-  await syncStatus(teamDir, broker, team);
+  const failedFinal = results.find(result => result.status === 'rejected');
+  if (failedFinal) throw failedFinal.reason;
+  const stopped = await stopWorkers(teamDir, ids, broker);
+  await forEachChild(stopped, subManagers, childDir => clearTeam(childDir, { timeout, max: maximum, fast }));
   await withLock(teamDir, async () => {
     const data = await load(teamDir);
     for (const id of ids) {
-      const worker = data.workers[id];
-      if (worker?.state !== 'idle') throw new Error(`broker has not proven ${id} stopped; refusing cleanup`);
-      if (worker.observer && !(await muxOf(data).close(data, worker.observer))) throw new Error(`observer for ${id} is not proven closed`);
-      await cleanupWorker(worker);
+      if (data.workers[id]?.state !== 'idle') throw new Error(`broker has not proven ${id} stopped; refusing cleanup`);
+    }
+    // Preserve all sessions if even one observer cannot be proven closed.
+    await closeWorkerObservers(data, ids.map(id => data.workers[id]));
+    for (const id of ids) {
+      await cleanupWorker(data.workers[id]);
       delete data.workers[id];
     }
     await save(teamDir, data);
@@ -855,7 +999,17 @@ async function retire(teamDir, ids, timeout, maximum, fast = false) {
 }
 
 async function init(args) {
-  forbidWorkerManager();
+  if (!args.context) return initTeam(args);
+  if (args.mode === 'multi-team') die('workers cannot init --mode multi-team (no recursion)');
+  if (args.clearPrevious) die('sub-managers cannot use --clear-previous');
+  const { team, worker } = args.context;
+  // Serialize concurrent init calls from this sub-manager, not its siblings.
+  return withLock(join(STATE_ROOT, team.id), () => initTeam(args), `init-${worker.id}`);
+}
+
+async function initTeam(args) {
+  const context = args.context;
+  await checkManager(context);
   if (args.member !== undefined && (!Number.isInteger(args.member) || args.member < 1 || args.member > MAX_WORKERS)) {
     die(`member must be 1..${MAX_WORKERS} (task.maxConcurrency)`);
   }
@@ -865,24 +1019,29 @@ async function init(args) {
   const familySelected = !!selectedFamily;
   const fixedModel = familySelected ? null : args.model || null;
   const harness = args.harness || 'omp';
-  if (familySelected && harness !== 'omp') die('gpt/claude family routing requires --harness omp; the family selects models, not the harness');
-  // One omp spawn proves the binary exists and reads the approval mode.
-  const approvalModePromise = harness === 'omp' ? requireOmp(die) : Promise.resolve(null);
-  approvalModePromise.catch(() => {});
-  if (requiresBypass(harness) && !args.allowBypass) {
-    die(`--harness ${harness} requires explicit --allow-bypass (it enables ${configFor({ harness }).bypass})`, 3);
-  }
 
-  const cwd = realpathSync(process.cwd());
+  const cwd = context?.cwd || realpathSync(process.cwd());
   const muxName = backendName();
   if (args.name !== undefined && args.team) die('init accepts either --name or --team, not both');
   if (args.name !== undefined && (!TEAM_NAME_PATTERN.test(args.name) || TEAM_ID_PATTERN.test(args.name))) {
     die('--name must be 1-32 lowercase letters, numbers, underscores, or hyphens; it cannot look like a team ID');
   }
-  const teams = await activeTeams();
-  const active = await Promise.all(teams.map(async teamDir => ({ teamDir, data: await load(teamDir) })));
+  const records = await teamRecords();
+  const active = records.filter(({ data }) => (data.backend || 'orca') === muxName);
+  const roots = active.filter(({ data }) => !data.parent);
   let existing;
-  if (args.team) {
+  if (context) {
+    existing = ownedChild(records, context);
+    if (args.team && (!existing || (args.team !== existing.data.id && args.team !== existing.data.name))) {
+      die(`team ${JSON.stringify(args.team)} is not owned by sub-manager ${context.team.id}/${context.worker.id}`);
+    }
+    if (args.name && existing && existing.data.name !== args.name) {
+      die(`sub-manager already owns child team ${teamLabel(existing.data)}; adopt it without --name or clear it first`);
+    }
+    if (args.name && active.some(({ data }) => data.name === args.name && data.id !== existing?.data.id)) {
+      die(`team name ${JSON.stringify(args.name)} is already in use; choose another name`);
+    }
+  } else if (args.team) {
     const matches = active.filter(team => team.data.id === args.team || team.data.name === args.team);
     if (matches.length !== 1) die(`init --team must select one existing team; no unique team ${JSON.stringify(args.team)} found`);
     existing = matches[0];
@@ -895,12 +1054,27 @@ async function init(args) {
       if (existing.data.cwd !== cwd) die(`team name ${JSON.stringify(args.name)} is already used at ${existing.data.cwd}; choose another name`);
     }
   } else {
-    const samePath = active.filter(team => team.data.cwd === cwd);
+    const samePath = roots.filter(team => team.data.cwd === cwd);
     if (samePath.length > 1) die(`multiple teams for cwd ${cwd}; pass --team <id|name> to adopt one`);
     existing = samePath[0];
   }
+  const mode = existing ? teamMode(existing.data) : args.mode || 'single-team';
+  if (existing && args.mode && args.mode !== mode) die(`cannot change team mode on adoption (recorded ${mode})`);
+  if (existing?.data.parent && mode !== 'single-team') die('child teams must use single-team mode');
+  if (mode === 'multi-team' && (harness !== 'omp' || (existing && Object.values(existing.data.workers)
+    .some(worker => workerHarness(worker, existing.data) !== 'omp')))) {
+    die('--mode multi-team requires OMP workers (--harness omp)');
+  }
+  if (familySelected && harness !== 'omp') die('gpt/claude family routing requires --harness omp; the family selects models, not the harness');
+  if (requiresBypass(harness) && !args.allowBypass) {
+    die(`--harness ${harness} requires explicit --allow-bypass (it enables ${configFor({ harness }).bypass})`, 3);
+  }
+  if (mode === 'multi-team') await requireSubManagerSlots(await connectSupervisor(STATE_ROOT));
+  // One omp spawn proves the binary exists and reads the approval mode.
+  const approvalModePromise = harness === 'omp' ? requireOmp(die) : Promise.resolve(null);
+  approvalModePromise.catch(() => {});
   let approvalMode;
-  if (existing) {
+  if (existing) return withLock(existing.teamDir, async () => {
     approvalMode = await approvalModePromise;
     if (harness === 'omp' && approvalMode !== 'yolo') {
       die(`tools.approvalMode is ${JSON.stringify(approvalMode)}; omp workers need yolo because nobody can answer their prompts.`, 3);
@@ -910,15 +1084,17 @@ async function init(args) {
     if (adoptMismatch) die(adoptMismatch, 4);
     const currentWorktree = (await MUXES[muxName].current(die)).worktree;
     assertTeamWorktree(existing.data, currentWorktree);
-    console.log(`adopted existing team ${teamLabel(existing.data)} for cwd ${cwd}`);
-    // The adopting session becomes the manager; role widgets key on this id.
-    await withLock(teamDir, async () => {
+    await withParentState(context, () => withLock(teamDir, async () => {
+      // The adopting session becomes the manager; role widgets key on this id.
       const data = await load(teamDir);
+      await checkManager(context, data);
+      if (data.closing) die('team is being cleared');
       data.manager_session = process.env.OMP_SESSION_ID || process.env.PI_SESSION_ID || null;
       data.idle_stop_ms = args.idleStopMs ?? data.idle_stop_ms ?? DEFAULT_IDLE_STOP_MS;
       idleStopMs(data);
       await save(teamDir, data);
-    });
+    }));
+    console.log(`adopted existing team ${teamLabel(existing.data)} for cwd ${cwd}`);
     const client = await connectSupervisor(STATE_ROOT);
     await syncStatus(teamDir, client, existing.data.id);
     let current = await load(teamDir);
@@ -936,6 +1112,7 @@ async function init(args) {
       const router = await configureRouter(family);
       await withLock(teamDir, async () => {
         const data = await load(teamDir);
+        await checkManager(context, data);
         rejectBusyChange(data);
         if (data.closing) die('team is being cleared');
         if (Object.values(data.workers).some(worker => workerHarness(worker, data) !== 'omp')) die('family routing requires OMP workers');
@@ -947,12 +1124,12 @@ async function init(args) {
     }
     current = await load(teamDir);
     if (args.member || fixedModel) {
-      return member({ ...args, model: fixedModel, n: args.member || Object.keys(current.workers).length, team: basename(teamDir) });
+      return resize(teamDir, { ...args, model: fixedModel, n: args.member || Object.values(current.workers).filter(worker => !worker.retiring).length });
     }
     await ensureObservers(teamDir, current, Object.values(current.workers).filter(worker =>
-      !worker.retiring && (workerHarness(worker, current) !== 'omp' || worker.state !== 'idle')));
+      !worker.retiring && !worker.stopping && (workerHarness(worker, current) !== 'omp' || worker.state !== 'idle')));
     return show(teamDir);
-  }
+  }, 'lifecycle');
   if (args.isolate && muxName === 'hc') die('herdr-app (hc) does not support --isolate; omit --isolate', 2);
   if (harness === 'claude' || harness === 'codex') {
     console.error(`team-building: --harness ${harness} uses read-only activity observers, not interactive sessions; init claude uses Claude models through interactive OMP workers`);
@@ -970,7 +1147,7 @@ async function init(args) {
     die(`tools.approvalMode is ${JSON.stringify(approvalMode)}; omp workers need yolo because nobody can answer their prompts.`, 3);
   }
 
-  const otherPaths = active.filter(({ data }) => data.cwd !== cwd);
+  const otherPaths = context ? [] : roots.filter(({ data }) => data.cwd !== cwd);
   if (otherPaths.length && !args.clearPrevious && !args.keepPrevious) {
     const previous = otherPaths.map(({ data }) => {
       const busy = Object.values(data.workers || {}).filter(worker => worker.state === 'busy').length;
@@ -979,7 +1156,7 @@ async function init(args) {
     die(`active teams at other paths:\n${previous.join('\n')}\nAsk whether to delete the previous manager, then rerun with --clear-previous or --keep-previous.`, 3);
   }
   if (args.clearPrevious) {
-    for (const { teamDir } of active) await clear({ ...args, team: basename(teamDir) });
+    for (const { teamDir } of roots) await clear({ ...args, team: basename(teamDir) });
   }
 
   const { worktree, home } = await placePromise;
@@ -999,7 +1176,11 @@ async function init(args) {
     console.error('team-building: warning: uncommitted manager changes are not copied into isolated worker worktrees');
   }
   const router = await routerPromise;
+  const teamDir = await createTeam(args, { mode, cwd, mux, worktree, home, fixedModel, router, harness, approvalMode });
+  await show(teamDir);
+}
 
+async function createTeam(args, { mode, cwd, mux, worktree, home, fixedModel, router, harness, approvalMode }) {
   const stamp = new Date();
   const base = `tb-${String(stamp.getMonth() + 1).padStart(2, '0')}${String(stamp.getDate()).padStart(2, '0')}-${String(stamp.getHours()).padStart(2, '0')}${String(stamp.getMinutes()).padStart(2, '0')}${String(stamp.getSeconds()).padStart(2, '0')}`;
   let id = base;
@@ -1022,10 +1203,12 @@ async function init(args) {
   const data = {
     id,
     name: args.name || null,
+    mode,
+    parent: args.context ? { team: args.context.team.id, worker: args.context.worker.id } : null,
     created: now(),
     cwd,
     manager_session: process.env.OMP_SESSION_ID || process.env.PI_SESSION_ID || null,
-    backend: muxName,
+    backend: mux.name,
     worktree,
     ...home,
     model: fixedModel,
@@ -1042,48 +1225,65 @@ async function init(args) {
     isolate: !!args.isolate,
     idle_stop_ms: args.idleStopMs ?? DEFAULT_IDLE_STOP_MS,
   };
-  await writeShims(teamDir, data);
-  try {
-    for (let index = 0; index < (args.member || 3); index++) {
-      const workerId = `w${data.next_worker}`;
-      const [workerWorktree, workerCwd] = data.isolate ? await isolatedCwd(data, workerId) : [null, cwd];
-      newWorker(teamDir, data, null, workerCwd);
-      data.workers[workerId].worktree = workerWorktree;
+  return withLock(teamDir, async () => {
+    try {
+      await writeShims(teamDir, data);
+      for (let index = 0; index < (args.member || 3); index++) {
+        const workerId = `w${data.next_worker}`;
+        const [workerWorktree, workerCwd] = data.isolate ? await isolatedCwd(data, workerId) : [null, cwd];
+        newWorker(teamDir, data, null, workerCwd);
+        data.workers[workerId].worktree = workerWorktree;
+      }
+      // Publish atomically against the parent's retirement fence. Keep tab creation
+      // under the child lifecycle lock, not the shared parent state lock.
+      await withParentState(args.context, async () => {
+        await checkManager(args.context);
+        if (!data.name) return save(teamDir, data);
+        return withLock(STATE_ROOT, async () => {
+          if ((await activeTeams()).some(team => team.data.name === data.name)) {
+            throw new Error(`team name ${JSON.stringify(data.name)} is already in use; retry init or choose another name`);
+          }
+          await save(teamDir, data);
+        }, 'team-names');
+      });
+      await ensureObservers(teamDir, data, Object.values(data.workers));
+      await settleWorkerRuntime(teamDir, Object.keys(data.workers));
+    } catch (error) {
+      const latest = await load(teamDir).catch(() => data);
+      await closeWorkerObservers(latest, Object.values(data.workers));
+      await rollbackIsolated(latest);
+      await rm(teamDir, { recursive: true, force: true });
+      die(`${mux.name}: ${error.message.split('\n')[0]}`, 4);
     }
-    await save(teamDir, data);
-    await ensureObservers(teamDir, data, Object.values(data.workers));
-    await settleWorkerRuntime(teamDir, Object.keys(data.workers));
-  } catch (error) {
-    const latest = await load(teamDir).catch(() => data);
-    await Promise.all(Object.values(latest.workers).map(worker => worker.observer && mux.close(data, worker.observer)));
-    await rollbackIsolated(latest);
-    await rm(teamDir, { recursive: true, force: true });
-    die(`${mux.name}: ${error.message.split('\n')[0]}`, 4);
-  }
-
-  console.log(`team ${teamLabel(data)} ready: ${args.member || 3} workers, harness=${harness}, model=${fixedModel || 'automatic'}, router=${router?.family || 'off'}, cwd=${data.cwd}`);
-  await show(teamDir);
-
+    console.log(`team ${teamLabel(data)} ready: ${args.member || 3} workers, harness=${harness}, model=${fixedModel || 'automatic'}, router=${router?.family || 'off'}, cwd=${data.cwd}`);
+    return teamDir;
+  }, 'lifecycle');
 }
 
 async function member(args) {
-  forbidWorkerManager();
+  return withManagedTeam(args, teamDir => resize(teamDir, args));
+}
+
+async function resize(teamDir, args) {
   if (['gpt', 'claude'].includes(args.model)) die('select a model family with init --model gpt|claude, not member --model');
   if (!Number.isInteger(args.n) || args.n < 1 || args.n > MAX_WORKERS) die(`member must be 1..${MAX_WORKERS} (task.maxConcurrency)`);
 
-  const teamDir = await resolveTeam(args.team, die, process.cwd());
   let retirees = [];
   let removed = {};
   let data;
   const added = [];
   await withLock(teamDir, async () => {
     data = await load(teamDir);
+    await checkManager(args.context, data);
     if (data.closing) die('team is being cleared');
     const memberMismatch = backendMismatchError(data);
     if (memberMismatch) die(memberMismatch, 4);
     assertTeamWorktree(data, (await muxOf(data).current(die)).worktree);
 
     const effectiveHarness = args.harness || data.harness || 'omp';
+    const mode = teamMode(data);
+    if (data.parent && mode !== 'single-team') die('child teams must use single-team mode');
+    if (mode === 'multi-team' && effectiveHarness !== 'omp') die('multi-team requires OMP workers');
     const liveWorkers = Object.values(data.workers)
       .filter(worker => !worker.retiring)
       .sort((left, right) => workerIndex(left.id) - workerIndex(right.id));
@@ -1091,6 +1291,7 @@ async function member(args) {
     if (requiresBypass(effectiveHarness) && !args.allowBypass && (args.harness || growing)) {
       die(`--harness ${effectiveHarness} requires explicit --allow-bypass (it enables ${configFor({ harness: effectiveHarness }).bypass})`, 3);
     }
+    if (growing && mode === 'multi-team') await requireSubManagerSlots(await connectSupervisor(STATE_ROOT));
     if (args.model) {
       data.model = args.model;
       data.router = null;
@@ -1108,8 +1309,9 @@ async function member(args) {
         .sort((left, right) => Number(left.state !== 'idle') - Number(right.state !== 'idle') || workerIndex(right.id) - workerIndex(left.id))
         .slice(0, liveWorkers.length - args.n)
         .map(worker => worker.id);
-      removed = Object.fromEntries(retirees.map(id => [id, { ...data.workers[id] }]));
     }
+    retirees.push(...Object.values(data.workers).filter(worker => worker.retiring).map(worker => worker.id));
+    removed = Object.fromEntries(retirees.map(id => [id, { ...data.workers[id] }]));
 
     if (args.model) {
       for (const worker of liveWorkers) {
@@ -1117,7 +1319,7 @@ async function member(args) {
       }
     }
     for (const worker of Object.values(data.workers)) {
-      if (worker.retiring || retirees.includes(worker.id)) continue;
+      if (worker.stopping || retirees.includes(worker.id)) continue;
       worker.run_state = 'starting';
       worker.idle_since_ms = null;
       delete worker.starting_task;
@@ -1126,11 +1328,11 @@ async function member(args) {
     await save(teamDir, data);
   });
   try {
-    const starting = Object.values(data.workers).filter(worker => !worker.retiring && !retirees.includes(worker.id));
+    const starting = Object.values(data.workers).filter(worker => !worker.stopping && !retirees.includes(worker.id));
     await ensureObservers(teamDir, data, starting);
     await settleWorkerRuntime(teamDir, starting.map(worker => worker.id));
   } catch (error) {
-    await Promise.all(added.map(worker => worker.observer && muxOf(data).close(data, worker.observer)));
+    await closeWorkerObservers(data, added);
     await rollbackIsolated({ ...data, workers: Object.fromEntries(added.map(worker => [worker.id, worker])) });
     await withLock(teamDir, async () => {
       const latest = await load(teamDir);
@@ -1154,16 +1356,16 @@ async function member(args) {
 }
 
 async function dismiss(args) {
-  forbidWorkerManager();
-  const ids = String(args.worker || '').split(',').filter(Boolean);
-  if (!ids.length) die('dismiss requires --worker wN[,wM...]');
-  const teamDir = await resolveTeam(args.team, die, process.cwd());
+  const ids = [...new Set(String(args.worker || '').split(',').filter(Boolean))];
+  if (!ids.length || ids.some(id => !/^w[1-9]\d*$/.test(id))) die('dismiss requires --worker wN[,wM...]');
+  return withManagedTeam(args, teamDir => dismissWorkers(teamDir, ids, args));
+}
+
+async function dismissWorkers(teamDir, ids, args) {
   const data = await load(teamDir);
-  for (const id of ids) {
-    if (!data.workers[id]) die(`unknown worker ${id}`);
-    if (data.workers[id].state === 'busy') die(`${id} is busy; wait for its task first`);
-  }
-  const finals = await retire(teamDir, ids, args.timeout, args.max);
+  const mismatch = backendMismatchError(data);
+  if (mismatch) die(mismatch, 4);
+  const finals = await retire(teamDir, ids, args.timeout, args.max, false, true);
   for (const [id, result] of Object.entries(finals)) {
     console.log(`  ${id} final ${result.status}: ${result.summary.slice(0, 200)}`);
     const note = await removeIsolated(data, data.workers[id]);
@@ -1173,7 +1375,7 @@ async function dismiss(args) {
 }
 
 async function status(args) {
-  return show(await resolveTeam(args.team, die, process.cwd()));
+  return show(await resolveManagedTeam(args));
 }
 
 async function readPrompt(prompt) {
@@ -1189,6 +1391,10 @@ function workerHarness(worker, team) {
   return worker.harness || team.harness || 'omp';
 }
 
+function workerRole(worker) {
+  return worker.role === 'sub-manager' ? 'sub-manager' : 'worker';
+}
+
 export function routedAssignment(data, args) {
   if (!args.difficulty || args.model) return args.model ? { model: args.model } : {};
   const error = routingError(data, args.worker);
@@ -1199,8 +1405,7 @@ export function routedAssignment(data, args) {
 }
 
 async function assign(args) {
-  forbidWorkerManager();
-  const teamDir = await resolveTeam(args.team, die, process.cwd());
+  const teamDir = await resolveManagedTeam(args);
   const prompt = await readPrompt(args.prompt);
   if (!prompt.trim()) die('empty prompt');
   if (args.approval && !/^t\d{3}$/.test(args.approval)) die('--approval must name a source task such as t001');
@@ -1215,7 +1420,7 @@ async function assign(args) {
         thinking: prior.spec.thinking,
       });
       if (args.model !== undefined) retry.model = args.model;
-      const output = await runAssignment(teamDir, args.worker, prompt, args.timeout, args.max, 'task', args.approval, retry, args.detach);
+      const output = await runAssignment(teamDir, args.worker, prompt, args.timeout, args.max, 'task', args.approval, retry, args.detach, args.context);
       if (args.detach) console.log(output.task);
       else {
         printResult(output);
@@ -1238,6 +1443,7 @@ async function assign(args) {
   }
 
   let data = await load(teamDir);
+  await checkManager(args.context, data);
   const assignMismatch = backendMismatchError(data);
   if (assignMismatch) die(assignMismatch, 4);
   const mux = muxOf(data);
@@ -1258,6 +1464,7 @@ async function assign(args) {
     router.enabled = false;
     await withLock(teamDir, async () => {
       data = await load(teamDir);
+      await checkManager(args.context, data);
       if (!data.model && !data.router) {
         data.router = router;
         await save(teamDir, data);
@@ -1290,7 +1497,7 @@ async function assign(args) {
   assignment.current_worktree = currentWorktree;
   assignment.request_id = args.request_id;
   if (interrupted()) throw interrupted();
-  const output = await runAssignment(teamDir, args.worker, prompt, args.timeout, args.max, 'task', args.approval, assignment, args.detach);
+  const output = await runAssignment(teamDir, args.worker, prompt, args.timeout, args.max, 'task', args.approval, assignment, args.detach, args.context);
   if (args.detach) console.log(output.task);
   else {
     printResult(output);
@@ -1299,8 +1506,7 @@ async function assign(args) {
 }
 
 async function wait(args) {
-  forbidWorkerManager();
-  const teamDir = await resolveTeam(args.team, die, process.cwd());
+  const teamDir = await resolveManagedTeam(args);
   const data = await load(teamDir);
   const mismatch = backendMismatchError(data);
   if (mismatch) die(mismatch, 4);
@@ -1367,8 +1573,8 @@ async function wait(args) {
 }
 
 async function approve(args) {
-  forbidWorkerManager();
-  const teamDir = await resolveTeam(args.team, die, process.cwd());
+  if (args.context) die('sub-managers cannot approve gated commands; ask the root manager to record user approval');
+  const teamDir = await resolveManagedTeam(args);
   if (!/^w\d+$/.test(args.worker) || !/^t\d{3}$/.test(args.task) || !args.command.length) {
     die('approve requires --worker wN --task tNNN -- <command...>');
   }
@@ -1399,22 +1605,37 @@ async function approve(args) {
 }
 
 async function stop(args) {
-  forbidWorkerManager();
   if (!/^w\d+$/.test(args.worker || '')) die('stop requires --worker wN');
-  const teamDir = await resolveTeam(args.team, die, process.cwd());
+  return withManagedTeam(args, teamDir => stopTeamWorker(teamDir, args.worker));
+}
+
+async function stopTeamWorker(teamDir, id) {
   const team = basename(teamDir);
   const data = await load(teamDir);
-  const worker = data.workers[args.worker];
-  if (!worker) die(`worker ${args.worker} does not exist`);
-  if (worker.terminal || worker.terminal_started || worker.terminal_stopped) {
-    throw new Error(`legacy terminal for ${args.worker} has no broker-owned process identity; leave it open and recover its native session before migration`);
+  const mismatch = backendMismatchError(data);
+  if (mismatch) die(mismatch, 4);
+  const worker = data.workers[id];
+  if (!worker) die(`worker ${id} does not exist`);
+  const subManager = worker.role === 'sub-manager';
+  if (subManager) {
+    await withLock(teamDir, async () => {
+      const current = await load(teamDir);
+      current.workers[id].stopping = true;
+      current.workers[id].stop_generation = (current.workers[id].stop_generation ?? 0) + 1;
+      await save(teamDir, current);
+    });
   }
-  const client = await connectSupervisor(STATE_ROOT);
-  await client.stop(team, args.worker);
-  await syncStatus(teamDir, client, team);
-  const latest = await load(teamDir).then(data => data.workers[args.worker]);
-  if (latest.state !== 'idle') throw new Error(`broker did not prove ${args.worker} idle; state=${latest.state}`);
-  console.log(`${team}/${args.worker}: broker-proven idle; ${latest.session_id ? 'native session retained' : 'no native session'}; queued tasks, if any, are blocked and must be resubmitted`);
+  const broker = await connectSupervisor(STATE_ROOT);
+  const latest = await stopWorkers(teamDir, [id], broker);
+  if (subManager) {
+    await forEachChild(latest, [worker], (childDir, child) => stopWorkers(childDir, Object.keys(child.workers), broker));
+    await withLock(teamDir, async () => {
+      const current = await load(teamDir);
+      delete current.workers[id].stopping;
+      await save(teamDir, current);
+    });
+  }
+  console.log(`${team}/${id}: broker-proven idle; ${latest.workers[id].session_id ? 'native session retained' : 'no native session'}; queued tasks, if any, are blocked and must be resubmitted`);
 }
 
 function tableCell(value) {
@@ -1422,8 +1643,10 @@ function tableCell(value) {
 }
 
 async function clear(args) {
-  forbidWorkerManager();
-  const teamDir = await resolveTeam(args.team, die, process.cwd());
+  return withManagedTeam(args, teamDir => clearTeam(teamDir, args));
+}
+
+async function clearTeam(teamDir, args) {
   let data;
   await withLock(teamDir, async () => {
     data = await load(teamDir);
@@ -1502,12 +1725,12 @@ async function clear(args) {
 }
 
 function usage() {
-  console.log(`usage: node src/main.mjs {init,member,status,assign,wait,approve,stop,clear} [options]
+  console.log(`usage: node src/main.mjs {init,member,dismiss,status,assign,wait,approve,stop,clear} [options]
 
 team-building helper: persistent harness-neutral workers driven by one manager session.
 
 Commands:
-  init [gpt|claude] [--name NAME|--team ID|NAME] [--model gpt|claude|MODEL] [--member N] [--idle-stop 15m|0] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
+  init [gpt|claude] [--mode single-team|multi-team] [--name NAME|--team ID|NAME] [--model gpt|claude|MODEL] [--member N] [--idle-stop 15m|0] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
   member N [--model MODEL] [--harness omp|claude|codex] [--allow-bypass]
   dismiss --worker wN[,wM...]
   status
@@ -1558,6 +1781,11 @@ export function parseArgs(argv) {
       if (args.cmd !== 'init') die('--name is only valid with init');
       args.name = take(index, '--name');
       index++;
+    } else if (option === '--mode') {
+      if (args.cmd !== 'init') die('--mode is only valid with init');
+      args.mode = take(index, '--mode');
+      index++;
+      if (!['single-team', 'multi-team'].includes(args.mode)) die('--mode must be single-team or multi-team');
     } else if (option === '--timeout') {
       args.timeout = Number(take(index, '--timeout'));
       index++;
@@ -1635,6 +1863,7 @@ export function parseArgs(argv) {
   }
 
   args.command ??= [];
+  if (args.team === '') die('--team must name a team');
   if (!Number.isInteger(args.timeout) || !Number.isInteger(args.max)) die('--timeout and --max must be integers');
   return args;
 }
@@ -1658,6 +1887,7 @@ async function main() {
 
   await mkdir(STATE_ROOT, { recursive: true });
   if (args.cmd === 'idle-watch') {
+    if (process.env[WORKER_ENV] !== undefined) die('workers cannot run the team idle watcher directly');
     await idleWatch();
     return;
   }
@@ -1665,6 +1895,11 @@ async function main() {
   if (!action) {
     usage();
     die(`invalid command ${args.cmd}`);
+  }
+  args.context = await subManagerContext();
+  if (args.context) {
+    const mismatch = backendMismatchError(args.context.team);
+    if (mismatch) die(mismatch, 4);
   }
   await action(args);
   await startIdleWatcher();

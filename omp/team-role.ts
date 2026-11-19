@@ -1,6 +1,6 @@
 // team-building managed omp extension
-// 1. Shows the team-building role under the editor: manager (bold dark purple) / worker (blue).
-//    Worker = launched by the team supervisor (TEAM_BUILDING_WORKER set).
+// 1. Shows the manager, sub-manager, or worker role under the editor.
+//    Sub-manager and worker = launched by the team supervisor (TEAM_BUILDING_WORKER set).
 //    Manager = an active team at this cwd whose manager_session is this session.
 // 2. Worker tab bridge (TEAM_BUILDING_TAB_DIR set): this interactive session *is* the worker.
 //    The broker hands it prompts through small JSON files in that directory and reads the
@@ -14,6 +14,7 @@
 import { mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { registerTeamPolicy } from '../runtime/team-policy.mjs'
 
 const STATE_ROOT = join(homedir(), '.local/state/team-building')
 const TAB = process.env.TEAM_BUILDING_TAB_DIR
@@ -58,7 +59,9 @@ function render(ctx: Ctx): void {
   const session = ctx?.sessionManager?.getSessionId?.()
   if (!ctx?.ui?.setWidget) return
   const line = process.env.TEAM_BUILDING_WORKER
-    ? '🔧 \x1b[38;5;27mRole: worker\x1b[39m'
+    ? process.env.TEAM_BUILDING_ROLE === 'sub-manager'
+      ? '🧭 \x1b[1;38;5;91mRole: sub-manager\x1b[22;39m'
+      : '🔧 \x1b[38;5;27mRole: worker\x1b[39m'
     : managesTeam(ctx.cwd ?? process.cwd(), session)
       ? '👑 \x1b[1;38;5;91mRole: manager\x1b[22;39m'
       : undefined
@@ -171,6 +174,7 @@ async function tick(pi: Pi, ctx: Ctx): Promise<void> {
 }
 
 export default function (pi: Pi): void {
+  registerTeamPolicy(pi, { subagentSpawn: true })
   pi.on('session_start', (_event, ctx) => {
     render(ctx)
     if (!TAB) return
@@ -188,9 +192,16 @@ export default function (pi: Pi): void {
   pi.on('tool_call', (event: ToolCall, ctx) => {
     const { command } = event.input ?? {}
     if (event.toolName !== 'bash' || typeof command !== 'string') return
-    const exports = Object.entries(active?.env ?? {}).map(([key, value]) => `export ${key}='${value.replaceAll("'", "'\\''")}'`)
+    const env = active?.env ?? {}
     const session = ctx?.sessionManager?.getSessionId?.()
-    if (command.includes('team-building') && typeof session === 'string' && /^[\w-]+$/.test(session)) exports.push(`export OMP_SESSION_ID=${session}`)
+    const worker = process.env.TEAM_BUILDING_WORKER
+    const teamCommand = command.includes('team-building')
+    // The broker omits launch identity from the task env; keep it when addressing a child team.
+    const exports = Object.entries({
+      ...env,
+      ...(teamCommand && typeof session === 'string' && /^[\w-]+$/.test(session) ? { OMP_SESSION_ID: session } : {}),
+      ...(teamCommand && worker ? { TEAM_BUILDING_WORKER: worker } : {}),
+    }).map(([key, value]) => `export ${key}='${value.replaceAll("'", "'\\''")}'`)
     if (!exports.length) return
     return { input: { ...event.input, command: `${exports.join('; ')}; ${command}` } }
   })

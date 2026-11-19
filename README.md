@@ -1,6 +1,6 @@
 # team-building
 
-- **Release:** [v0.6.0](https://github.com/DamChan0/team-building-skill/releases/tag/v0.6.0)
+- **Release:** [v0.7.0](https://github.com/DamChan0/team-building-skill/releases/tag/v0.7.0)
 - Persistent AI-worker teams managed from one session.
 - **Manager hosts:** OMP, Pi, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
 - **OMP is not needed when Pi, Claude Code, or Codex is the manager and you select native workers.** OMP remains the default worker backend.
@@ -10,7 +10,26 @@
 
 ## Weight routing
 
-`SKILL.md` routes short bounded work to tier 1 one-shot subagents; long-running, multi-step, or resumable work uses a persistent team worker (tier 2), even when the code change is simple. Tier 3 uses a parallel team sized to independent slices (≤4). Failed or blocked results escalate one tier; idle workers are dismissed. `--difficulty` chooses model strength independently of team size.
+`SKILL.md` routes short bounded work inline or to one persistent worker; long-running, multi-step, or resumable work requires a persistent team worker (tier 2), even when the code change is simple. Tier 3 uses a parallel team sized to independent slices (≤4). In team mode, delegated work never uses one-shot host subagents. Failed or blocked results escalate one tier; idle workers are dismissed. `--difficulty` chooses model strength independently of team size.
+
+## Sub-managers and concurrent teams
+
+Use `multi-team` when separate team goals need their own persistent coordinator:
+
+```sh
+node ~/.agents/skills/team-building/src/main.mjs init --name portfolio --mode multi-team --member 2
+node ~/.agents/skills/team-building/src/main.mjs assign --team portfolio --worker w1 --detach "Manage the API team; delegate implementation and verify its result."
+node ~/.agents/skills/team-building/src/main.mjs assign --team portfolio --worker w2 --detach "Manage the UI team; delegate implementation and verify its result."
+node ~/.agents/skills/team-building/src/main.mjs wait --team portfolio --all
+node ~/.agents/skills/team-building/src/main.mjs status --team portfolio
+node ~/.agents/skills/team-building/src/main.mjs clear --team portfolio --fast
+```
+
+`--member` counts sub-managers in this mode. Each is a real persistent OMP session using the existing broker, not a host subagent. Each sub-manager creates/adopts one owned child team with normal `init --member N` and delegates to that team's workers. Child workers may use OMP, Claude Code, or Codex; sub-manager sessions require OMP.
+
+Sub-managers cannot manage their parent, siblings, or unrelated teams; cannot nest another manager layer; and cannot grant themselves approval or disable routing enforcement. Approval requests go back to the main manager. Parent `status` displays child associations. Clearing or retiring a sub-manager also cleans its child team; cleanup errors leave recoverable state instead of silently orphaning workers. Existing single-team mode stays the default, and mode cannot change during adoption. Without an explicit selector, the main manager selects root teams rather than their children.
+
+Coordinator tasks use four separate scheduler slots, so waiting sub-managers cannot consume their children's four execution slots. Long-poll waits also have a separate bounded pool, leaving control capacity for child submissions and acknowledgements. Older running supervisors lack the required `health.sub_managers` capability: multi-team init/submission fails explicitly rather than entering an unsupported hierarchy. Finish active tasks before restarting an older supervisor; setup does not stop it for you. Reload/restart OMP before launching new sub-manager sessions so the updated extension and role guard are loaded.
 
 ## Execution model
 
@@ -41,6 +60,7 @@ sequenceDiagram
 - Closing an OMP worker tab ends that worker (a running task becomes `failed: worker tab exited`); the session file survives. `assign` resumes it on demand; `member <current N>` starts stopped workers eagerly. `init` re-adoption leaves idle OMP workers stopped. Closing a Claude/Codex observer does not stop its worker. Connected tabs are reused. A live Orca tab without a pane produces a warning instead of launching another; use `orca-ide terminal switch --terminal <handle>` to reveal it.
 - OMP worker sessions stop after 15 minutes idle by default. `init --idle-stop Nm` sets the timeout; `0` disables it. Idle age follows the last task result, not terminal activity; explicit `member N` startup gives restarted workers a fresh interval. `status` shows stopped workers and idle age; only OMP sessions are stopped.
 - Typing into an OMP worker tab while a task runs is allowed but unsupervised: its output is part of that task's final message. The extension needs `team-role.ts` installed (`node install.mjs`) before the tab starts, and omp tab titles are managed by omp itself (`<team-id> <worker-id> observer` applies only to Claude/Codex).
+- **Enforced manager routing (OMP/Pi):** the installed role extension locks delegation to the team CLI when the skill is invoked or the session owns an active team. It refreshes routing instructions on each prompt/model turn and denies known host subagent tools before execution. Manager `eval` is blocked as well, because older OMP releases bypass the child-spawn hook for eval/workpool; use bash for inline calculations or assign eval work to a persistent worker. Workers and ordinary sessions are unaffected. OMP also registers the spawn hook for runtimes supporting it. `/team-building-mode on|off|auto` controls the session lock; `on` survives resume/compaction, while `auto` follows active-team ownership. If team execution is blocked, report the blocker instead of falling back. Start a new manager session after installing the extension. Native Claude Code/Codex managers remain prompt-only; arbitrary shell execution and third-party extensions are not sandboxed, and system safety rules remain authoritative.
 - **Temporary tool tabs:** The manager snapshots the team's tabs before each assignment. Workers report only disposable tab IDs they created in `tool_sessions`; after the result, the manager closes only tabs absent from that snapshot and refuses registered worker tabs or tabs outside the team's workspace. Existing manager/user tabs stay open. Workers close non-tab helper sessions through their owning tool. Cleanup failures appear as `tool_session_cleanup_errors`; detached tasks remain available for retry.
 - **Local IPC:** every request uses an object envelope such as `{ "version": 1, "id": "<uuid>", "type": "<command>", "payload": { ... } }`.
   - Envelopes and payloads must be objects; scalar requests are rejected.
@@ -58,7 +78,7 @@ sequenceDiagram
   - OMP requires its native session file.
   - Claude and Codex resume their exact broker-recorded IDs.
   - Never recover with `latest`, `continue`, or a fresh session.
-- **Resource limits:** current-thread Tokio runtime; 32 IPC clients; 4 active workers; 1 MiB protocol frames; 1024 queued tasks; bounded, rotated worker logs; 512 KiB SQLite cache with mmap disabled.
+- **Resource limits:** current-thread Tokio runtime; 32 control IPC clients plus 64 long-poll waits; 4 active implementation workers plus 4 coordinators; 1 MiB protocol frames; 1024 queued tasks per role class; bounded, rotated worker logs; 512 KiB SQLite cache with mmap disabled.
 
 ## Requirements and installation
 
@@ -93,7 +113,7 @@ sequenceDiagram
   - There is no Node transport fallback.
 - OMP is not a hard install requirement. If it is missing, setup still installs the skill and prints the OMP install suggestion.
   - Setup also writes an OMP-specific `/team-building` command alias; Claude Code and Codex use the installed `SKILL.md` instead.
-- When `pi` is on `PATH`, setup also installs a separate manager-role widget in `$PI_CODING_AGENT_DIR/extensions` (default `~/.pi/agent/extensions`). Pi is not an OMP worker-tab backend.
+- When `pi` is on `PATH`, setup also installs a manager-role widget and routing guard in `$PI_CODING_AGENT_DIR/extensions` (default `~/.pi/agent/extensions`). Pi is not an OMP worker-tab backend.
 - **OMP backend only:** install OMP and set `tools.approvalMode=yolo`; workers cannot answer approval prompts.
 
   ```sh
@@ -164,7 +184,7 @@ node ~/.agents/skills/team-building/src/main.mjs init --harness codex --allow-by
 ## Commands and recovery
 
 ```sh
-node ~/.agents/skills/team-building/src/main.mjs init [gpt|claude] [--name NAME] [--team ID|NAME] [--member N] [--idle-stop 15m|0] [--model M] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
+node ~/.agents/skills/team-building/src/main.mjs init [gpt|claude] [--name NAME] [--team ID|NAME] [--mode single-team|multi-team] [--member N] [--idle-stop 15m|0] [--model M] [--harness omp|claude|codex] [--allow-bypass] [--isolate] [--clear-previous|--keep-previous]
 node ~/.agents/skills/team-building/src/main.mjs member N [--model M] [--harness H] [--allow-bypass]
 node ~/.agents/skills/team-building/src/main.mjs dismiss --worker wN[,wM...]
 node ~/.agents/skills/team-building/src/main.mjs status [--team ID|NAME]

@@ -79,7 +79,8 @@ export class Supervisor {
 
   health() { return this.request('health'); }
   async submit(spec, requestId) {
-    if (!compatible(await this.health())) throw staleSupervisorError();
+    const health = await this.health();
+    if (!compatible(health) || (spec.env?.TEAM_BUILDING_ROLE === 'sub-manager' && health.sub_managers !== true)) throw staleSupervisorError();
     return this.request('submit', spec, requestId, 15_000);
   }
   get(request_id) { return this.request('get', { request_id }); }

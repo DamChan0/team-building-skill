@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { exists, GATED, STATE_ROOT, WORKER_ENV, dropPointers, load, save, withLock } from './state.mjs';
 
 export class OrcaError extends Error {}
@@ -208,16 +209,28 @@ await import('./run.mjs');
   }
 }
 
-export const contract = (team, wid) => `You are team-building worker ${wid} of team ${team}. Work only on the assigned task. Your task is the prompt sent by your manager.
+const CLI = fileURLToPath(new URL('./main.mjs', import.meta.url));
+const roleFor = worker => worker.role === 'sub-manager' ? 'sub-manager' : 'worker';
+
+export const contract = (team, wid, role = 'worker') => `${role === 'sub-manager'
+  ? `You are team-building sub-manager ${wid} of parent team ${team}. Your task is the prompt sent by your parent manager.
+
+Rules:
+- Delegate, coordinate, and review; do not implement the code yourself. Work only on the assigned scope.
+- Manage exactly one owned child team using only the persistent CLI (node ${JSON.stringify(CLI)}): use status to find it, init --mode single-team if needed, member to size it, assign --detach to delegate, and wait to collect and review results. Use the owned child's --team selector once known. Use clear only for that child when directed; otherwise keep it for follow-up.
+- Do not operate on the parent, siblings, or other teams, and do not create another hierarchy level. Never use host task/Agent/subagent tools, eval agent()/workpool, or shell-launched helper agents. If the CLI is unavailable, report the blocker instead of switching executors.
+- Report the aggregate outcome to the parent using the result schema below. Include the changed/deleted files and verification from reviewed child results; don't claim success for incomplete work. Relay unresolved child approval requests to the parent with the originating child team, worker and task in the reason. Do not approve or retry them yourself.
+- Report only your own eligible temporary tool tabs, not child workers' reports or any managed worker/manager tab. Report branch/commit from child results only when unambiguous; otherwise list them in the summary.`
+  : `You are team-building worker ${wid} of team ${team}. Work only on the assigned task. Your task is the prompt sent by your manager.
 
 Rules:
 - Implement the assigned slice directly; never run team-building commands, manage teams, or create workers.
-- You are not the lead. The manager triages and reviews your result, so skip lead-only startup: do not read ~/.codex/orchestration.md or output-style skills (caveman), and do not run an independent-review gate.
+- You are not the lead. The manager triages and reviews your result, so skip lead-only startup: do not read ~/.codex/orchestration.md or output-style skills (caveman), and do not run an independent-review gate.`}
 - Do not ask the user. If blocked, return status "blocked" and state the exact need.
 - Touch only assigned files. Delete only paths explicitly allowed by the brief or files you created; never delete a directory wholesale or rewrite git history.
 - Keep this worker's persistent session/tab. Extra tabs opened for MCP/tool access are temporary: create them in the team's managed workspace, and include each exact handle in tool_sessions only if it was absent from the manager's pre-assignment tab census. The manager closes listed tabs after receiving your result. Close tabs opened elsewhere and non-tab helper sessions through their owning tool after use. Never list this worker's tab, another worker's tab, the manager's tab, or any tab you did not create.
 - External/gated commands need manager approval. If not approved, do not retry; return a blocked result with approval_requests containing the exact command argv, target, and reason. Local commands need no approval.
-- In an isolated worktree, make a local commit and report its branch and commit. Never push.
+${role === 'sub-manager' ? '- Do not push.' : '- In an isolated worktree, make a local commit and report its branch and commit. Never push.'}
 - Return exactly one JSON object, without prose or Markdown, containing status ("succeeded", "failed", or "blocked"), summary, files_changed, files_deleted, verification, blockers, approval_requests, tool_sessions, branch, and commit. tool_sessions is an array of {"kind":"tab","id":"<opaque handle>"} objects; use [] when none. summary, verification, branch, and commit must be strings; use "\\n" inside verification for multiple checks and "" for unavailable branch/commit, never null. files_changed, files_deleted, and blockers must be arrays of strings; approval_requests must be an array of request objects; use [] when empty. Do not write a result file; the supervisor receives the structured native result.`;
 export function launchConfig(worker) {
   return { model: worker.task_model ?? worker.model ?? null, thinking: worker.task_thinking ?? null };
@@ -233,7 +246,6 @@ async function defaultOmpThinking() {
 }
 
 export async function nativeTask(team, worker, { prompt, teamDir, cwd }) {
-  const instruction = contract(team, worker.id);
   const { model, thinking: configuredThinking } = launchConfig(worker);
   const harness = worker.harness || 'omp';
   if (worker.session_file) await recordSession(teamDir, worker, cwd);
@@ -241,6 +253,7 @@ export async function nativeTask(team, worker, { prompt, teamDir, cwd }) {
     // The worker is the interactive omp in its multiplexer tab (see ompTabCommand); the broker only needs the thinking level.
     return { argv: [], env: {}, thinking: configuredThinking ?? await defaultOmpThinking() };
   }
+  const instruction = contract(team, worker.id, roleFor(worker));
   if (harness === 'claude') {
     const schema = JSON.stringify({
       type: 'object',
@@ -290,11 +303,15 @@ export const tabDir = (teamDir, worker) => join(teamDir, 'tabs', worker.id);
 // interactive session receives broker prompts via TEAM_BUILDING_TAB_DIR. Per-task model and
 // thinking are applied by the extension; the launch model only seeds a fixed-model team.
 export function ompTabCommand(team, worker, { teamDir, cwd }) {
-  const argv = ['omp', '--no-title', '--cwd', cwd, '--session-dir', worker.session_dir, '--append-system-prompt', contract(team, worker.id)];
+  const role = roleFor(worker);
+  const argv = ['omp', '--no-title', '--cwd', cwd, '--session-dir', worker.session_dir, '--append-system-prompt', contract(team, worker.id, role)];
   if (worker.session_file) argv.push('--resume', worker.session_file);
   if (worker.model) argv.push('--model', worker.model);
   const env = {
     TEAM_BUILDING_WORKER: `${team}/${worker.id}`,
+    TEAM_BUILDING_ROLE: role,
+    // A child tab must not inherit an approval task from its launching sub-manager.
+    TEAM_BUILDING_APPROVAL_TASK: '',
     TEAM_BUILDING_TAB_DIR: tabDir(teamDir, worker),
     PATH: `${join(teamDir, 'shim')}:${process.env.PATH || ''}`,
   };

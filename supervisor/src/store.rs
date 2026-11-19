@@ -105,8 +105,8 @@ impl Store {
             return Err(anyhow!("task_conflict"));
         }
         let queued: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE state='queued'",
-            [],
+            "SELECT COUNT(*) FROM tasks WHERE state='queued' AND (COALESCE(json_extract(spec, '$.env.TEAM_BUILDING_ROLE'), '')='sub-manager')=?1",
+            [spec.env.get("TEAM_BUILDING_ROLE").is_some_and(|role| role == "sub-manager")],
             |row| row.get(0),
         )?;
         if queued >= 1024 {
@@ -129,12 +129,12 @@ impl Store {
         snapshot_in(&connection, request_id).map(|item| item.map(|(snapshot, _)| snapshot))
     }
 
-    pub(crate) fn next_queued(&self) -> Result<Option<TaskSnapshot>> {
+    pub(crate) fn next_queued(&self, sub_managers: bool) -> Result<Option<TaskSnapshot>> {
         let connection = self
             .connection
             .lock()
             .map_err(|_| anyhow!("database lock poisoned"))?;
-        let id = connection.query_row("SELECT t.request_id FROM tasks t WHERE t.state='queued' AND NOT EXISTS (SELECT 1 FROM tasks r WHERE r.team=t.team AND r.worker=t.worker AND (r.state='running' OR (r.state='unknown' AND r.fence_released=0))) ORDER BY t.rowid LIMIT 1", [], |row| row.get::<_, String>(0)).optional()?;
+        let id = connection.query_row("SELECT t.request_id FROM tasks t WHERE t.state='queued' AND (COALESCE(json_extract(t.spec, '$.env.TEAM_BUILDING_ROLE'), '')='sub-manager')=?1 AND NOT EXISTS (SELECT 1 FROM tasks r WHERE r.team=t.team AND r.worker=t.worker AND (r.state='running' OR (r.state='unknown' AND r.fence_released=0) OR (r.state='queued' AND r.rowid<t.rowid))) ORDER BY t.rowid LIMIT 1", [sub_managers], |row| row.get::<_, String>(0)).optional()?;
         id.map_or(Ok(None), |id| {
             snapshot_in(&connection, &id).map(|item| item.map(|(snapshot, _)| snapshot))
         })
@@ -608,12 +608,73 @@ mod tests {
         let second = "00000000-0000-4000-8000-000000000002";
         assert!(store.submit(first, &spec("first")).unwrap().1);
         assert!(!store.submit(first, &spec("first")).unwrap().1);
-        assert_eq!(store.next_queued().unwrap().unwrap().request_id, first);
+        assert_eq!(store.next_queued(false).unwrap().unwrap().request_id, first);
         assert!(store.mark_running(first).unwrap().is_some());
         let mut second_spec = spec("second");
         second_spec.worker = "other".into();
         assert!(store.submit(second, &second_spec).unwrap().1);
-        assert_eq!(store.next_queued().unwrap().unwrap().request_id, second);
+        assert_eq!(store.next_queued(false).unwrap().unwrap().request_id, second);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn role_changes_do_not_overtake_earlier_work_for_the_same_session() {
+        let path = std::env::temp_dir()
+            .join(format!("team-supervisor-{}.sqlite", uuid::Uuid::new_v4()));
+        let store = Store::open(&path).unwrap();
+        let first = "00000000-0000-4000-8000-000000000001";
+        let second = "00000000-0000-4000-8000-000000000002";
+        let mut coordinator = spec("coordinate");
+        coordinator.env.insert("TEAM_BUILDING_ROLE".into(), "sub-manager".into());
+        store.submit(first, &coordinator).unwrap();
+        store.submit(second, &spec("implement")).unwrap();
+        assert!(store.next_queued(false).unwrap().is_none());
+        store.mark_running(first).unwrap();
+        assert!(store.next_queued(false).unwrap().is_none());
+        store.mark_stopped(first).unwrap();
+        assert_eq!(store.next_queued(false).unwrap().unwrap().request_id, second);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn full_coordinator_queue_preserves_child_admission() {
+        let path = std::env::temp_dir()
+            .join(format!("team-supervisor-{}.sqlite", uuid::Uuid::new_v4()));
+        let store = Store::open(&path).unwrap();
+        for index in 0..1024 {
+            let mut coordinator = spec(&format!("manager-{index}"));
+            coordinator.env.insert("TEAM_BUILDING_ROLE".into(), "sub-manager".into());
+            store.submit(&format!("request-{index}"), &coordinator).unwrap();
+        }
+        assert!(store.submit("child-request", &spec("child")).is_ok());
+        let mut overflow = spec("overflow");
+        overflow.env.insert("TEAM_BUILDING_ROLE".into(), "sub-manager".into());
+        assert_eq!(store.submit("overflow", &overflow).unwrap_err().to_string(), "queue_full");
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn coordinators_and_child_tasks_use_independent_fifo_queues() {
+        let path = std::env::temp_dir()
+            .join(format!("team-supervisor-{}.sqlite", uuid::Uuid::new_v4()));
+        let store = Store::open(&path).unwrap();
+        let mut manager = spec("coordinate");
+        manager.env.insert("TEAM_BUILDING_ROLE".into(), "sub-manager".into());
+        let manager_id = "00000000-0000-4000-8000-000000000001";
+        let child_id = "00000000-0000-4000-8000-000000000002";
+        let mut child = spec("implement");
+        child.team = "child".into();
+        store.submit(manager_id, &manager).unwrap();
+        store.submit(child_id, &child).unwrap();
+        assert_eq!(store.next_queued(true).unwrap().unwrap().request_id, manager_id);
+        store.mark_running(manager_id).unwrap();
+        assert!(store.next_queued(true).unwrap().is_none());
+        assert_eq!(store.next_queued(false).unwrap().unwrap().request_id, child_id);
+        store.mark_running(child_id).unwrap();
+        assert!(store.next_queued(false).unwrap().is_none());
         drop(store);
         let _ = std::fs::remove_file(path);
     }

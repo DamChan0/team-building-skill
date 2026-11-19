@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 const skillRoot = dirname(fileURLToPath(import.meta.url));
 
 const COMMAND_NAME = "team-building.md";
@@ -80,7 +80,8 @@ async function installNativeCommand() {
 
 async function installRoleExtension() {
   const target = join(extensionsDir(), EXTENSION_NAME);
-  const content = await readFile(join(skillRoot, "omp", EXTENSION_NAME), "utf8");
+  const content = (await readFile(join(skillRoot, "omp", EXTENSION_NAME), "utf8"))
+    .replace("'../runtime/team-policy.mjs'", JSON.stringify(pathToFileURL(join(skillRoot, "runtime", "team-policy.mjs")).href));
   await installManagedFile(
     target,
     content,
@@ -92,7 +93,8 @@ async function installRoleExtension() {
 
 async function installPiRoleExtension() {
   const target = join(piExtensionsDir(), PI_EXTENSION_NAME);
-  const content = await readFile(join(skillRoot, "pi", PI_EXTENSION_NAME), "utf8");
+  const content = (await readFile(join(skillRoot, "pi", PI_EXTENSION_NAME), "utf8"))
+    .replace("'../runtime/team-policy.mjs'", JSON.stringify(pathToFileURL(join(skillRoot, "runtime", "team-policy.mjs")).href));
   await installManagedFile(
     target,
     content,

@@ -37,7 +37,10 @@ test('OMP workers launch as interactive tabs; native launches pin only exact Cla
   try {
     const bin = join(root, 'bin');
     await mkdir(bin);
-    await writeFile(join(bin, 'omp'), '#!/bin/sh\nprintf "low\\n"\n');
+    await writeFile(join(bin, 'omp'), `#!/bin/sh
+if [ "$1" = config ]; then printf "low\\n"; exit; fi
+exec node -e 'console.log(JSON.stringify(process.argv.slice(1)))' -- "$PWD" "$TEAM_BUILDING_WORKER" "$TEAM_BUILDING_ROLE" "$TEAM_BUILDING_TAB_DIR" "$TEAM_BUILDING_APPROVAL_TASK" "$@"
+`);
     await chmod(join(bin, 'omp'), 0o755);
     process.env.PATH = `${bin}:${previousPath || ''}`;
     const worker = { id: 'w1', harness: 'omp', session_dir: join(root, "sessions 'w1'"), session_file: join(root, 'w1.jsonl'), model: 'openai-codex/gpt-6-luna' };
@@ -46,12 +49,24 @@ test('OMP workers launch as interactive tabs; native launches pin only exact Cla
     assert.deepEqual(omp.argv, []);
     assert.equal(omp.thinking, 'low');
 
-    const launch = ompTabCommand('team', worker, { teamDir: root, cwd: root });
-    const printed = spawnSync('/bin/sh', ['-c', launch.replace(/exec [\s\S]*$/, 'printf "%s|%s|%s" "$PWD" "$TEAM_BUILDING_WORKER" "$TEAM_BUILDING_TAB_DIR"')], { encoding: 'utf8' });
-    assert.equal(printed.stdout, `${root}|team/w1|${join(root, 'tabs', 'w1')}`);
-    const exec = launch.slice(launch.indexOf('exec '));
-    assert.ok(!exec.includes("'--mode'") && !exec.includes("'--no-ui'"), 'the tab must run the interactive TUI');
-    assert.ok(exec.includes(`'--resume' '${join(root, 'w1.jsonl')}'`) && exec.includes(`'--model' 'openai-codex/gpt-6-luna'`));
+    const launch = props => {
+      const result = spawnSync('/bin/sh', ['-c', ompTabCommand('team', { ...worker, ...props }, { teamDir: root, cwd: root })], {
+        encoding: 'utf8',
+        env: { ...process.env, TEAM_BUILDING_WORKER: 'outer/w9', TEAM_BUILDING_ROLE: 'sub-manager', TEAM_BUILDING_APPROVAL_TASK: 't001' },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      return JSON.parse(result.stdout);
+    };
+    const [cwd, identity, role, tab, approval, ...argv] = launch({});
+    assert.deepEqual([cwd, identity, role, tab, approval], [root, 'team/w1', 'worker', join(root, 'tabs', 'w1'), '']);
+    assert.ok(!argv.includes('--mode') && !argv.includes('--no-ui'), 'the tab must run the interactive TUI');
+    assert.deepEqual(argv.slice(-4), ['--resume', join(root, 'w1.jsonl'), '--model', 'openai-codex/gpt-6-luna']);
+    const prompt = '--append-system-prompt';
+    assert.match(argv[argv.indexOf(prompt) + 1], /never run team-building commands, manage teams, or create workers/);
+
+    const [childCwd, parentIdentity, subRole, subTab, subApproval, ...subArgv] = launch({ role: 'sub-manager' });
+    assert.deepEqual([childCwd, parentIdentity, subRole, subTab, subApproval], [root, 'team/w1', 'sub-manager', tab, '']);
+    assertSubManagerContract(subArgv[subArgv.indexOf(prompt) + 1]);
   } finally {
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;
@@ -76,8 +91,21 @@ test('OMP workers launch as interactive tabs; native launches pin only exact Cla
   const schema = JSON.parse(fresh.argv[schemaIndex + 1]);
   assert.ok(schema.required.includes('tool_sessions'));
   assert.deepEqual(schema.properties.tool_sessions.items.required, ['kind', 'id']);
+  const sub = await claude({ role: 'sub-manager', session_id: pinned });
+  assertSubManagerContract(sub.argv[sub.argv.indexOf('--append-system-prompt') + 1]);
+  const codex = await nativeTask('team', { id: 'w1', role: 'sub-manager', harness: 'codex' }, { prompt: 'smoke', teamDir: '/tmp', cwd: '/tmp' });
+  const developerInstructions = codex.argv.find(arg => arg.startsWith('developer_instructions='));
+  assertSubManagerContract(JSON.parse(developerInstructions.slice('developer_instructions='.length)));
 });
 
+function assertSubManagerContract(prompt) {
+  assert.match(prompt, /sub-manager w1 of parent team team/);
+  assert.match(prompt, /do not implement the code yourself/);
+  for (const instruction of ['one owned child team', 'init --mode single-team', 'member', 'assign --detach', 'wait', 'status', 'clear', 'Never use host task', 'report the aggregate outcome', 'approval_requests', 'tool_sessions']) {
+    assert.ok(prompt.toLowerCase().includes(instruction.toLowerCase()), `missing ${instruction}`);
+  }
+  assert.doesNotMatch(prompt, /never run team-building commands/);
+}
 
 test('a worker can run a gated command only through its bound approval', async () => {
   const home = await mkdtemp(join(tmpdir(), 'team-building-approval-'));

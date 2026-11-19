@@ -50,6 +50,8 @@ struct Daemon {
     store: Arc<Store>,
     active: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     slots: Arc<Semaphore>,
+    manager_slots: Arc<Semaphore>,
+    wait_slots: Arc<Semaphore>,
     stopping: watch::Sender<bool>,
     changed: Notify,
 }
@@ -84,6 +86,9 @@ async fn serve(state_dir: PathBuf, socket: PathBuf) -> Result<()> {
         store,
         active: Arc::new(Mutex::new(HashMap::new())),
         slots: Arc::new(Semaphore::new(4)),
+        // Coordinators wait on child tasks; they must not consume execution slots.
+        manager_slots: Arc::new(Semaphore::new(4)),
+        wait_slots: Arc::new(Semaphore::new(64)),
         stopping: stopping.clone(),
         changed: Notify::new(),
     });
@@ -102,9 +107,9 @@ async fn serve(state_dir: PathBuf, socket: PathBuf) -> Result<()> {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
-                let Ok(permit) = admission.clone().try_acquire_owned() else { drop(stream); continue };
+                let Ok(permit) = admission.clone().acquire_owned().await else { break };
                 let daemon = daemon.clone();
-                tokio::spawn(async move { let _permit = permit; let _ = handle_connection(stream, daemon).await; });
+                tokio::spawn(async move { let _ = handle_connection(stream, daemon, permit).await; });
             }
             changed = shutdown.changed() => if changed.is_ok() && *shutdown.borrow() { break; },
             signal = tokio::signal::ctrl_c() => { signal?; let _ = stopping.send(true); break; },
@@ -135,25 +140,38 @@ fn start_scheduler(daemon: Arc<Daemon>) {
         let mut stopping = daemon.stopping.subscribe();
         loop {
             tokio::select! { _ = stopping.changed() => break, _ = tokio::time::sleep(Duration::from_millis(50)) => {} }
-            while let Ok(permit) = daemon.slots.clone().try_acquire_owned() {
-                let Some(task) = daemon.store.next_queued().ok().flatten() else {
-                    drop(permit);
-                    break;
-                };
-                let Some(task) = daemon.store.mark_running(&task.request_id).ok().flatten() else {
-                    drop(permit);
-                    continue;
-                };
-                daemon.changed.notify_waiters();
-                let (cancel, receiver) = watch::channel(false);
-                if let Ok(mut active) = daemon.active.lock() {
-                    active.insert(task.request_id.clone(), cancel);
+            for (sub_managers, slots) in [
+                (true, &daemon.manager_slots),
+                (false, &daemon.slots),
+            ] {
+                while let Ok(permit) = slots.clone().try_acquire_owned() {
+                    let task = match daemon.store.next_queued(sub_managers) {
+                        Ok(Some(task)) => task,
+                        Ok(None) => break,
+                        Err(error) => {
+                            let _ = writeln!(std::io::stderr(), "supervisor queue read failed: {error}");
+                            break;
+                        }
+                    };
+                    let task = match daemon.store.mark_running(&task.request_id) {
+                        Ok(Some(task)) => task,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            let _ = writeln!(std::io::stderr(), "supervisor dispatch failed: {error}");
+                            break;
+                        }
+                    };
+                    daemon.changed.notify_waiters();
+                    let (cancel, receiver) = watch::channel(false);
+                    if let Ok(mut active) = daemon.active.lock() {
+                        active.insert(task.request_id.clone(), cancel);
+                    }
+                    let daemon = daemon.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        run_task(daemon, task, receiver).await;
+                    });
                 }
-                let daemon = daemon.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    run_task(daemon, task, receiver).await;
-                });
             }
         }
     });
@@ -246,14 +264,43 @@ fn persist_event(daemon: &Daemon, request_id: &str, event: WorkerEvent) {
     daemon.changed.notify_waiters();
 }
 
-async fn handle_connection(mut stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
+async fn handle_connection(
+    mut stream: UnixStream,
+    daemon: Arc<Daemon>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<()> {
+    let mut control_permit = Some(permit);
     let credential = stream.peer_cred().context("reading peer credential")?;
     if credential.uid() != unsafe { libc::geteuid() } {
         return Ok(());
     }
     let reply = match read_frame(&mut stream).await {
         Ok(frame) => match parse_command(&frame) {
-            Ok(command) => dispatch(&command.id, &command.kind, command.payload, &daemon).await,
+            Ok(command) => {
+                // Long polls must leave control capacity for child submissions and acks.
+                let wait_permit = (command.kind == "wait")
+                    .then(|| daemon.wait_slots.clone().try_acquire_owned().ok())
+                    .flatten();
+                if command.kind == "wait" && wait_permit.is_none() {
+                    error_response(&command.id, "wait_capacity")
+                } else {
+                    if wait_permit.is_some() {
+                        drop(control_permit.take());
+                    }
+                    tokio::select! {
+                        reply = dispatch(&command.id, &command.kind, command.payload, &daemon) => reply,
+                        _ = async {
+                            loop {
+                                if stream.readable().await.is_err() { break; }
+                                match stream.try_read(&mut [0_u8; 1]) {
+                                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                                    _ => break,
+                                }
+                            }
+                        }, if wait_permit.is_some() => return Ok(()),
+                    }
+                }
+            }
             Err(code) => error(
                 "00000000-0000-0000-0000-000000000000",
                 code,
@@ -324,7 +371,7 @@ async fn dispatch(
     match command {
         "health" if payload.is_empty() => response(
             id,
-            json!({"ok":true,"healthy":true,"compatibility":COMPATIBILITY_MARKER}),
+            json!({"ok":true,"healthy":true,"compatibility":COMPATIBILITY_MARKER,"sub_managers":true}),
         ),
         "submit" => match serde_json::from_value::<TaskSpec>(Value::Object(payload)) {
             Ok(spec) if serde_json::to_vec(&spec).is_ok_and(|bytes| bytes.len() > 512 * 1024) => {

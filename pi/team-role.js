@@ -1,9 +1,10 @@
 // team-building managed pi extension
-// Shows the active manager session's role below Pi's editor. OMP worker-tab
+// Shows the manager or sub-manager role below Pi's editor. OMP worker-tab
 // protocol stays in omp/team-role.ts; Pi exports PI_SESSION_ID to its bash tool.
 import { readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { registerTeamPolicy } from '../runtime/team-policy.mjs';
 
 const STATE_ROOT = join(homedir(), '.local/state/team-building');
 
@@ -24,12 +25,17 @@ function managesTeam(cwd, session) {
 
 function render(ctx) {
   if (!ctx.hasUI || !ctx.ui?.setWidget) return;
-  const manager = managesTeam(ctx.cwd ?? process.cwd(), ctx.sessionManager?.getSessionId?.());
-  const line = manager ? '👑 \x1b[1;38;5;91mRole: manager\x1b[22;39m' : undefined;
+  const subManager = !!process.env.TEAM_BUILDING_WORKER && process.env.TEAM_BUILDING_ROLE === 'sub-manager';
+  const line = subManager
+    ? '🧭 \x1b[1;38;5;91mRole: sub-manager\x1b[22;39m'
+    : managesTeam(ctx.cwd ?? process.cwd(), ctx.sessionManager?.getSessionId?.())
+      ? '👑 \x1b[1;38;5;91mRole: manager\x1b[22;39m'
+      : undefined;
   ctx.ui.setWidget('team-role', line && [line], { placement: 'belowEditor' });
 }
 
 export default function (pi) {
+  registerTeamPolicy(pi);
   pi.on('session_start', (_event, ctx) => render(ctx));
   pi.on('agent_end', (_event, ctx) => render(ctx));
 }

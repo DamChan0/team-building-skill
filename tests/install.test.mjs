@@ -98,7 +98,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import extension from ${JSON.stringify(pathToFileURL(piExtension).href)};
 const handlers = new Map();
 const widgets = [];
-extension({ on: (name, handler) => handlers.set(name, handler) });
+extension({ on: (name, handler) => handlers.set(name, handler), registerCommand() {} });
 const ctx = {
   hasUI: true,
   cwd: ${JSON.stringify(cwd)},

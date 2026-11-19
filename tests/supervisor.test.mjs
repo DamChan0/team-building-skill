@@ -127,8 +127,9 @@ setInterval(() => {
 const tabs = [];
 // Starts the fixture tab in its own process group (the broker may SIGTERM that group).
 async function startTab(root, control, { source = tabFixture, session = 'session-tab', worker = 'w1' } = {}) {
-  await writeFile(join(root, 'tab.mjs'), source);
-  const child = spawn(process.execPath, [join(root, 'tab.mjs')], {
+  const sourcePath = join(root, `tab-${worker}.mjs`);
+  await writeFile(sourcePath, source);
+  const child = spawn(process.execPath, [sourcePath], {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, FIXTURE_TAB: join(root, 'tabs', worker), FIXTURE_SESSION: session, FIXTURE_SESSION_FILE: join(root, `${worker}.session`), FIXTURE_CONTROL: control, FIXTURE_EFFECT: join(root, 'effect'), FIXTURE_READY: `${control}.ready` },
@@ -257,11 +258,50 @@ test('health reports the current supervisor compatibility marker', { skip: !avai
   }
 });
 
+test('child tasks and control requests progress with coordinator slots and long polls occupied', { skip: !available, timeout: 30_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'team-supervisor-coordinators-'));
+  let daemon;
+  try {
+    daemon = await start(root);
+    const managers = [];
+    for (let index = 1; index <= 4; index++) {
+      const worker = `w${index}`;
+      const control = join(root, `${worker}.sock`);
+      await startTab(root, control, { worker, session: `manager-${index}` });
+      const spec = task(root, index, control, join(root, 'effect'), { worker, task: `t00${index}` });
+      spec.env.TEAM_BUILDING_ROLE = 'sub-manager';
+      await daemon.client.submit(spec, uuid(index));
+      managers.push({ request: uuid(index), control });
+    }
+    await Promise.all(managers.map(manager => running(daemon.client, manager.request)));
+    const waiting = [];
+    for (let index = 0; index < 40; index++) {
+      waiting.push(daemon.client.wait(uuid(1), 1_000_000_000, 60_000).catch(error => error));
+      assert.equal((await daemon.client.health()).sub_managers, true);
+    }
+    const childControl = join(root, 'child.sock');
+    await startTab(root, childControl, { worker: 'w5', session: 'child' });
+    await daemon.client.submit(task(root, 5, childControl, join(root, 'effect'), { worker: 'w5', task: 't005' }), uuid(5));
+    await running(daemon.client, uuid(5));
+    await connectControl(childControl);
+    assert.equal((await terminal(daemon.client, uuid(5))).state, 'succeeded');
+    await Promise.all(managers.map(manager => connectControl(manager.control)));
+    for (const manager of managers) assert.equal((await terminal(daemon.client, manager.request)).state, 'succeeded');
+    for (const reply of await Promise.all(waiting)) {
+      assert.ok(!(reply instanceof Error), reply.message);
+      assert.equal(reply.task.state, 'succeeded');
+    }
+  } finally {
+    if (daemon) await stop(daemon);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('legacy or mismatched health rejects submit without sending its incompatible payload', async () => {
   const root = await mkdtemp(join(tmpdir(), 'team-supervisor-legacy-'));
   const socket = join(root, 'supervisor.sock');
   const commands = [];
-  const healthMarkers = [undefined, supervisorCompatibility + 1];
+  const healthMarkers = [undefined, supervisorCompatibility + 1, supervisorCompatibility];
   const server = net.createServer(connection => connection.once('data', chunk => {
     const request = JSON.parse(chunk.toString('utf8').trim());
     commands.push(request.type);
@@ -285,7 +325,8 @@ test('legacy or mismatched health rejects submit without sending its incompatibl
           && /retry/.test(error.message),
       );
     }
-    assert.deepEqual(commands, ['status', 'health', 'health']);
+    await assert.rejects(client.submit({ env: { TEAM_BUILDING_ROLE: 'sub-manager' } }, uuid(101)), error => error.code === 'stale_supervisor');
+    assert.deepEqual(commands, ['status', 'health', 'health', 'health']);
   } finally {
     await new Promise(resolve => server.close(resolve));
     await rm(root, { recursive: true, force: true });
