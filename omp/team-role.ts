@@ -1,7 +1,7 @@
 // team-building managed omp extension
 // 1. Shows the manager, sub-manager, or worker role under the editor.
 //    Sub-manager and worker = launched by the team supervisor (TEAM_BUILDING_WORKER set).
-//    Manager = an active team at this cwd whose manager_session is this session.
+//    Manager = the shared routing guard is active, including restored manager sessions.
 // 2. Worker tab bridge (TEAM_BUILDING_TAB_DIR set): this interactive session *is* the worker.
 //    The broker hands it prompts through small JSON files in that directory and reads the
 //    final assistant text back (protocol documented in supervisor/src/worker.rs):
@@ -11,12 +11,10 @@
 //      abort.json                <- broker   interrupt the running prompt
 // Bun child processes ignore process.env writes, so tool_call prefixes bash commands with
 // the env they need (OMP_SESSION_ID for `init` to record; per-task TEAM_BUILDING_* for workers).
-import { mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { registerTeamPolicy } from '../runtime/team-policy.mjs'
 
-const STATE_ROOT = join(homedir(), '.local/state/team-building')
 const TAB = process.env.TEAM_BUILDING_TAB_DIR
 
 type Ctx = {
@@ -40,29 +38,14 @@ type Pi = {
 }
 type Task = { request_id: string; prompt: string; model?: string | null; thinking?: string | null; env?: Record<string, unknown> }
 
-function managesTeam(cwd: string, session: unknown): boolean {
-  if (typeof session !== 'string' || !session) return false
-  let path: string
-  try { path = realpathSync(cwd) } catch { return false }
-  try {
-    return readdirSync(STATE_ROOT).some(id => {
-      if (!id.startsWith('tb-')) return false
-      try {
-        const team = JSON.parse(readFileSync(join(STATE_ROOT, id, 'team.json'), 'utf8'))
-        return team.cwd === path && !team.closing && team.manager_session === session
-      } catch { return false }
-    })
-  } catch { return false }
-}
 
-function render(ctx: Ctx): void {
-  const session = ctx?.sessionManager?.getSessionId?.()
+function render(ctx: Ctx, manager: boolean): void {
   if (!ctx?.ui?.setWidget) return
   const line = process.env.TEAM_BUILDING_WORKER
     ? process.env.TEAM_BUILDING_ROLE === 'sub-manager'
       ? '🧭 \x1b[1;38;5;91mRole: sub-manager\x1b[22;39m'
       : '🔧 \x1b[38;5;27mRole: worker\x1b[39m'
-    : managesTeam(ctx.cwd ?? process.cwd(), session)
+    : manager
       ? '👑 \x1b[1;38;5;91mRole: manager\x1b[22;39m'
       : undefined
   ctx.ui.setWidget('team-role', line && [line], { placement: 'belowEditor' })
@@ -174,9 +157,12 @@ async function tick(pi: Pi, ctx: Ctx): Promise<void> {
 }
 
 export default function (pi: Pi): void {
-  registerTeamPolicy(pi, { subagentSpawn: true })
+  const routing = registerTeamPolicy(pi, { subagentSpawn: true, onModeChange: render })
+  for (const name of ['session_switch', 'session_branch', 'session_tree']) {
+    pi.on(name, (_event, ctx) => render(ctx, routing.active(ctx)))
+  }
   pi.on('session_start', (_event, ctx) => {
-    render(ctx)
+    render(ctx, routing.active(ctx))
     if (!TAB) return
     mkdirSync(TAB, { recursive: true })
     lastReady = ''
@@ -184,7 +170,7 @@ export default function (pi: Pi): void {
     timer = ctx.setInterval?.(() => { void tick(pi, ctx).catch(() => { ticking = false }) }, 250)
   })
   pi.on('agent_end', (event: never, ctx) => {
-    render(ctx) // refreshes after `init`/`clear` changes the team mid-session
+    render(ctx, routing.active(ctx)) // refreshes after `init`/`clear` changes the team mid-session
     const { messages, willContinue } = event as { messages?: Message[]; willContinue?: boolean }
     if (TAB && active && !willContinue) finish(assistantOutcome(messages ?? [], active.started))
   })

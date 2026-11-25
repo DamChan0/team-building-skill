@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -136,5 +138,86 @@ test('sub-manager routing stays enforced before child init despite mode changes 
   } finally {
     if (previous.worker === undefined) delete process.env.TEAM_BUILDING_WORKER; else process.env.TEAM_BUILDING_WORKER = previous.worker;
     if (previous.role === undefined) delete process.env.TEAM_BUILDING_ROLE; else process.env.TEAM_BUILDING_ROLE = previous.role;
+  }
+});
+
+test('manager routing and badge survive process restart without leaking into other sessions', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'team-routing-resume-'));
+  const cwd = join(home, 'project');
+  await mkdir(cwd);
+  const script = `
+import extension from ${JSON.stringify(new URL('../pi/team-role.js', import.meta.url).href)};
+const args = JSON.parse(process.argv[1]);
+const handlers = new Map(), commands = new Map(), widgets = [];
+let history = args.late ? [] : args.history ?? [];
+extension({
+  on(name, handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+  registerCommand(name, command) { commands.set(name, command); },
+  appendEntry(customType, data) { history = [...history, { type: 'custom', customType, data }]; },
+});
+const ctx = {
+  cwd: args.cwd, hasUI: true, agent: { kind: 'main' },
+  sessionManager: { getSessionId: () => args.session, getBranch: () => history, getEntries: () => args.allHistory ?? history },
+  ui: { setWidget: (_name, content) => widgets.push(content), notify() {} },
+};
+const emit = async (name, event = {}) => {
+  let result;
+  for (const handler of handlers.get(name) ?? []) {
+    const value = await handler(event, ctx);
+    if (value !== undefined && result === undefined) result = value;
+  }
+  return result;
+};
+if (!args.early) await emit('session_start');
+if (args.late) history = args.history;
+if (args.mode) await commands.get('team-building-mode').handler(args.mode, ctx);
+const changedBadge = widgets.at(-1) ?? [];
+if (args.tree) await emit('session_tree');
+const denied = await emit('tool_call', { toolName: 'functions.task', input: {} });
+await emit('session_switch');
+console.log(JSON.stringify({ blocked: denied?.block === true, badge: widgets.at(-1) ?? [], changedBadge }));
+`;
+  const run = (args = {}) => {
+    const input = { cwd, session: 'manager-1', ...args };
+    const env = { ...process.env, HOME: home, ORCA_PANE_KEY: args.pane ?? 'tab:manager' };
+    delete env.TEAM_BUILDING_WORKER;
+    delete env.TEAM_BUILDING_ROLE;
+    delete env.ORCA_AGENT_PANE;
+    if (args.worker) { env.TEAM_BUILDING_WORKER = 'tb-owner/w1'; env.TEAM_BUILDING_ROLE = 'worker'; }
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script, JSON.stringify(input)], { encoding: 'utf8', env });
+    assert.equal(child.status, 0, child.stderr);
+    return JSON.parse(child.stdout);
+  };
+  const on = { type: 'custom', customType: 'team-building.manager-mode', data: { mode: 'on' } };
+  const off = { type: 'custom', customType: 'team-building.manager-mode', data: { mode: 'off' } };
+  try {
+    const enabled = run({ mode: 'on' });
+    assert.equal(enabled.blocked, true);
+    assert.match(enabled.changedBadge.join(''), /Role: manager/, 'commands refresh the badge immediately');
+    const restarted = run({ pane: 'restored-tab:new-handle', early: true });
+    assert.equal(restarted.blocked, true, 'the first tool is guarded without a lifecycle event or history');
+    assert.match(restarted.badge.join(''), /Role: manager/);
+    assert.equal(run({ session: 'unrelated' }).blocked, false, 'another session in the same pane does not inherit the lock');
+    assert.equal(run({ worker: true }).blocked, false, 'workers never inherit their parent session lock');
+    const disabled = run({ mode: 'off' });
+    assert.equal(disabled.blocked, false);
+    assert.deepEqual(disabled.changedBadge, []);
+    assert.equal(run({ history: [on] }).blocked, false, 'a durable user off overrides stale startup history');
+    assert.equal(run({ session: 'legacy', history: [on], late: true }).blocked, true, 'history arriving after session_start is not cached as auto');
+    assert.equal(run({ session: 'branch-mode', history: [off], allHistory: [off, on] }).blocked, false, 'a different branch cannot override the current off');
+    assert.equal(run({ session: 'branch-mode', history: [on], tree: true }).blocked, true);
+    assert.equal(run({ session: 'branch-mode', history: [off], tree: true }).blocked, false);
+    assert.equal(run({ session: 'branch-mode', tree: true }).blocked, false, 'a branch without a mode uses auto');
+    assert.equal(run({ pane: '', session: 'non-orca', mode: 'on' }).blocked, true);
+    assert.equal(run({ pane: '', session: 'non-orca', early: true }).blocked, true);
+    assert.equal(run({ pane: '', session: 'other-session' }).blocked, false);
+    run({ session: 'corrupt', mode: 'on' });
+    const key = createHash('sha256').update('corrupt').digest('hex');
+    await writeFile(join(home, '.local/state/team-building/managers', `${key}.json`), 'invalid');
+    assert.equal(run({ session: 'corrupt' }).blocked, true, 'a corrupt snapshot cannot silently release the guard');
+    assert.equal(run({ session: 'corrupt', history: [off], tree: true }).blocked, true, 'branch switching cannot release a corrupt snapshot');
+    assert.equal(run({ session: 'corrupt', mode: 'off' }).blocked, false, 'explicit off repairs the snapshot');
+  } finally {
+    await rm(home, { recursive: true, force: true });
   }
 });

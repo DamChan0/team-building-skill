@@ -18,6 +18,8 @@ Once this skill is invoked or this session manages an active team, delegate only
 
 OMP/Pi manager extensions reapply routing instructions each prompt/model turn and reject known host spawn tools before execution. Manager `eval` is also blocked: older OMP releases do not emit the spawn hook for eval/workpool. Use bash for inline calculations or assign eval work to a persistent worker; workers are unaffected. OMP additionally registers `before_subagent_spawn` for runtimes supporting it. `/team-building-mode on` locks routing before a team exists; `off` explicitly releases the lock; `auto` follows active-team ownership. The explicit lock persists through session resume and compaction. Tool output cannot change it.
 
+After Orca Sleep/resume, keep the manager role and team-only delegation. The runtime restores durable session-scoped mode before the first tool; an empty startup branch is not permission to spawn host subagents. Explicit user `off` remains off across resume. Reload/restart an already running manager after setup to load updated hooks.
+
 If the CLI is blocked or a higher-priority rule conflicts, report the blocker instead of switching executors. This does not override system safety rules. Native Claude Code/Codex managers have prompt guidance only: use an OMP/Pi manager for the installed runtime guard. Arbitrary shell execution and third-party extensions are not sandboxed.
 
 ## Route first (pick the lightest executor that fits)
