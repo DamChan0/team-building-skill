@@ -39,17 +39,23 @@ const orcaMux = {
     }
     die(`Orca is not running/reachable; start it (\`${ORCA} open\`) and retry.`, 4);
   },
-  // The manager's worktree, as the multiplexer sees it.
+  // The manager's worktree, as the multiplexer sees it. Folder workspaces (e.g. Orca bots) have
+  // `folder:<id>` IDs without a path; Orca exports their root as ORCA_WORKSPACE_ROOT.
   async current(die) {
     const managerWorktreeId = process.env.ORCA_WORKTREE_ID;
     if (managerWorktreeId) {
+      const folder = managerWorktreeId.startsWith('folder:');
       const separator = managerWorktreeId.indexOf('::');
-      const root = separator > 0 ? managerWorktreeId.slice(separator + 2) : '';
-      if (!isAbsolute(root)) die('Orca manager has an invalid ORCA_WORKTREE_ID; refusing cwd-based worktree lookup.', 4);
+      const root = folder ? process.env.ORCA_WORKSPACE_ROOT || '' : separator > 0 ? managerWorktreeId.slice(separator + 2) : '';
+      if (!isAbsolute(root)) {
+        die(folder
+          ? `Orca folder workspace ORCA_WORKTREE_ID=${managerWorktreeId} needs an absolute ORCA_WORKSPACE_ROOT; refusing cwd-based worktree lookup.`
+          : 'Orca manager has an invalid ORCA_WORKTREE_ID; refusing cwd-based worktree lookup.', 4);
+      }
       try {
-        return { worktree: realpathSync(root) };
+        return { worktree: realpathSync(root), folder };
       } catch (error) {
-        die(`Orca manager worktree ${root} from ORCA_WORKTREE_ID is unavailable (${error.message}); refusing cwd-based worktree lookup.`, 4);
+        die(`Orca manager worktree ${root} from ${folder ? 'ORCA_WORKSPACE_ROOT' : 'ORCA_WORKTREE_ID'} is unavailable (${error.message}); refusing cwd-based worktree lookup.`, 4);
       }
     }
     if (process.env.ORCA_TERMINAL_HANDLE) {

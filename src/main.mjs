@@ -1136,7 +1136,7 @@ async function initTeam(args) {
   }
 
   const mux = MUXES[muxName];
-  const placePromise = Promise.all([mux.current(die), mux.home(die)]).then(([current, home]) => ({ worktree: current.worktree, home }));
+  const placePromise = Promise.all([mux.current(die), mux.home(die)]).then(([current, home]) => ({ ...current, home }));
   const routerPromise = harness === 'omp' && !fixedModel
     ? configureRouter(selectedFamily || 'gpt')
     : Promise.resolve(null);
@@ -1146,6 +1146,9 @@ async function initTeam(args) {
   if (harness === 'omp' && approvalMode !== 'yolo') {
     die(`tools.approvalMode is ${JSON.stringify(approvalMode)}; omp workers need yolo because nobody can answer their prompts.`, 3);
   }
+  const { worktree, home, folder } = await placePromise;
+  // Checked before --clear-previous so the rejection has no side effects.
+  if (args.isolate && folder) die(`--isolate needs a git repository registered in Orca; folder workspace ${worktree} cannot host isolated worktrees. Omit --isolate.`, 2);
 
   const otherPaths = context ? [] : roots.filter(({ data }) => data.cwd !== cwd);
   if (otherPaths.length && !args.clearPrevious && !args.keepPrevious) {
@@ -1159,11 +1162,10 @@ async function initTeam(args) {
     for (const { teamDir } of roots) await clear({ ...args, team: basename(teamDir) });
   }
 
-  const { worktree, home } = await placePromise;
   if (!args.isolate) {
     const [gitCode, gitRoot] = await gitOutput(['rev-parse', '--show-toplevel'], cwd);
     const sameWorktree = insideWorktree(worktree, cwd)
-      && (gitCode !== 0 || resolve(gitRoot) === resolve(worktree));
+      && (folder || gitCode !== 0 || resolve(gitRoot) === resolve(worktree)); // folder workspaces: containment only
     if (!sameWorktree) {
       const gitDetail = gitCode === 0 ? ` (git top-level ${gitRoot})` : '';
       die(`manager cwd ${cwd}${gitDetail} does not match active ${mux.label} worktree ${worktree}; register the git worktree in Orca or run init from the manager's worktree`, 4);

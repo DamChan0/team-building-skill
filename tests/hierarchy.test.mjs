@@ -68,6 +68,10 @@ import { join } from 'node:path';
 const dir = process.env.FIXTURE_TERMINALS;
 const args = process.argv.slice(2, -1);
 const option = flag => args[args.indexOf(flag) + 1];
+if (args.includes('--worktree') && option('--worktree') !== ${JSON.stringify(`path:${cwd}`)}) {
+  console.error('unexpected worktree ' + option('--worktree'));
+  process.exit(1);
+}
 let result;
 if (args[0] === 'status') result = { app: { running: true }, runtime: { reachable: true } };
 else if (args[1] === 'create') {
@@ -113,7 +117,7 @@ console.log(JSON.stringify({ ok: true, result }));
   };
   const teams = async () => Promise.all((await readdir(stateRoot)).filter(name => /^tb-/.test(name)).map(async id =>
     JSON.parse(await readFile(join(stateRoot, id, 'team.json'), 'utf8'))));
-  return { cwd, stateRoot, terminals, denyClose, calls, ok, rejects, teams };
+  return { cwd, env, stateRoot, terminals, denyClose, calls, invoke, ok, rejects, teams };
 }
 
 test('hierarchical init and selection enforce recorded ownership without changing legacy mode', async t => {
@@ -246,6 +250,27 @@ test('retiring a sub-manager drains only its child and requires stop and observe
   await rejects(/observer .*w2 is not proven closed/, null, 'clear', '--fast');
   assert.equal(await readFile(join(session, 'recoverable.jsonl'), 'utf8'), 'session record');
   await rm(denyClose);
+  await ok(null, 'clear', '--fast');
+  assert.deepEqual(await teams(), []);
+});
+
+test('Orca folder workspaces bind teams to ORCA_WORKSPACE_ROOT without git checks', async t => {
+  const { cwd, env, terminals, invoke, ok, rejects, teams } = await fixture(t);
+  await exec('git', ['init', '--quiet', join(cwd, '..')]); // a git-tracked home must not reject the folder
+  Object.assign(env, { ORCA_WORKTREE_ID: 'folder:46d09e84-1e03-4abf-b57d-1d1762d0a11b', ORCA_WORKSPACE_ROOT: '' });
+  const missing = await invoke(null, 'init', '--model', 'fixture', '--member', '1');
+  assert.equal(missing.code, 4, missing.stderr);
+  assert.match(missing.stderr, /ORCA_WORKTREE_ID=folder:\S+ needs an absolute ORCA_WORKSPACE_ROOT/);
+  env.ORCA_WORKSPACE_ROOT = cwd;
+  await rejects(/--isolate needs a git repository/, null, 'init', '--isolate', '--model', 'fixture', '--member', '1');
+  assert.deepEqual(await teams(), []);
+  assert.deepEqual(await readdir(terminals), []);
+  await ok(null, 'init', '--model', 'fixture', '--member', '1');
+  assert.equal((await teams())[0].worktree, cwd);
+  await ok(null, 'status');
+  await ok(null, 'assign', '--detach', 'folder work');
+  await ok(null, 'member', '2');
+  assert.equal((await readdir(terminals)).length, 2);
   await ok(null, 'clear', '--fast');
   assert.deepEqual(await teams(), []);
 });

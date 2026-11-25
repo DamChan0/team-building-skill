@@ -1,6 +1,6 @@
 # team-building
 
-- **Release:** [v0.7.0](https://github.com/DamChan0/team-building-skill/releases/tag/v0.7.0)
+- **Release:** [v0.7.1](https://github.com/DamChan0/team-building-skill/releases/tag/v0.7.1)
 - Persistent AI-worker teams managed from one session.
 - **Manager hosts:** OMP, Pi, Claude Code, and Codex. The `SKILL.md` uses the Agent Skills format supported by [Claude Code](https://code.claude.com/docs/en/skills) and [Codex](https://developers.openai.com/codex/skills).
 - **OMP is not needed when Pi, Claude Code, or Codex is the manager and you select native workers.** OMP remains the default worker backend.
@@ -87,7 +87,7 @@ sequenceDiagram
 - **Runtime prerequisites:**
   - Node.js 20+.
   - A running Orca app and CLI (`orca-ide`) with the current worktree registered, a herdr TUI pane (`HERDR_ENV=1`), **or** a herdr-app terminal with `hc` (`HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET`).
-  - In an Orca terminal, `init` uses the manager tab's `ORCA_WORKTREE_ID`. It exits 4 if `cwd` is outside that worktree or its git top-level differs; a terminal without `ORCA_WORKTREE_ID` also fails closed. Register sibling worktrees in Orca or run `init` from the manager's worktree.
+  - In an Orca terminal, `init` uses the manager tab's `ORCA_WORKTREE_ID`. It exits 4 if `cwd` is outside that worktree or its git top-level differs; a terminal without `ORCA_WORKTREE_ID` also fails closed. Register sibling worktrees in Orca or run `init` from the manager's worktree. Folder workspaces such as Orca bots (`ORCA_WORKTREE_ID=folder:<id>`) bind to the absolute `ORCA_WORKSPACE_ROOT` instead, skip the git top-level check, and reject `--isolate`.
   - The selected worker CLI in `PATH` (`omp`, `claude`, or `codex`).
 - On Linux, do not use bare `orca`; it is the GNOME screen reader.
 - Set `ORCA_CLI_COMMAND` if the Orca CLI binary has another name; `HERDR_CLI_COMMAND` likewise for herdr; `HC_CLI_COMMAND` for the `hc` binary.

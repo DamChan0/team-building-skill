@@ -69,7 +69,7 @@ Requirements: OMP workers need `tools.approvalMode=yolo`; `--harness claude|code
 `init claude` selects Claude-family models on the interactive OMP harness; `init --harness claude --allow-bypass` uses native Claude Code with a read-only activity observer. Native Codex works the same way.
 Idle OMP sessions stop after 15 minutes without a task result by default; `init --idle-stop Nm` configures the timeout and `0` disables it. Idle age is based on the last task result, not terminal activity; `member N` gives restarted workers a fresh interval. `status` shows stopped workers and their idle age.
 
-- In Orca, `init` binds to the manager terminal's `ORCA_WORKTREE_ID`; it exits 4 if `cwd` is outside that worktree or its git top-level differs. Register sibling git worktrees with Orca or run `init` from the manager's worktree.
+- In Orca, `init` binds to the manager terminal's `ORCA_WORKTREE_ID`; it exits 4 if `cwd` is outside that worktree or its git top-level differs. Register sibling git worktrees with Orca or run `init` from the manager's worktree. Folder workspaces (`folder:<id>`, e.g. Orca bots) bind to `ORCA_WORKSPACE_ROOT` without the git check; `--isolate` is rejected there.
 
 ## Dispatch
 
